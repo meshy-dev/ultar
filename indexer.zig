@@ -19,6 +19,7 @@ pub fn main() !void {
     const params = comptime clap.parseParamsComptime(
         \\-h, --help             Display this help and exit.
         \\-f, --file <str>...    Tar file(s) to index.
+        \\--fmt <str>            Output format (msgpack / jsonl).
         \\
     );
 
@@ -36,9 +37,6 @@ pub fn main() !void {
     if (res.args.help != 0)
         return clap.help(std.io.getStdErr().writer(), clap.Help, &params, .{});
 
-    var loop = try xev.Loop.init(.{});
-    defer loop.deinit();
-
     const Scanner = scanners.TarFileScanner(WdsIndexingState, WdsIndexingState.scannedEntryCb);
     var tarfiles = try allocator.alloc(Scanner, res.args.file.len);
     defer {
@@ -51,14 +49,24 @@ pub fn main() !void {
         allocator.free(tarfiles);
     }
 
+    const fmt = if (res.args.fmt) |fmt_str| (std.meta.stringToEnum(WdsIndexingState.SerializationFormat, fmt_str) orelse {
+        logger.err("Unrecognized format: {s}", .{fmt_str});
+        return clap.help(std.io.getStdErr().writer(), clap.Help, &params, .{});
+    }) else .msgpack;
+
+    var loop = try xev.Loop.init(.{});
+    defer loop.deinit();
+
     for (res.args.file, 0..) |fp, i| {
         const tarfile = &tarfiles[i];
         const out_fp = try std.mem.join(allocator, ".", &[_][]const u8{ fp, index_ext });
         defer allocator.free(out_fp);
-        tarfile.* = try Scanner.initFp(try WdsIndexingState.init(allocator, &loop, std.fs.cwd().createFile(out_fp, .{ .truncate = true }) catch |err| {
+        const out_file = std.fs.cwd().createFile(out_fp, .{ .truncate = true }) catch |err| {
             logger.err("Error opening output file {s}: {}", .{ out_fp, err });
             return err;
-        }), fp);
+        };
+        const state = try WdsIndexingState.init(allocator, &loop, out_file, fmt);
+        tarfile.* = try Scanner.initFp(state, fp);
         tarfile.enqueueRead(&loop);
     }
 
@@ -85,7 +93,18 @@ const WdsIndexingState = struct {
         iidx: usize = 0,
         offset: usize = 0,
         str_idx: []const u8,
-        entries: []const Entry,
+        keys: []const []const u8,
+        offsets: []const u32,
+        sizes: []const u32,
+    };
+
+    pub const SerializationFormat = enum { msgpack, jsonl };
+
+    const MsgpackSer = M.Packer(OStream.Writer);
+    const JsonSer = std.json.WriteStream(OStream.Writer, .{ .checked_to_fixed_depth = 2 });
+    const Packer = union(enum) {
+        msgpack: MsgpackSer,
+        jsonl: JsonSer,
     };
 
     gpa: std.mem.Allocator,
@@ -97,12 +116,20 @@ const WdsIndexingState = struct {
     current_row_str_idx: ?[]const u8 = null,
     current_row_base: usize = 0,
 
+    fmt: SerializationFormat,
+
     row_buf: std.ArrayListUnmanaged(Entry),
     row_arena: std.heap.ArenaAllocator,
 
-    pub fn init(alloc: std.mem.Allocator, loop: *xev.Loop, output_file: std.fs.File) !Self {
+    pub fn init(alloc: std.mem.Allocator, loop: *xev.Loop, output_file: std.fs.File, fmt: SerializationFormat) !Self {
         const ostream = try OStream.init(loop, output_file);
-        return .{ .gpa = alloc, .ostream = ostream, .row_buf = try std.ArrayListUnmanaged(Entry).initCapacity(alloc, 256), .row_arena = std.heap.ArenaAllocator.init(alloc) };
+        return .{
+            .gpa = alloc,
+            .ostream = ostream,
+            .row_buf = try std.ArrayListUnmanaged(Entry).initCapacity(alloc, 256),
+            .row_arena = std.heap.ArenaAllocator.init(alloc),
+            .fmt = fmt, // Don't init the serializer (they need &ostream)
+        };
     }
 
     pub fn deinit(self: *Self) void {
@@ -111,12 +138,12 @@ const WdsIndexingState = struct {
         self.row_arena.deinit();
     }
 
-    pub fn writeRow(self: *Self) !void {
-        if (self.current_row_str_idx == null) return;
+    fn writeRowMsgPack(self: *Self) !void {
+        const writer = self.ostream.writer();
+        var pack = MsgpackSer.init(writer);
 
-        // Write the previous row
-        var pack = M.Packer(OStream).init(&self.ostream);
-
+        const items = self.row_buf.items;
+        const num_entries = items.len;
         try pack.beginMap(std.meta.fields(Row).len);
         {
             try pack.addStr("iidx");
@@ -125,27 +152,60 @@ const WdsIndexingState = struct {
             try pack.addInt(usize, self.current_row_base);
             try pack.addStr("str_idx");
             try pack.addStr(self.current_row_str_idx.?);
-            try pack.addStr("entries");
-            const num_entries = self.row_buf.items.len;
+            try pack.addStr("keys");
             try pack.beginArray(num_entries);
-            for (self.row_buf.items) |entry| {
-                try pack.beginMap(3);
-                {
-                    try pack.addStr("key");
-                    try pack.addStr(entry.key);
-                    try pack.addStr("offset");
-                    try pack.addInt(u32, entry.offset_from_base);
-                    try pack.addStr("size");
-                    try pack.addInt(u32, entry.size);
-                }
-            }
+            for (self.row_buf.items) |e| try pack.addStr(e.key);
+            try pack.addStr("offsets");
+            try pack.beginArray(num_entries);
+            for (self.row_buf.items) |e| try pack.addInt(u32, e.offset_from_base);
+            try pack.addStr("sizes");
+            try pack.beginArray(num_entries);
+            for (self.row_buf.items) |e| try pack.addInt(u32, e.size);
+        }
+    }
+
+    fn writeRowJsonl(self: *Self) !void {
+        const writer = self.ostream.writer();
+        var json = std.json.writeStreamMaxDepth(writer, .{}, 2);
+
+        const items = self.row_buf.items;
+        try json.beginObject();
+        try json.objectField("iidx");
+        try json.write(self.rows);
+        try json.objectField("offset");
+        try json.write(self.current_row_base);
+        try json.objectField("str_idx");
+        try json.write(self.current_row_str_idx.?);
+        try json.objectField("keys");
+        try json.beginArray();
+        for (items) |e| try json.write(e.key);
+        try json.endArray();
+        try json.objectField("offsets");
+        try json.beginArray();
+        for (items) |e| try json.write(e.offset_from_base);
+        try json.endArray();
+        try json.objectField("sizes");
+        try json.beginArray();
+        for (items) |e| try json.write(e.size);
+        try json.endArray();
+        try json.endObject();
+
+        try writer.writeByte('\n');
+    }
+
+    pub fn writeRow(self: *Self) !void {
+        if (self.current_row_str_idx == null) return;
+        if (self.rows > std.math.maxInt(i32)) {
+            return IndexMetadataError.TooManyRows;
+        }
+
+        // Write the previous row
+        switch (self.fmt) {
+            .msgpack => try self.writeRowMsgPack(),
+            .jsonl => try self.writeRowJsonl(),
         }
 
         self.rows += 1;
-
-        if (self.rows >= std.math.maxInt(i32)) {
-            return IndexMetadataError.TooManyRows;
-        }
     }
 
     pub fn pushEntry(self: *Self, header: *tardefs.TarHeader, offset: usize, size: usize) !void {

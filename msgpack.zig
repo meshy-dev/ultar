@@ -402,28 +402,23 @@ test "test map packing" {
 // IO based serialization
 
 pub fn Packer(comptime Writer: type) type {
-    // Ensure writer has write method
-    comptime {
-        std.debug.assert(std.meta.hasMethod(Writer, "write"));
-    }
-
     return struct {
         const Self = @This();
 
-        writer: *Writer,
+        writer: Writer,
 
-        pub fn init(writer: *Writer) Self {
+        pub fn init(writer: Writer) Self {
             return .{
                 .writer = writer,
             };
         }
 
         pub fn addNil(self: *Self) !void {
-            _ = try self.writer.write(&[_]u8{m_nil});
+            _ = try self.writer.writeByte(m_nil);
         }
 
         pub fn addBool(self: *Self, v: bool) !void {
-            _ = try self.writer.write(if (v) &[_]u8{m_true} else &[_]u8{m_false});
+            _ = try self.writer.writeByte(if (v) m_true else m_false);
         }
 
         pub fn addInt(self: *Self, comptime T: type, v: T) !void {
@@ -461,7 +456,8 @@ pub fn Packer(comptime Writer: type) type {
 
 test "test writer" {
     var buf: [1024]u8 = std.mem.zeroes([1024]u8);
-    var writer = std.io.FixedBufferStream([]u8){ .buffer = &buf, .pos = 0 };
+    var stream = std.io.FixedBufferStream([]u8){ .buffer = &buf, .pos = 0 };
+    const writer = stream.writer();
 
     var pack = Packer(@TypeOf(writer)).init(&writer);
     try pack.beginMap(4);
@@ -482,7 +478,7 @@ test "test writer" {
     try pack.addFloat(f64, 1.0 / 3.0);
 
     const ref = "\x84\xa3abc\xc2\xa3def7\xb4%%%%%%%%%%%%%%%%%%%%\xce\xba\xad\xf0\r\xb1this is an \xe5\x90\x91\xe9\x87\x8f\x93\xcb\xbf\xec\xcc\xcc\xcc\xcc\xcc\xcd\xcb?\xe0Q\xeb\x85\x1e\xb8R\xcb?\xd5UUUUUU";
-    const gen = writer.getWritten();
+    const gen = stream.getWritten();
 
     try std.testing.expectEqualSlices(u8, ref, gen);
 }

@@ -37,6 +37,8 @@ xfile: xev.File,
 pub const ReadError = error{};
 pub const WriteError = error{OutOfMemory};
 
+pub const Writer = std.io.Writer(*Self, WriteError, write);
+
 pub fn init(loop: *xev.Loop, output_file: std.fs.File) !Self {
     return .{
         .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator),
@@ -90,27 +92,31 @@ fn writeCb(
     return .disarm;
 }
 
+fn write_impl(self: *Self, bytes: []const u8) WriteError!void {
+    const chunk_node = try self.getOrAllocCurrChunk();
+
+    // Try to write to the last chunk
+    const chunk = &chunk_node.data;
+    const remaining_buf = chunk.remaining();
+    const n = @min(remaining_buf.len, bytes.len);
+    @memcpy(remaining_buf[0..n], bytes[0..n]);
+    chunk.len += n;
+    const rem = bytes[n..];
+
+    // If chunk is full, submit to write
+    if (chunk.remaining().len == 0) {
+        self.flush();
+    }
+
+    if (rem.len > 0) {
+        return @call(.always_tail, write_impl, .{ self, rem });
+    }
+}
+
 pub fn write(self: *Self, bytes: []const u8) WriteError!usize {
     if (bytes.len == 0) return 0;
 
-    var rem = bytes;
-
-    while (rem.len > 0) {
-        const chunk_node = try self.getOrAllocCurrChunk();
-
-        // Try to write to the last chunk
-        const chunk = &chunk_node.data;
-        const remaining_buf = chunk.remaining();
-        const n = @min(remaining_buf.len, rem.len);
-        @memcpy(remaining_buf[0..n], rem[0..n]);
-        chunk.len += n;
-        rem = rem[n..];
-
-        // If chunk is full, submit to write
-        if (chunk.remaining().len == 0) {
-            self.flush();
-        }
-    }
+    try self.write_impl(bytes);
 
     return bytes.len;
 }
@@ -124,4 +130,8 @@ pub fn flush(self: *Self) void {
         self.xfile.write(self.loop, &chunk.c, .{ .slice = slice }, Self, self, writeCb);
         self.curr_chunk = null;
     }
+}
+
+pub fn writer(self: *Self) Writer {
+    return .{ .context = self };
 }

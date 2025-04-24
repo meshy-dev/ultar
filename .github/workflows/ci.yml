@@ -1,0 +1,47 @@
+# .github/workflows/ci.yml
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  release:
+    types: [ published ]
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        target:
+          - x86_64-linux                # Cross-compile Linux x64
+          - aarch64-linux               # Cross-compile Linux ARM
+          - aarch64-macos               # Native macOS ARM
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v1
+        with:
+          version: latest
+
+      - name: Build (ReleaseSafe, ${{ matrix.target }})
+        run: |
+          zig build -Doptimize=ReleaseFast -Dtarget=${{ matrix.target }} --summary all
+          mv ./zig-out/bin/indexer ./indexer-${{ matrix.target }}
+
+      - name: Test
+        if: matrix.target == 'aarch64-macos'
+        run: |
+          zig build test --summary all
+
+      # Upload binaries on release
+      - name: Upload binaries to Release
+        uses: softprops/action-gh-release@v2
+        if: github.ref_type == 'tag'
+        with:
+          files: |
+            ./indexer-${{ matrix.target }}
+

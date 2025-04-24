@@ -1,0 +1,10 @@
+.{ .name = .ultar, .version = "0.0.0", .fingerprint = 0x17f55a637e2667a4, .dependencies = .{
+    .libxev = .{
+        .url = "git+https://github.com/mitchellh/libxev.git#94ed6af7b2aaaeab987fbf87fcee410063df715b",
+        .hash = "libxev-0.0.0-86vtc-zkEgB7uv1i0Sa6ytJETZQi_lHJrImu9mLb9moi",
+    },
+    .clap = .{
+        .url = "git+https://github.com/Hejsil/zig-clap#a4e784da8399c51d5eeb5783e6a485b960d5c1f9",
+        .hash = "clap-0.10.0-oBajB8fkAQB0JvsrWLar4YZrseSZ9irFxHB7Hvy_bvxb",
+    },
+}, .paths = .{""} }

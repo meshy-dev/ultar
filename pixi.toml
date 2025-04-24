@@ -1,0 +1,16 @@
+[workspace]
+authors = ["Cheng Cao <bobcaocheng@gmail.com>"]
+channels = ["conda-forge"]
+name = "ultar"
+platforms = ["linux-64"]
+version = "0.1.0"
+
+[tasks]
+
+[build-dependencies]
+zig = ">=0.14"
+uv = "*"
+python = "*"
+
+[pypi-dependencies]
+msgpack = "*"

@@ -9,8 +9,17 @@ version = "0.1.0"
 
 [build-dependencies]
 zig = ">=0.14"
-uv = "*"
-python = "*"
 
-[pypi-dependencies]
+[feature.demo.dependencies]
+python = "3.13.*"
+uv = "*"
+flask = "*"
+cachetools = "*"
+watchdog = "*"
+gunicorn = "*"
+
+[feature.demo.pypi-dependencies]
 msgpack = "*"
+
+[environments]
+demo = ["demo"]

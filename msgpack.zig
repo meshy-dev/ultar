@@ -332,12 +332,12 @@ pub fn packArrayHeader(len: usize, buf: []u8) PackError![]u8 {
             return buf[0..1];
         },
         .array16 => {
-            buf[0] = 0xda;
+            buf[0] = 0xdc;
             packBE(u16, buf[1..], @intCast(len));
             return buf[0..3];
         },
         .array32 => {
-            buf[0] = 0xdb;
+            buf[0] = 0xdd;
             packBE(u32, buf[1..], @intCast(len));
             return buf[0..5];
         },
@@ -456,29 +456,47 @@ pub fn Packer(comptime Writer: type) type {
 
 test "test writer" {
     var buf: [1024]u8 = std.mem.zeroes([1024]u8);
-    var stream = std.io.FixedBufferStream([]u8){ .buffer = &buf, .pos = 0 };
-    const writer = stream.writer();
 
-    var pack = Packer(@TypeOf(writer)).init(writer);
-    try pack.beginMap(4);
-    const k0: *const [3:0]u8 = "abc";
-    try pack.addStr(k0);
-    try pack.addBool(false);
-    const k1: *const [3]u8 = "def";
-    try pack.addStr(k1);
-    try pack.addInt(u32, 55);
-    const k2: [20]u8 = @splat('%');
-    try pack.addStr(&k2);
-    try pack.addInt(u64, 0xbaadf00d);
-    const k3 = "this is an 向量";
-    try pack.addStr(k3);
-    try pack.beginArray(3);
-    try pack.addFloat(f64, -0.9);
-    try pack.addFloat(f64, 0.51);
-    try pack.addFloat(f64, 1.0 / 3.0);
+    {
+        var stream = std.io.FixedBufferStream([]u8){ .buffer = &buf, .pos = 0 };
+        const writer = stream.writer();
 
-    const ref = "\x84\xa3abc\xc2\xa3def7\xb4%%%%%%%%%%%%%%%%%%%%\xce\xba\xad\xf0\r\xb1this is an \xe5\x90\x91\xe9\x87\x8f\x93\xcb\xbf\xec\xcc\xcc\xcc\xcc\xcc\xcd\xcb?\xe0Q\xeb\x85\x1e\xb8R\xcb?\xd5UUUUUU";
-    const gen = stream.getWritten();
+        var pack = Packer(@TypeOf(writer)).init(writer);
+        try pack.beginMap(4);
+        const k0: *const [3:0]u8 = "abc";
+        try pack.addStr(k0);
+        try pack.addBool(false);
+        const k1: *const [3]u8 = "def";
+        try pack.addStr(k1);
+        try pack.addInt(u32, 55);
+        const k2: [20]u8 = @splat('%');
+        try pack.addStr(&k2);
+        try pack.addInt(u64, 0xbaadf00d);
+        const k3 = "this is an 向量";
+        try pack.addStr(k3);
+        try pack.beginArray(3);
+        try pack.addFloat(f64, -0.9);
+        try pack.addFloat(f64, 0.51);
+        try pack.addFloat(f64, 1.0 / 3.0);
 
-    try std.testing.expectEqualSlices(u8, ref, gen);
+        const ref = "\x84\xa3abc\xc2\xa3def7\xb4%%%%%%%%%%%%%%%%%%%%\xce\xba\xad\xf0\r\xb1this is an \xe5\x90\x91\xe9\x87\x8f\x93\xcb\xbf\xec\xcc\xcc\xcc\xcc\xcc\xcd\xcb?\xe0Q\xeb\x85\x1e\xb8R\xcb?\xd5UUUUUU";
+        const gen = stream.getWritten();
+
+        try std.testing.expectEqualSlices(u8, ref, gen);
+    }
+
+    {
+        var stream = std.io.FixedBufferStream([]u8){ .buffer = &buf, .pos = 0 };
+        const writer = stream.writer();
+
+        var pack = Packer(@TypeOf(writer)).init(writer);
+
+        try pack.beginArray(100);
+        for (0..100) |i| try pack.addInt(usize, i);
+
+        const ref = "\xdc\x00d\x00\x01\x02\x03\x04\x05\x06\x07\x08\t\n\x0b\x0c\r\x0e\x0f\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f !\"#$%&\'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abc";
+        const gen = stream.getWritten();
+
+        try std.testing.expectEqualSlices(u8, ref, gen);
+    }
 }

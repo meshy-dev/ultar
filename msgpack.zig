@@ -459,7 +459,7 @@ test "test writer" {
     var stream = std.io.FixedBufferStream([]u8){ .buffer = &buf, .pos = 0 };
     const writer = stream.writer();
 
-    var pack = Packer(@TypeOf(writer)).init(&writer);
+    var pack = Packer(@TypeOf(writer)).init(writer);
     try pack.beginMap(4);
     const k0: *const [3:0]u8 = "abc";
     try pack.addStr(k0);

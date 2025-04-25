@@ -37,8 +37,7 @@ pub fn main() !void {
     if (res.args.help != 0)
         return clap.help(std.io.getStdErr().writer(), clap.Help, &params, .{});
 
-    const Scanner = scanners.TarFileScanner(WdsIndexingState, WdsIndexingState.scannedEntryCb);
-    var tarfiles = try allocator.alloc(Scanner, res.args.file.len);
+    var tarfiles = try allocator.alloc(Indexer, res.args.file.len);
     defer {
         for (tarfiles) |*t| {
             if (t.fs_file != null) {
@@ -66,7 +65,7 @@ pub fn main() !void {
             return err;
         };
         const state = try WdsIndexingState.init(allocator, &loop, out_file, fmt);
-        tarfile.* = try Scanner.initFp(state, fp);
+        tarfile.* = try Indexer.initFp(state, fp);
         tarfile.enqueueRead(&loop);
     }
 
@@ -79,6 +78,8 @@ pub const IndexMetadataError = error{
     TooManyRows,
     TooManyColumns,
 };
+
+pub const Indexer = scanners.TarFileScanner(WdsIndexingState, WdsIndexingState.scannedEntryCb, WdsIndexingState.errorCb);
 
 const WdsIndexingState = struct {
     const Self = @This();
@@ -245,6 +246,13 @@ const WdsIndexingState = struct {
         });
     }
 
+    pub fn finalize(self: *Self) void {
+        self.writeRow() catch |err| {
+            logger.err("Error writing final row: {}", .{err});
+        };
+        self.ostream.flush();
+    }
+
     pub fn scannedEntryCb(
         state: *Self,
         header: ?*tardefs.TarHeader,
@@ -271,8 +279,8 @@ const WdsIndexingState = struct {
                 switch (err) {
                     IndexMetadataError.RowTooLarge, IndexMetadataError.EntryTooLarge, IndexMetadataError.TooManyColumns => logger.warn("Skipping {s} due to {}", .{ name, err }),
                     IndexMetadataError.TooManyRows => {
-                        logger.err("Too many rows in {s} - stopping indexing", .{name});
-                        state.ostream.flush();
+                        logger.err("Too many rows! Ending indexing", .{});
+                        state.finalize();
                         return false;
                     },
                     else => {
@@ -281,12 +289,14 @@ const WdsIndexingState = struct {
                     },
                 };
         } else {
-            state.writeRow() catch |err| {
-                logger.err("Error writing final row: {}", .{err});
-            };
-            state.ostream.flush();
+            state.finalize();
             logger.info("End of tar file, {} rows", .{state.rows});
         }
         return true;
+    }
+
+    pub fn errorCb(state: *Self, _: xev.ReadError!void) bool {
+        state.finalize();
+        return false;
     }
 };

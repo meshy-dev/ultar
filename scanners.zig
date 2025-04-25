@@ -14,6 +14,7 @@ pub fn TarFileScanner(
         offset: usize,
         size: usize,
     ) bool,
+    comptime error_cb: ?*const fn (state: *State, err: xev.ReadError!void) bool,
 ) type {
     return struct {
         const Self = @This();
@@ -62,6 +63,9 @@ pub fn TarFileScanner(
             const self = _self orelse unreachable;
             const read_size = r catch |err| {
                 logger.err("Error reading from file: {}", .{err});
+                if (error_cb) |f| {
+                    return if (f(&self.state, err)) .rearm else .disarm;
+                }
                 return .disarm;
             };
             _ = c;

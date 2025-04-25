@@ -47,17 +47,21 @@ BASE_TEMPLATE = """
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <title>WebDataset Index Browser</title>
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet"/>
+  <link href="https://fonts.cdnfonts.com/css/anonymous-pro" rel="stylesheet">
   <style>
-    @import url('https://fonts.cdnfonts.com/css/anonymous-pro');
     #file-tree, #table-container {
       max-height: calc(100vh - 150px);
       overflow-y: auto;
+    }
+    #file-tree.htmx-request, #table-container.htmx-request {
+      opacity: 0.5;
+      transition: opacity 300ms linear;
     }
     h1, h2, h3, h4, h5, h6,
     .h1, .h2, .h3, .h4, .h5, .h6,
     .display-1, .display-2, .display-3,
     .display-4, .display-5, .display-6 {
-      font-family: "Noto Serif", sans-serif;
+      font-family: "Anonymous Pro", sans-serif;
       font-weight: bold
     }
     html, body, .tooltip, .popover {
@@ -66,10 +70,6 @@ BASE_TEMPLATE = """
     }
     code, kbd, pre, samp, .text-monospace {
       font-family: 'Anonymous Pro', monospace;
-      font-variant-emoji: emoji;
-    }
-    button, input, optgroup, select, textarea {
-      font-family: inherit;
       font-variant-emoji: emoji;
     }
   </style>
@@ -89,7 +89,7 @@ BASE_TEMPLATE = """
     </div>
   </div>
 </div>
-<script src="https://unpkg.com/htmx.org@1.9.2"></script>
+<script src="https://unpkg.com/htmx.org@2.0.4"></script>
 </body>
 </html>
 """
@@ -137,7 +137,7 @@ def index():
         html += (
             f'<li class="list-group-item py-1">'
             f'<a href="#" hx-get="/{endpoint}?path={rel}" '
-            f'hx-target="#file-tree" hx-swap="innerHTML">{icon} {name}</a></li>'
+            f'hx-target="#file-tree" hx-indicator="#file-tree" hx-swap="innerHTML">{icon} {name}</a></li>'
         )
     html += "</ul>"
     return render_body(html)
@@ -166,6 +166,42 @@ def _map_file(file: str, base: int, end: int) -> bytes:
     return m.mm[base:end]
 
 
+import mimetypes
+
+mimetypes.init()
+
+
+def map_file_internal(file, base, end):
+    full_path = os.path.join(BASE_DIR, file)
+    base = int(base, 16)
+    end = int(end, 16)
+
+    b = _map_file(full_path, base, end)
+
+    return b
+
+
+@app.route("/boxed_file")
+def boxed_file():
+    file = request.args.get("file")
+    base = request.args.get("base")
+    end = request.args.get("end")
+    k = request.args.get("k")
+    if file is None or base is None or end is None or k is None:
+        return "Missing arguments"
+
+    em = f'<div><a href="/map_file?file={quote(file, safe=[])}&k={k}&base={base}&end={end}" target="_blank">Open {k}</a></div>'
+
+    mime_type, _ = mimetypes.guess_type("test" + k, False)
+    if mime_type:
+        if mime_type.startswith("image"):
+            em += f'<img src="/map_file?file={quote(file, safe=[])}&k={k}&base={base}&end={end}" class="img-fluid" style="max-height: 128px;"/>'
+        if mime_type in ["text/plain", "text/html", "application/json"]:
+            em += f'<div class="border p-1" style="width: auto; max-width: 20em; max-height: 10em; overflow: auto;"><pre><code>{map_file_internal(file, base, end).decode("utf-8")}</code></pre>'
+
+    return em
+
+
 @app.route("/map_file")
 def map_file():
     file = request.args.get("file")
@@ -175,19 +211,11 @@ def map_file():
     if file is None or base is None or end is None or k is None:
         return "Missing arguments"
 
-    full_path = os.path.join(BASE_DIR, file)
-    base = int(base, 16)
-    end = int(end, 16)
-
-    b = _map_file(full_path, base, end)
-
-    response = make_response(b)
-    if k.endswith(".webp"):
-        response.mimetype = "image/webp"
-    elif k.endswith(".jpg") or k.endswith(".jpeg"):
-        response.mimetype = "image/jpeg"
-    else:
-        response.mimetype = "text/plain"
+    response = make_response(map_file_internal(file, base, end))
+    mime_type, _ = mimetypes.guess_type("test" + k, False)
+    print("MIME type:", mime_type)
+    if mime_type:
+        response.mimetype = mime_type
 
     return response
 
@@ -202,7 +230,7 @@ def browse():
         html += (
             f'<li class="list-group-item py-1">'
             f'<a href="#" hx-get="/browse?path={parent}" '
-            f'hx-target="#file-tree" hx-swap="innerHTML">⬆️ ..</a></li>'
+            f'hx-target="#file-tree" hx-indicator="#file-tree" hx-swap="innerHTML">⬆️ ..</a></li>'
         )
     for typ, name, rel in entries:
         icon = "📁" if typ == "dir" else "📄"
@@ -211,7 +239,7 @@ def browse():
         html += (
             f'<li class="list-group-item py-1">'
             f'<a href="#" hx-get="/{endpoint}?path={rel}" '
-            f'hx-target="{target}" hx-swap="innerHTML">{icon} {name}</a></li>'
+            f'hx-target="{target}" hx-indicator="{target}" hx-swap="innerHTML">{icon} {name}</a></li>'
         )
     html += "</ul>"
     return html
@@ -228,21 +256,16 @@ def load_index():
     with open(full_path, "rb") as f:
         unpacker = msgpack.Unpacker(f, raw=False)
         for item in unpacker:
-            d = {"id": item["str_idx"], "idx": item["iidx"]}
             l = {}
-            off = item["offset"]
-            for e in item["entries"]:
-                e_off = off + e["offset"]
-                e_size = e["size"]
-                k = e["key"]
-                icon = "📄"
-                if k.endswith(".webp") or k.endswith(".jpg"):
-                    icon = "🖼"
-                d[k] = f"{e_off:08X}..{e_off+e_size:08X} {icon}"
+            base_offset = item["offset"]
+            d = {"id": item["str_idx"], "idx": item["iidx"]}
+            for k, o, s in zip(item["keys"], item["offsets"], item["sizes"]):
+                off = base_offset + o
+                size = s
+                d[k] = f"{off:08X}..{off+size:08X}"
                 l[k] = (
-                    f"/map_file?file={quote(tar_path, safe=[])}&k={k}&base={e_off:x}&end={e_off+e_size:x}"
+                    f"/boxed_file?file={quote(tar_path, safe=[])}&k={k}&base={off:x}&end={off+size:x}"
                 )
-
             data.append(d)
             links.append(l)
 
@@ -252,6 +275,7 @@ def load_index():
     keys = sorted(data[0].keys())
     html = '<div class="table-responsive" style="max-height: calc(100vh - 200px); overflow-y: auto;">'
     html += (
+        f"<p>{tar_path}</p>"
         '<table class="table table-hover table-sm mb-0"><thead class="table-light"><tr>'
     )
     for k in keys:
@@ -262,7 +286,9 @@ def load_index():
         for k in keys:
             if k in l:
                 href = l.get(k)
-                html += f"<td><a href=\"{href}\">{row.get(k, '')}</a></td>"
+                html += (
+                    f'<td><a hx-get="{href}" hx-swap="outerHTML">{row.get(k)}</a></td>'
+                )
             else:
                 html += f"<td>{row.get(k, '')}</td>"
         html += "</tr>"

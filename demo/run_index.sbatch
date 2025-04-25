@@ -4,8 +4,12 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=2G
 
+shopt -s globstar nullglob
+
 # Collect and sort all .tar files
-mapfile -t tar_files < <(printf '%s\n' "$DATA_PATH"/*.tar | sort)
+mapfile -t tar_files < <(
+  printf '%s\n' "$DATA_PATH"/**/*.tar | sort
+)
 num_files=${#tar_files[@]}
 num_tasks=$SLURM_NTASKS
 task_id=$SLURM_PROCID # 0-based rank of this task

@@ -158,6 +158,7 @@ const LoaderCtx = struct {
         switch (req) {
             .open_file => |open_req| {
                 const file_path = open_req.file_path;
+                wlog.debug("Req {}: open_file: file = {s}", .{ req_id, file_path });
 
                 var h = self.findFreeFileSlot() catch |err| {
                     self.sendResponseSynced(req_id, err);
@@ -186,6 +187,8 @@ const LoaderCtx = struct {
             },
 
             .close_file => |file_handle| {
+                wlog.debug("Req {}: close_file: {}", .{ req_id, file_handle });
+
                 self.checkFilehandle(file_handle) catch |err| {
                     self.sendResponseSynced(req_id, err);
                     return;
@@ -202,6 +205,8 @@ const LoaderCtx = struct {
             },
 
             .read_block => |read_req| {
+                wlog.debug("Req {}: read_block: file = {}, base = {}, size = {}", .{ req_id, read_req.file, read_req.base, read_req.result_buffer.len });
+
                 self.checkFilehandle(read_req.file) catch |err| {
                     self.sendResponseSynced(req_id, err);
                     return;
@@ -251,8 +256,6 @@ const LoaderCtx = struct {
                 if (self.req_cnt > self.debug_max_req_id) {
                     @panic("Request ID overflow");
                 }
-
-                wlog.debug("Req {}: {s}", .{ req_id, std.json.fmt(req, .{}) });
 
                 self.handleReq(req_id, req);
             } else if (self.is_draining) {
@@ -363,21 +366,28 @@ const LoaderCtx = struct {
 test "test dataloader" {
     std.testing.log_level = .debug;
 
+    const f = try std.fs.cwd().createFile("testfile.tar", .{});
+    var rng = std.Random.DefaultPrng.init(42);
+    var ref: [256]u8 = undefined;
+    rng.fill(&ref);
+    try f.writeAll(&ref);
+    f.close();
+
     var ctx = try LoaderCtx.init();
     ctx.debug_max_req_id = 5;
     ctx.debug_max_tick = 1000;
     try ctx.start();
 
-    ctx.sendSynced(.{ .open_file = .{ .file_path = "dataloader.zig" } });
+    ctx.sendSynced(.{ .open_file = .{ .file_path = "testfile.tar" } });
     const resp = try ctx.recvSynced().payload;
     const file = resp.open_file;
-    var buf: [4096]u8 = undefined;
-    ctx.sendSynced(.{ .read_block = .{ .file = file, .base = 0, .result_buffer = buf[0..17] } });
+    var buf: [256 - 42]u8 = undefined;
+    ctx.sendSynced(.{ .read_block = .{ .file = file, .base = 42, .result_buffer = &buf } });
     _ = try ctx.recvSynced().payload;
     ctx.sendSynced(.{ .close_file = file });
     ctx.join();
 
-    try std.testing.expectEqualStrings("// dataloader.zig", buf[0..17]);
+    try std.testing.expectEqualSlices(u8, ref[42..], &buf);
     try std.testing.expect(ctx.is_running == false);
     try std.testing.expectEqual(null, ctx.result_ring.dequeue());
 }

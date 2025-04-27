@@ -3,9 +3,8 @@ const std = @import("std");
 const Counter = std.atomic.Value(usize);
 
 pub const EnqueueError = error{Full};
-pub const DequeueError = error{Empty};
 
-fn SPSCRing(comptime capacity: comptime_int, comptime T: type) type {
+pub fn SPSCRing(comptime capacity: comptime_int, comptime T: type) type {
     return struct {
         const Self = @This();
         comptime {
@@ -35,10 +34,10 @@ fn SPSCRing(comptime capacity: comptime_int, comptime T: type) type {
             self.tail.store(next_tail, .release);
         }
 
-        pub fn dequeue(self: *Self) DequeueError!T {
+        pub fn dequeue(self: *Self) ?T {
             const cur_head = self.head.load(.unordered);
             if (cur_head == self.tail.load(.acquire)) {
-                return DequeueError.Empty;
+                return null;
             }
             const item = self.buffer[cur_head];
             self.head.store((cur_head + 1) & mask, .release);
@@ -53,8 +52,8 @@ test "test SPSC enqueue-dequeue" {
     try ring.enqueue(2);
     try ring.enqueue(3);
     try std.testing.expectError(EnqueueError.Full, ring.enqueue(5));
-    try std.testing.expectEqual(1, try ring.dequeue());
-    try std.testing.expectEqual(2, try ring.dequeue());
-    try std.testing.expectEqual(3, try ring.dequeue());
-    try std.testing.expectError(DequeueError.Empty, ring.dequeue());
+    try std.testing.expectEqual(1, ring.dequeue());
+    try std.testing.expectEqual(2, ring.dequeue());
+    try std.testing.expectEqual(3, ring.dequeue());
+    try std.testing.expectEqual(null, ring.dequeue());
 }

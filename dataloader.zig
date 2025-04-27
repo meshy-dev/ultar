@@ -1,3 +1,5 @@
+// dataloader.zig
+
 const std = @import("std");
 const xev = @import("xev");
 
@@ -15,29 +17,25 @@ const FileHandle = packed struct {
 const max_file_slots = std.math.maxInt(@FieldType(FileHandle, "idx"));
 const max_generation = std.math.maxInt(@FieldType(FileHandle, "generation"));
 
+const ReadBlockReq = struct {
+    base: u64,
+    file: FileHandle,
+    result_buffer: []u8,
+};
+
 const Request = union(enum) {
     open_file: struct {
         file_path: []const u8,
     },
-    close_file: struct {
-        file: u32,
-    },
-    read_block: struct {
-        base: u64,
-        size: u32,
-        file: u32,
-    },
+    close_file: FileHandle,
+    read_block: ReadBlockReq,
     drain: struct {},
 };
 
 const ResponsePayload = union(enum) {
     open_file: FileHandle,
     close_file: struct {},
-    read_block: struct {
-        data: []const u8,
-        size: u32,
-        file: u32,
-    },
+    read_block: struct {},
 };
 
 const Response = struct {
@@ -47,17 +45,25 @@ const Response = struct {
 
 const LoaderError = error{
     TooManyOpenFiles,
-} || std.fs.File.OpenError;
+    InvalidFileHandle,
+    ReadError,
+} || std.fs.File.OpenError || std.mem.Allocator.Error;
 
 const gpa = std.heap.c_allocator;
 
 fn path_checksum(path: []const u8) u8 {
     var checksum: u8 = 0;
     for (path) |c| {
-        checksum ^= c;
+        checksum +%= c;
     }
     return checksum;
 }
+
+const XevReq = struct {
+    req: ReadBlockReq,
+    c: xev.Completion = undefined,
+    request_id: u64 = 0,
+};
 
 const LoaderCtx = struct {
     const Self = @This();
@@ -81,11 +87,12 @@ const LoaderCtx = struct {
     tick: u64 = 0,
     debug_max_tick: u64 = std.math.maxInt(u64),
 
-    fn find_free_file_slot(self: *Self) !FileHandle {
+    req_mem_pool: std.heap.MemoryPool(XevReq),
+
+    fn findFreeFileSlot(self: *Self) !FileHandle {
         // This isn't called too often, just linear scan
         for (self.file_slots, 0..) |f, i| {
             if (f == null) {
-                self.file_slots_generation[i] += 1;
                 return .{
                     .idx = @intCast(i),
                     .generation = 0,
@@ -97,7 +104,16 @@ const LoaderCtx = struct {
         return LoaderError.TooManyOpenFiles;
     }
 
-    fn send_response(self: *Self, req_id: u64, resp: LoaderError!ResponsePayload) void {
+    fn checkFilehandle(self: *Self, file: FileHandle) !void {
+        const slot: usize = @intCast(file.idx);
+        if (self.file_slots[slot] == null) return LoaderError.InvalidFileHandle;
+        if (self.file_slots_generation[slot] != file.generation or self.file_slots_checksum[slot] != file.path_checksum) {
+            logger.warn("File handle {} is corrupted, current generation: {}, checksum: {}", .{ file, self.file_slots_generation[slot], self.file_slots_checksum[slot] });
+            return LoaderError.InvalidFileHandle;
+        }
+    }
+
+    fn sendResponseSynced(self: *Self, req_id: u64, resp: LoaderError!ResponsePayload) void {
         while (true) {
             self.result_ring.enqueue(.{
                 .request_id = req_id,
@@ -112,19 +128,45 @@ const LoaderCtx = struct {
         }
     }
 
-    fn handle_req(self: *Self, req_id: u64, req: Request) void {
+    fn xevReadCb(
+        ud: ?*Self,
+        _: *xev.Loop,
+        c: *xev.Completion,
+        _: xev.File,
+        _: xev.ReadBuffer,
+        r: xev.ReadError!usize,
+    ) xev.CallbackAction {
+        const self = ud orelse unreachable;
+
+        const xreq: *XevReq = @fieldParentPtr("c", c);
+
+        const actual = r catch {
+            self.sendResponseSynced(xreq.request_id, LoaderError.ReadError);
+            return .disarm;
+        };
+        if (actual != xreq.req.result_buffer.len) {
+            std.debug.panic("Unhandled error: {} != {}", .{ actual, xreq.req.result_buffer.len });
+        }
+
+        self.sendResponseSynced(xreq.request_id, .{ .read_block = .{} });
+
+        self.req_mem_pool.destroy(xreq);
+        return .disarm;
+    }
+
+    fn handleReq(self: *Self, req_id: u64, req: Request) void {
         switch (req) {
             .open_file => |open_req| {
                 const file_path = open_req.file_path;
 
-                var h = self.find_free_file_slot() catch |err| {
-                    self.send_response(req_id, err);
+                var h = self.findFreeFileSlot() catch |err| {
+                    self.sendResponseSynced(req_id, err);
                     return;
                 };
 
                 // Open the file
                 const f = std.fs.cwd().openFile(open_req.file_path, .{ .mode = .read_only }) catch |err| {
-                    self.send_response(req_id, err);
+                    self.sendResponseSynced(req_id, err);
                     return;
                 };
                 const xf = xev.File.init(f) catch unreachable;
@@ -140,17 +182,59 @@ const LoaderCtx = struct {
                 if (gen > max_generation) @panic("Open file generation overflow");
                 h.generation = @intCast(gen);
 
-                self.send_response(req_id, .{ .open_file = h });
+                self.sendResponseSynced(req_id, .{ .open_file = h });
+            },
+
+            .close_file => |file_handle| {
+                self.checkFilehandle(file_handle) catch |err| {
+                    self.sendResponseSynced(req_id, err);
+                    return;
+                };
+
+                const slot: usize = @intCast(file_handle.idx);
+
+                // Close the file
+                const f = self.file_slots[slot] orelse unreachable;
+                f.close();
+                self.file_slots[slot] = null;
+
+                self.sendResponseSynced(req_id, .{ .close_file = .{} });
+            },
+
+            .read_block => |read_req| {
+                self.checkFilehandle(read_req.file) catch |err| {
+                    self.sendResponseSynced(req_id, err);
+                    return;
+                };
+
+                const slot: usize = @intCast(read_req.file.idx);
+                const xf = self.xfile_slots[slot];
+
+                // Prepare read request
+                var xreq = self.req_mem_pool.create() catch |err| {
+                    self.sendResponseSynced(req_id, err);
+                    return;
+                };
+                xreq.req = read_req;
+
+                // Enqueue async read
+                xf.pread(
+                    &self.loop,
+                    &xreq.c,
+                    .{ .slice = read_req.result_buffer },
+                    read_req.base,
+                    Self,
+                    self,
+                    Self.xevReadCb,
+                );
             },
 
             .drain => {
                 self.is_draining = true;
             },
 
-            else => @panic("Not implemented"),
+            // else => @panic("Not implemented"),
         }
-
-        self.worker_thread = null;
     }
 
     fn run_worker(self: *Self) void {
@@ -168,9 +252,9 @@ const LoaderCtx = struct {
                     @panic("Request ID overflow");
                 }
 
-                wlog.debug("Req {}: {s}", .{ req_id, @tagName(req) });
+                wlog.debug("Req {}: {s}", .{ req_id, std.json.fmt(req, .{}) });
 
-                self.handle_req(req_id, req);
+                self.handleReq(req_id, req);
             } else if (self.is_draining) {
                 wlog.debug("No more requests, draining event loop", .{});
 
@@ -185,7 +269,10 @@ const LoaderCtx = struct {
             self.loop.run(.no_wait) catch |err| {
                 std.debug.panic("Error in event loop: {}", .{err});
             };
+            if (self.loop.active == 0) std.Thread.yield() catch {};
         }
+
+        self.worker_thread = null;
     }
 
     // Loader side functions
@@ -212,6 +299,16 @@ const LoaderCtx = struct {
         }
     }
 
+    pub fn recvSynced(self: *Self) Response {
+        while (true) {
+            if (self.result_ring.dequeue()) |r| {
+                return r;
+            }
+
+            std.Thread.yield() catch {};
+        }
+    }
+
     pub fn trySend(self: *Self, req: Request) bool {
         self.request_ring.enqueue(req) catch {
             return false;
@@ -220,8 +317,8 @@ const LoaderCtx = struct {
     }
 
     pub fn join(self: *Self) void {
-        logger.debug("Joining worker thread", .{});
         const thread = self.worker_thread orelse @panic("Worker thread not started");
+        logger.debug("Joining worker thread", .{});
         // Drain response so that pending requests won't block us from sending drain
         while (!self.trySend(.{ .drain = .{} })) {
             self.drainResponse();
@@ -245,7 +342,6 @@ const LoaderCtx = struct {
         self.is_running = true;
 
         self.worker_thread = try std.Thread.spawn(.{
-            .stack_size = 1 * 1024 * 1024,
             .allocator = gpa,
         }, Self.run_worker, .{self});
 
@@ -259,21 +355,29 @@ const LoaderCtx = struct {
             .file_slots = [_]?std.fs.File{null} ** max_file_slots,
             .file_slots_generation = [_]u32{0} ** max_file_slots,
             .loop = try xev.Loop.init(.{}),
+            .req_mem_pool = try std.heap.MemoryPool(XevReq).initPreheated(gpa, 16),
         };
     }
 };
 
-test "test dataloader join" {
+test "test dataloader" {
     std.testing.log_level = .debug;
 
     var ctx = try LoaderCtx.init();
-    ctx.debug_max_req_id = 2;
-    ctx.debug_max_tick = 10;
+    ctx.debug_max_req_id = 5;
+    ctx.debug_max_tick = 1000;
     try ctx.start();
 
-    ctx.sendSynced(.{ .open_file = .{ .file_path = "/sys/does_not_exist" } });
+    ctx.sendSynced(.{ .open_file = .{ .file_path = "dataloader.zig" } });
+    const resp = try ctx.recvSynced().payload;
+    const file = resp.open_file;
+    var buf: [4096]u8 = undefined;
+    ctx.sendSynced(.{ .read_block = .{ .file = file, .base = 0, .result_buffer = buf[0..17] } });
+    _ = try ctx.recvSynced().payload;
+    ctx.sendSynced(.{ .close_file = file });
     ctx.join();
 
+    try std.testing.expectEqualStrings("// dataloader.zig", buf[0..17]);
     try std.testing.expect(ctx.is_running == false);
     try std.testing.expectEqual(null, ctx.result_ring.dequeue());
 }

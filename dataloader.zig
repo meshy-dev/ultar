@@ -406,6 +406,14 @@ test "test dataloader" {
 }
 
 test "test dataloader blocked join" {
+    comptime {
+        const builtin = @import("builtin");
+
+        if (builtin.os.tag != .linux) {
+            return error.SkipZigTest;
+        }
+    }
+
     std.testing.log_level = .debug;
 
     var debug_alloc = std.heap.DebugAllocator(.{}).init;

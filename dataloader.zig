@@ -68,7 +68,11 @@ pub const LoaderCtx = struct {
     // The IO thread is very active, it should poll requests ASAP.
     // But the dataloader thread might be shared with Python,
     // thus making result ring larger helps reduce blocking.
-    const ReqRing = concurrent_ring.SPSCRing(7, Request);
+    const IdxedRequest = struct {
+        payload: Request,
+        request_id: u64,
+    };
+    const ReqRing = concurrent_ring.SPSCRing(7, IdxedRequest);
     const ResultRing = concurrent_ring.SPSCRing(63, Response);
 
     alloc: std.mem.Allocator,
@@ -225,6 +229,7 @@ pub const LoaderCtx = struct {
                     self.sendResponseSynced(req_id, err);
                     return;
                 };
+                xreq.request_id = req_id;
                 xreq.req = read_req;
 
                 // Enqueue async read
@@ -257,14 +262,7 @@ pub const LoaderCtx = struct {
             }
 
             if (self.request_ring.dequeue()) |req| {
-                const req_id = self.req_cnt;
-                self.req_cnt += 1;
-
-                if (self.req_cnt > self.debug_max_req_id) {
-                    @panic("Request ID overflow");
-                }
-
-                self.handleReq(req_id, req);
+                self.handleReq(req.request_id, req.payload);
             }
 
             self.loop.run(.no_wait) catch |err| {
@@ -295,15 +293,13 @@ pub const LoaderCtx = struct {
         }
     }
 
-    pub fn sendSynced(self: *Self, req: Request) void {
+    pub fn sendSynced(self: *Self, req: Request) u64 {
         while (true) {
-            self.request_ring.enqueue(req) catch {
-                std.atomic.spinLoopHint();
-                std.Thread.yield() catch {};
-                continue;
-            };
-
-            break;
+            if (self.trySend(req)) |rid| {
+                return rid;
+            }
+            std.atomic.spinLoopHint();
+            std.Thread.yield() catch {};
         }
     }
 
@@ -317,18 +313,21 @@ pub const LoaderCtx = struct {
         }
     }
 
-    pub fn trySend(self: *Self, req: Request) bool {
-        self.request_ring.enqueue(req) catch {
-            return false;
+    pub fn trySend(self: *Self, req: Request) ?u64 {
+        const req_id = self.req_cnt;
+        self.req_cnt += 1;
+        self.request_ring.enqueue(.{ .payload = req, .request_id = req_id }) catch {
+            self.req_cnt -= 1; // We can do this because this is SPSC
+            return null;
         };
-        return true;
+        return req_id;
     }
 
     pub fn join(self: *Self) void {
         const thread = self.worker_thread orelse @panic("Worker thread not started");
         logger.debug("Joining worker thread", .{});
         // Drain response so that pending requests won't block us from sending drain
-        while (!self.trySend(.{ .drain = .{} })) {
+        while (self.trySend(.{ .drain = .{} }) == null) {
             self.drainResponse();
             std.Thread.yield() catch {};
         }
@@ -367,6 +366,9 @@ pub const LoaderCtx = struct {
     }
 
     pub fn deinit(self: *Self) void {
+        if (self.worker_thread) |_| {
+            self.join();
+        }
         self.loop.deinit();
         self.req_mem_pool.deinit();
     }
@@ -397,13 +399,16 @@ test "test dataloader" {
     try ctx.start();
     defer ctx.deinit();
 
-    ctx.sendSynced(.{ .open_file = .{ .file_path = "testfile.tar" } });
-    const resp = try ctx.recvSynced().payload;
-    const file = resp.open_file;
+    const open_rid = ctx.sendSynced(.{ .open_file = .{ .file_path = "testfile.tar" } });
+    const resp = ctx.recvSynced();
+    try std.testing.expect(open_rid == resp.request_id);
+    const file = (try resp.payload).open_file;
     var buf: [256 - 42]u8 = undefined;
-    ctx.sendSynced(.{ .read_block = .{ .file = file, .base = 42, .result_buffer = &buf } });
-    _ = try ctx.recvSynced().payload;
-    ctx.sendSynced(.{ .close_file = file });
+    const read_rid = ctx.sendSynced(.{ .read_block = .{ .file = file, .base = 42, .result_buffer = &buf } });
+    const read_resp = ctx.recvSynced();
+    try std.testing.expect(read_rid == read_resp.request_id);
+    _ = try read_resp.payload;
+    _ = ctx.sendSynced(.{ .close_file = file });
     ctx.join();
 
     try std.testing.expectEqualSlices(u8, ref[42..], &buf);
@@ -424,7 +429,7 @@ test "test dataloader blocked join" {
     defer ctx.deinit();
 
     // Send until we can't send anymore (blocked on full response ring)
-    while (ctx.trySend(.{ .open_file = .{ .file_path = "/sys/does_not_exist" } })) {}
+    while (ctx.trySend(.{ .open_file = .{ .file_path = "/sys/does_not_exist" } })) |_| {}
     std.Thread.sleep(1000);
     // This must unblock the worker
     ctx.join();

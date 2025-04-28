@@ -45,17 +45,7 @@ pub const LuaDataLoader = struct {
     }
 
     fn printLuaErr(self: *Self, err: zlua.Error) zlua.Error {
-        switch (err) {
-            error.LuaError, error.LuaRuntime, error.LuaSyntax => {
-                const err_msg = self.lua.toString(-1) catch "unknown error";
-                logger.err("{}Error:\n{s}", .{ err, err_msg });
-            },
-            else => {
-                logger.err("Lua op returned {}", .{err});
-            },
-        }
-        std.debug.dumpCurrentStackTrace(null);
-        return err;
+        return lua_rt.printLuaErr(self.lua, err);
     }
 
     fn initLua(self: *Self, spec: LuaLoaderSpec) !void {

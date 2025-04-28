@@ -18,7 +18,8 @@ const ScanCtx = struct {
     }
 };
 
-fn printLuaErr(lua: *Lua, err: zlua.Error) zlua.Error {
+pub fn printLuaErr(lua: *Lua, err: zlua.Error) zlua.Error {
+    std.debug.dumpCurrentStackTrace(null);
     switch (err) {
         error.LuaError, error.LuaRuntime, error.LuaSyntax => {
             const err_msg = lua.toString(-1) catch "unknown error";
@@ -28,7 +29,6 @@ fn printLuaErr(lua: *Lua, err: zlua.Error) zlua.Error {
             logger.err("Lua op returned {}", .{err});
         },
     }
-    std.debug.dumpCurrentStackTrace(null);
     return err;
 }
 

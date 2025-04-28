@@ -263,9 +263,9 @@ def load_index():
                 off = base_offset + o
                 size = s
                 d[k] = f"{off:08X}..{off+size:08X}"
-                l[k] = (
-                    f"/boxed_file?file={quote(tar_path, safe=[])}&k={k}&base={off:x}&end={off+size:x}"
-                )
+                l[
+                    k
+                ] = f"/boxed_file?file={quote(tar_path, safe=[])}&k={k}&base={off:x}&end={off+size:x}"
             data.append(d)
             links.append(l)
 

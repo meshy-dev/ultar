@@ -1,7 +1,7 @@
 const std = @import("std");
 const zlua = @import("zlua");
 const Lua = @import("zlua").Lua;
-
+const lua_rt = @import("lua_rt.zig");
 const dataloader = @import("dataloader.zig");
 const LoaderCtx = dataloader.LoaderCtx;
 
@@ -29,6 +29,8 @@ pub const LuaDataLoader = struct {
 
     u_loader_fn: UserLoaderFn = .{},
     u_ctx: i32 = 0,
+
+    u_ctx_funcs_table: i32 = 0,
 
     fn getFieldAsFuncRef(self: *Self, table: i32, field_name: [:0]const u8) !i32 {
         _ = self.lua.getField(table, field_name);
@@ -58,6 +60,7 @@ pub const LuaDataLoader = struct {
 
     fn initLua(self: *Self, spec: LuaLoaderSpec) !void {
         self.lua.openLibs();
+        lua_rt.registerRt(self.lua) catch |err| return self.printLuaErr(err);
 
         // Compile src to bytecode & load into VM
         const alloc = self.lua.allocator();
@@ -98,13 +101,13 @@ pub const LuaDataLoader = struct {
         var self = try alloc.create(Self);
         errdefer alloc.destroy(self);
 
-        self.lua = try Lua.init(alloc);
-        errdefer self.lua.deinit();
-        try self.initLua(spec);
-
         self.loader = try LoaderCtx.init(alloc);
         errdefer self.loader.deinit();
         try self.loader.start();
+
+        self.lua = try Lua.init(alloc);
+        errdefer self.lua.deinit();
+        try self.initLua(spec);
 
         return self;
     }

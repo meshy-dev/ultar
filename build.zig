@@ -31,7 +31,7 @@ pub fn build(b: *std.Build) void {
         .pic = true,
         .target = target,
         .optimize = optimize,
-        .root_source_file = b.path("dataloader.zig"),
+        .root_source_file = b.path("lua_dataloader.zig"),
         .strip = if (optimize == .ReleaseFast) true else null,
     });
     lib_dataloader.root_module.addImport("xev", xev.module("xev"));

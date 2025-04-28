@@ -2,15 +2,12 @@
 
 const std = @import("std");
 const xev = @import("xev");
-const zlua = @import("zlua");
 const concurrent_ring = @import("concurrent_ring.zig");
 
 const logger = std.log.scoped(.dataloader);
 const wlog = std.log.scoped(.dataloader_io_thread);
 
-const Lua = zlua.Lua;
-
-const FileHandle = packed struct {
+pub const FileHandle = packed struct {
     idx: u10,
     generation: u14,
     path_checksum: u8,
@@ -19,13 +16,13 @@ const FileHandle = packed struct {
 const max_file_slots = std.math.maxInt(@FieldType(FileHandle, "idx"));
 const max_generation = std.math.maxInt(@FieldType(FileHandle, "generation"));
 
-const ReadBlockReq = struct {
+pub const ReadBlockReq = struct {
     base: u64,
     file: FileHandle,
     result_buffer: []u8,
 };
 
-const Request = union(enum) {
+pub const Request = union(enum) {
     open_file: struct {
         file_path: []const u8,
     },
@@ -34,18 +31,18 @@ const Request = union(enum) {
     drain: struct {},
 };
 
-const ResponsePayload = union(enum) {
+pub const ResponsePayload = union(enum) {
     open_file: FileHandle,
     close_file: struct {},
     read_block: struct {},
 };
 
-const Response = struct {
+pub const Response = struct {
     request_id: u64,
     payload: LoaderError!ResponsePayload,
 };
 
-const LoaderError = error{
+pub const LoaderError = error{
     TooManyOpenFiles,
     InvalidFileHandle,
     ReadError,
@@ -65,7 +62,7 @@ const XevReq = struct {
     request_id: u64 = 0,
 };
 
-const LoaderCtx = struct {
+pub const LoaderCtx = struct {
     const Self = @This();
 
     // The IO thread is very active, it should poll requests ASAP.
@@ -374,106 +371,6 @@ const LoaderCtx = struct {
         self.req_mem_pool.deinit();
     }
 };
-
-pub const LuaLoaderSpec = extern struct {
-    shard_list: [*c]const [*c]const u8,
-    num_shards: c_uint,
-    src: [*c]const u8,
-    debug: bool,
-};
-
-pub const LuaDataLoader = struct {
-    const Self = @This();
-
-    loader: LoaderCtx,
-    lua: *Lua,
-
-    fn initLua(self: *Self, spec: LuaLoaderSpec) !void {
-        self.lua.openLibs();
-
-        // Compile src to bytecode & load into VM
-        const alloc = self.lua.allocator();
-        const src: [:0]const u8 = std.mem.span(spec.src);
-        const bc = try zlua.compile(alloc, src, .{});
-        defer alloc.free(bc);
-
-        try self.lua.loadBytecode("...", bc);
-        // Call the bytecode that generates a context & its functions
-        try self.lua.protectedCall(.{});
-    }
-
-    pub fn init(spec: LuaLoaderSpec, alloc: std.mem.Allocator) !*Self {
-        var self = try alloc.create(Self);
-        errdefer alloc.destroy(self);
-
-        self.* = .{
-            .loader = try LoaderCtx.init(alloc),
-            .lua = try Lua.init(alloc),
-        };
-
-        try self.initLua(spec);
-        try self.loader.start();
-
-        return self;
-    }
-
-    pub fn deinit(self: *Self) void {
-        const alloc = self.lua.allocator();
-        self.loader.join();
-        self.loader.deinit();
-        self.lua.deinit();
-        alloc.destroy(self);
-    }
-};
-
-const LuaLoaderCCtx = struct {
-    alloc_ctx: union(enum) {
-        rel: struct {},
-        debug: std.heap.DebugAllocator(.{}),
-    },
-    alloc: std.mem.Allocator,
-    loader: *LuaDataLoader,
-};
-
-fn createLuaLoader(spec: LuaLoaderSpec) !*LuaLoaderCCtx {
-    logger.info("Creating lua loader with spec: {}", .{spec});
-    const c = try std.heap.c_allocator.create(LuaLoaderCCtx);
-    errdefer std.heap.c_allocator.destroy(c);
-
-    if (spec.debug) {
-        c.alloc_ctx = .{ .debug = std.heap.DebugAllocator(.{}).init };
-        errdefer _ = c.alloc_ctx.debug.deinit();
-        c.alloc = c.alloc_ctx.debug.allocator();
-        c.loader = try LuaDataLoader.init(spec, c.alloc);
-        errdefer c.loader.deinit();
-        return c;
-    } else {
-        c.alloc_ctx = .{ .rel = .{} };
-        c.alloc = std.heap.smp_allocator;
-        c.loader = try LuaDataLoader.init(spec, c.alloc);
-        errdefer c.loader.deinit();
-        return c;
-    }
-}
-
-export fn ultarCreateLuaLoader(spec: LuaLoaderSpec) ?*LuaLoaderCCtx {
-    return createLuaLoader(spec) catch |err| {
-        logger.err("Failed to create Lua loader: {}", .{err});
-        return @ptrFromInt(0);
-    };
-}
-
-export fn ultarDestroyLuaLoader(c: *LuaLoaderCCtx) void {
-    c.loader.deinit();
-    const alloc = c.alloc_ctx;
-    switch (alloc) {
-        .rel => {},
-        .debug => {
-            _ = c.alloc_ctx.debug.deinit();
-        },
-    }
-    std.heap.c_allocator.destroy(c);
-}
 
 test "test dataloader" {
     std.testing.log_level = .debug;

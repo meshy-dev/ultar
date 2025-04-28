@@ -373,6 +373,12 @@ pub const LoaderCtx = struct {
 };
 
 test "test dataloader" {
+    const builtin = @import("builtin");
+
+    if (builtin.os.tag != .linux) {
+        return error.SkipZigTest;
+    }
+
     std.testing.log_level = .debug;
 
     const f = try std.fs.cwd().createFile("testfile.tar", .{});
@@ -406,14 +412,6 @@ test "test dataloader" {
 }
 
 test "test dataloader blocked join" {
-    comptime {
-        const builtin = @import("builtin");
-
-        if (builtin.os.tag != .linux) {
-            return error.SkipZigTest;
-        }
-    }
-
     std.testing.log_level = .debug;
 
     var debug_alloc = std.heap.DebugAllocator(.{}).init;

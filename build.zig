@@ -6,6 +6,12 @@ pub fn build(b: *std.Build) void {
 
     const clap = b.dependency("clap", .{ .target = target, .optimize = optimize });
     const xev = b.dependency("libxev", .{ .target = target, .optimize = optimize });
+    const zlua = b.dependency("zlua", .{
+        .target = target,
+        .optimize = optimize,
+        .lang = .luau,
+        .shared = false,
+    });
 
     const indexer = b.addExecutable(.{
         .name = "indexer",
@@ -29,6 +35,7 @@ pub fn build(b: *std.Build) void {
         .strip = if (optimize == .ReleaseFast) true else null,
     });
     lib_dataloader.root_module.addImport("xev", xev.module("xev"));
+    lib_dataloader.root_module.addImport("zlua", zlua.module("zlua"));
     b.installArtifact(lib_dataloader);
 
     const test_step = b.step("test", "Run unit tests");

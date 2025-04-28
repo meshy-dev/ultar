@@ -2,11 +2,13 @@
 
 const std = @import("std");
 const xev = @import("xev");
-
+const zlua = @import("zlua");
 const concurrent_ring = @import("concurrent_ring.zig");
 
 const logger = std.log.scoped(.dataloader);
 const wlog = std.log.scoped(.dataloader_io_thread);
+
+const Lua = zlua.Lua;
 
 const FileHandle = packed struct {
     idx: u10,
@@ -49,8 +51,6 @@ const LoaderError = error{
     ReadError,
 } || std.fs.File.OpenError || std.mem.Allocator.Error;
 
-const gpa = std.heap.c_allocator;
-
 fn path_checksum(path: []const u8) u8 {
     var checksum: u8 = 0;
     for (path) |c| {
@@ -68,8 +68,16 @@ const XevReq = struct {
 const LoaderCtx = struct {
     const Self = @This();
 
-    request_ring: concurrent_ring.SPSCRing(15, Request),
-    result_ring: concurrent_ring.SPSCRing(15, Response),
+    // The IO thread is very active, it should poll requests ASAP.
+    // But the dataloader thread might be shared with Python,
+    // thus making result ring larger helps reduce blocking.
+    const ReqRing = concurrent_ring.SPSCRing(7, Request);
+    const ResultRing = concurrent_ring.SPSCRing(63, Response);
+
+    alloc: std.mem.Allocator,
+
+    request_ring: ReqRing = ReqRing.init(),
+    result_ring: ResultRing = ResultRing.init(),
 
     file_slots: [max_file_slots]?std.fs.File = @splat(null),
     xfile_slots: [max_file_slots]xev.File = undefined,
@@ -243,7 +251,7 @@ const LoaderCtx = struct {
     }
 
     fn run_worker(self: *Self) void {
-        self.worker_thread.setName("dataloader_io_worker") catch {};
+        self.worker_thread.?.setName("dataloader_io_worker") catch {};
 
         while (self.is_running) {
             self.tick += 1;
@@ -260,21 +268,19 @@ const LoaderCtx = struct {
                 }
 
                 self.handleReq(req_id, req);
-            } else if (self.is_draining) {
-                wlog.debug("No more requests, draining event loop", .{});
-
-                // If we are draining & no new requests, run the loop and exit
-                self.loop.run(.until_done) catch |err| {
-                    std.debug.panic("Error in event loop: {}", .{err});
-                };
-                self.is_running = false;
-                break;
             }
 
             self.loop.run(.no_wait) catch |err| {
                 std.debug.panic("Error in event loop: {}", .{err});
             };
-            if (self.loop.active == 0) std.Thread.yield() catch {};
+            if (self.loop.active == 0) {
+                if (self.is_draining) {
+                    wlog.debug("No more requests & IO loop drained.", .{});
+                    self.is_running = false;
+                    break;
+                }
+                std.Thread.yield() catch {};
+            }
         }
 
         self.worker_thread = null;
@@ -347,23 +353,127 @@ const LoaderCtx = struct {
         self.is_running = true;
 
         self.worker_thread = try std.Thread.spawn(.{
-            .allocator = gpa,
+            .allocator = self.alloc,
         }, Self.run_worker, .{self});
 
         logger.debug("Worker thread started", .{});
     }
 
-    pub fn init() !Self {
+    pub fn init(alloc: std.mem.Allocator) !Self {
         return .{
-            .request_ring = concurrent_ring.SPSCRing(15, Request).init(),
-            .result_ring = concurrent_ring.SPSCRing(15, Response).init(),
+            .alloc = alloc,
             .file_slots = [_]?std.fs.File{null} ** max_file_slots,
             .file_slots_generation = [_]u32{0} ** max_file_slots,
             .loop = try xev.Loop.init(.{}),
-            .req_mem_pool = try std.heap.MemoryPool(XevReq).initPreheated(gpa, 16),
+            .req_mem_pool = try std.heap.MemoryPool(XevReq).initPreheated(alloc, 16),
         };
     }
+
+    pub fn deinit(self: *Self) void {
+        self.loop.deinit();
+        self.req_mem_pool.deinit();
+    }
 };
+
+pub const LuaLoaderSpec = extern struct {
+    shard_list: [*c]const [*c]const u8,
+    num_shards: c_uint,
+    src: [*c]const u8,
+    debug: bool,
+};
+
+pub const LuaDataLoader = struct {
+    const Self = @This();
+
+    loader: LoaderCtx,
+    lua: *Lua,
+
+    fn initLua(self: *Self, spec: LuaLoaderSpec) !void {
+        self.lua.openLibs();
+
+        // Compile src to bytecode & load into VM
+        const alloc = self.lua.allocator();
+        const src: [:0]const u8 = std.mem.span(spec.src);
+        const bc = try zlua.compile(alloc, src, .{});
+        defer alloc.free(bc);
+
+        try self.lua.loadBytecode("...", bc);
+        // Call the bytecode that generates a context & its functions
+        try self.lua.protectedCall(.{});
+    }
+
+    pub fn init(spec: LuaLoaderSpec, alloc: std.mem.Allocator) !*Self {
+        var self = try alloc.create(Self);
+        errdefer alloc.destroy(self);
+
+        self.* = .{
+            .loader = try LoaderCtx.init(alloc),
+            .lua = try Lua.init(alloc),
+        };
+
+        try self.initLua(spec);
+        try self.loader.start();
+
+        return self;
+    }
+
+    pub fn deinit(self: *Self) void {
+        const alloc = self.lua.allocator();
+        self.loader.join();
+        self.loader.deinit();
+        self.lua.deinit();
+        alloc.destroy(self);
+    }
+};
+
+const LuaLoaderCCtx = struct {
+    alloc_ctx: union(enum) {
+        rel: struct {},
+        debug: std.heap.DebugAllocator(.{}),
+    },
+    alloc: std.mem.Allocator,
+    loader: *LuaDataLoader,
+};
+
+fn createLuaLoader(spec: LuaLoaderSpec) !*LuaLoaderCCtx {
+    logger.info("Creating lua loader with spec: {}", .{spec});
+    const c = try std.heap.c_allocator.create(LuaLoaderCCtx);
+    errdefer std.heap.c_allocator.destroy(c);
+
+    if (spec.debug) {
+        c.alloc_ctx = .{ .debug = std.heap.DebugAllocator(.{}).init };
+        errdefer _ = c.alloc_ctx.debug.deinit();
+        c.alloc = c.alloc_ctx.debug.allocator();
+        c.loader = try LuaDataLoader.init(spec, c.alloc);
+        errdefer c.loader.deinit();
+        return c;
+    } else {
+        c.alloc_ctx = .{ .rel = .{} };
+        c.alloc = std.heap.smp_allocator;
+        c.loader = try LuaDataLoader.init(spec, c.alloc);
+        errdefer c.loader.deinit();
+        return c;
+    }
+}
+
+export fn ultarCreateLuaLoader(spec: LuaLoaderSpec) ?*LuaLoaderCCtx {
+    return createLuaLoader(spec) catch |err| {
+        logger.err("Failed to create Lua loader: {}", .{err});
+        return @ptrFromInt(0);
+    };
+}
+
+export fn ultarDestroyLuaLoader(c: *LuaLoaderCCtx) void {
+    c.loader.deinit();
+    const alloc = c.alloc_ctx;
+    switch (alloc) {
+        .rel => {},
+        .debug => {
+            _ = c.alloc_ctx.debug.deinit();
+        },
+    }
+    std.heap.c_allocator.destroy(c);
+}
 
 test "test dataloader" {
     std.testing.log_level = .debug;
@@ -375,10 +485,14 @@ test "test dataloader" {
     try f.writeAll(&ref);
     f.close();
 
-    var ctx = try LoaderCtx.init();
+    var debug_alloc = std.heap.DebugAllocator(.{}).init;
+    defer _ = debug_alloc.deinit();
+
+    var ctx = try LoaderCtx.init(debug_alloc.allocator());
     ctx.debug_max_req_id = 5;
     ctx.debug_max_tick = 1000;
     try ctx.start();
+    defer ctx.deinit();
 
     ctx.sendSynced(.{ .open_file = .{ .file_path = "testfile.tar" } });
     const resp = try ctx.recvSynced().payload;
@@ -397,17 +511,18 @@ test "test dataloader" {
 test "test dataloader blocked join" {
     std.testing.log_level = .debug;
 
-    var ctx = try LoaderCtx.init();
+    var debug_alloc = std.heap.DebugAllocator(.{}).init;
+    defer _ = debug_alloc.deinit();
+
+    var ctx = try LoaderCtx.init(debug_alloc.allocator());
     ctx.debug_max_req_id = 100;
     ctx.debug_max_tick = 1000;
     try ctx.start();
+    defer ctx.deinit();
 
     // Send until we can't send anymore (blocked on full response ring)
     while (ctx.trySend(.{ .open_file = .{ .file_path = "/sys/does_not_exist" } })) {}
-    for (0..20) |_| {
-        // For good measure try to send a few more
-        _ = ctx.trySend(.{ .open_file = .{ .file_path = "/sys/does_not_exist" } });
-    }
+    std.Thread.sleep(1000);
     // This must unblock the worker
     ctx.join();
 

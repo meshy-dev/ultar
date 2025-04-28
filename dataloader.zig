@@ -6,7 +6,7 @@ const xev = @import("xev");
 const concurrent_ring = @import("concurrent_ring.zig");
 
 const logger = std.log.scoped(.dataloader);
-const wlog = std.log.scoped(.data_worker);
+const wlog = std.log.scoped(.dataloader_io_thread);
 
 const FileHandle = packed struct {
     idx: u10,
@@ -243,6 +243,8 @@ const LoaderCtx = struct {
     }
 
     fn run_worker(self: *Self) void {
+        self.worker_thread.setName("dataloader_io_worker") catch {};
+
         while (self.is_running) {
             self.tick += 1;
             if (self.tick > self.debug_max_tick) {

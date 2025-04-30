@@ -2,6 +2,7 @@ import ctypes
 from pathlib import Path
 import sys
 import re
+from tqdm import tqdm
 
 
 libdataloader = ctypes.CDLL("./zig-out/lib/libdataloader.so")
@@ -57,11 +58,13 @@ test_spec.debug = False
 loader = libdataloader.ultarCreateLuaLoader(test_spec)
 assert loader is not None
 
+pgbar = tqdm()
 while True:
     r = libdataloader.ultarNextRow(loader)
     if r:
         libdataloader.ultarReclaimRow(loader, r)
     else:
         break
+    pgbar.update(1)
 
 libdataloader.ultarDestroyLuaLoader(loader)

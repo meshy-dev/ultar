@@ -313,14 +313,21 @@ pub const LoaderCtx = struct {
         }
     }
 
+    // Try to send a request,
+    // on success: return request id (id always > 0)
+    // on failure: return null
     pub fn trySend(self: *Self, req: Request) ?u64 {
-        const req_id = self.req_cnt;
         self.req_cnt += 1;
+        const req_id = self.req_cnt;
         self.request_ring.enqueue(.{ .payload = req, .request_id = req_id }) catch {
             self.req_cnt -= 1; // We can do this because this is SPSC
             return null;
         };
         return req_id;
+    }
+
+    pub fn tryRecv(self: *Self) ?Response {
+        return self.result_ring.dequeue();
     }
 
     pub fn join(self: *Self) void {

@@ -513,11 +513,11 @@ pub fn MsgpackHandler(CtxT: type) type {
         int: ?fn (ud: *CtxT, v: i64) anyerror!void = null,
         float: ?fn (ud: *CtxT, v: f64) anyerror!void = null,
         str: ?fn (ud: *CtxT, str: []const u8) anyerror!void = null,
-        map_begin: ?fn (ud: *CtxT, len: usize) anyerror!void = null,
-        map_field: ?fn (ud: *CtxT, key: []const u8) anyerror!void = null,
-        map_end: ?fn (ud: *CtxT) anyerror!void = null,
-        array_begin: ?fn (ud: *CtxT, len: usize) anyerror!void = null,
-        array_end: ?fn (ud: *CtxT) anyerror!void = null,
+        mapBegin: ?fn (ud: *CtxT, len: usize) anyerror!void = null,
+        mapField: ?fn (ud: *CtxT, key: []const u8) anyerror!void = null,
+        mapEnd: ?fn (ud: *CtxT) anyerror!void = null,
+        arrayBegin: ?fn (ud: *CtxT, len: usize) anyerror!void = null,
+        arrayEnd: ?fn (ud: *CtxT) anyerror!void = null,
     };
 }
 
@@ -534,7 +534,7 @@ const MsgpackError = error{
     MapKeyIsNotStr,
 };
 
-pub fn MsgpackUnpacker(CtxT: type, comptime handler: MsgpackHandler(CtxT), Reader: type) type {
+pub fn Unpacker(CtxT: type, comptime handler: MsgpackHandler(CtxT), Reader: type) type {
     return struct {
         const Self = @This();
         const BufferStream = std.io.BufferedReader(16384, Reader);
@@ -543,43 +543,76 @@ pub fn MsgpackUnpacker(CtxT: type, comptime handler: MsgpackHandler(CtxT), Reade
         ctx: CtxT,
         stream: BufferStream,
 
-        fn unpackStrAlloc(self: *Self, header: u8) !struct { []u8, u64 } {
+        fn isShortStr(header: u8) bool {
+            return header == 0xd9 or (header >= 0xa0 and header <= 0xbf);
+        }
+
+        fn unpackStr(self: *Self, header: u8, out_buf: []u8) !struct { []u8, u64 } {
             const reader = self.stream.reader();
+            var read: usize = 0;
+            var str_len: usize = 0;
             switch (header) {
                 // fixstr
                 0xa0...0xbf => {
-                    const str_len: usize = @intCast(header & 0x1f);
-                    const str = try self.alloc.alloc(u8, str_len);
-                    _ = try reader.readAll(str);
-                    return .{ str, str_len };
+                    str_len = @intCast(header & 0x1f);
                 },
                 // str 8
                 0xd9 => {
-                    const str_len: usize = @intCast(try reader.readByte());
-                    const str = try self.alloc.alloc(u8, str_len);
-                    _ = try reader.readAll(str);
-                    return .{ str, 1 + str_len };
+                    str_len = @intCast(try reader.readByte());
+                    read += 1;
                 },
                 // str 16
                 0xda => {
                     var buf: [2]u8 = undefined;
-                    _ = try reader.readAll(&buf);
-                    const str_len: usize = (@as(u64, @intCast(buf[0])) << 8) | @as(u64, @intCast(buf[1]));
-                    const str = try self.alloc.alloc(u8, str_len);
-                    _ = try reader.readAll(str);
-                    return .{ str, 2 + str_len };
+                    read += try reader.readAll(&buf);
+                    str_len = (@as(u64, @intCast(buf[0])) << 8) | @as(u64, @intCast(buf[1]));
                 },
                 // str 32
                 0xdb => {
                     var buf: [4]u8 = undefined;
-                    _ = try reader.readAll(&buf);
-                    const str_len: usize = (@as(u64, @intCast(buf[0])) << 24) | (@as(u64, @intCast(buf[1])) << 16) | (@as(u64, @intCast(buf[2])) << 8) | @as(u64, @intCast(buf[3]));
-                    const str = try self.alloc.alloc(u8, str_len);
-                    _ = try reader.readAll(str);
-                    return .{ str, 4 + str_len };
+                    read += try reader.readAll(&buf);
+                    str_len = (@as(u64, @intCast(buf[0])) << 24) | (@as(u64, @intCast(buf[1])) << 16) | (@as(u64, @intCast(buf[2])) << 8) | @as(u64, @intCast(buf[3]));
                 },
                 else => return error.InvalidHeader,
             }
+            if (str_len > out_buf.len) {
+                return error.OutOfMemory;
+            }
+            read += try reader.readAll(out_buf[0..str_len]);
+            return .{ out_buf[0..str_len], read };
+        }
+
+        fn unpackStrAlloc(self: *Self, header: u8) !struct { []u8, u64 } {
+            const reader = self.stream.reader();
+            var read: usize = 0;
+            var str_len: usize = 0;
+            switch (header) {
+                // fixstr
+                0xa0...0xbf => {
+                    str_len = @intCast(header & 0x1f);
+                },
+                // str 8
+                0xd9 => {
+                    str_len = @intCast(try reader.readByte());
+                    read += 1;
+                },
+                // str 16
+                0xda => {
+                    var buf: [2]u8 = undefined;
+                    read += try reader.readAll(&buf);
+                    str_len = (@as(u64, @intCast(buf[0])) << 8) | @as(u64, @intCast(buf[1]));
+                },
+                // str 32
+                0xdb => {
+                    var buf: [4]u8 = undefined;
+                    read += try reader.readAll(&buf);
+                    str_len = (@as(u64, @intCast(buf[0])) << 24) | (@as(u64, @intCast(buf[1])) << 16) | (@as(u64, @intCast(buf[2])) << 8) | @as(u64, @intCast(buf[3]));
+                },
+                else => return error.InvalidHeader,
+            }
+            const str = try self.alloc.alloc(u8, str_len);
+            read += try reader.readAll(str);
+            return .{ str, read };
         }
 
         fn walkMap(self: *Self, header: u8) !u64 {
@@ -604,23 +637,34 @@ pub fn MsgpackUnpacker(CtxT: type, comptime handler: MsgpackHandler(CtxT), Reade
                 else => unreachable,
             }
 
-            try handler.map_begin.?(&self.ctx, map_len);
+            try handler.mapBegin.?(&self.ctx, map_len);
 
             for (0..map_len) |_| {
                 // Read key
-                const key, const key_n = self.unpackStrAlloc(try reader.readByte()) catch |err| {
-                    if (err == MsgpackError.InvalidHeader) return MsgpackError.MapKeyIsNotStr;
-                    return err;
-                };
-                read += key_n + 1;
-                try handler.map_field.?(&self.ctx, key);
-                self.alloc.free(key);
+                const key_header: u8 = 0;
+                if (Self.isShortStr(key_header)) {
+                    var buf: [256]u8 = undefined;
+                    const key, const key_n = self.unpackStr(try reader.readByte(), &buf) catch |err| {
+                        if (err == MsgpackError.InvalidHeader) return MsgpackError.MapKeyIsNotStr;
+                        return err;
+                    };
+                    read += key_n + 1;
+                    try handler.mapField.?(&self.ctx, key);
+                } else {
+                    const key, const key_n = self.unpackStrAlloc(try reader.readByte()) catch |err| {
+                        if (err == MsgpackError.InvalidHeader) return MsgpackError.MapKeyIsNotStr;
+                        return err;
+                    };
+                    defer self.alloc.free(key);
+                    read += key_n + 1;
+                    try handler.mapField.?(&self.ctx, key);
+                }
 
                 // Process value
                 read += try self.next(1);
             }
 
-            if (handler.map_end) |f| {
+            if (handler.mapEnd) |f| {
                 try f(&self.ctx);
             }
 
@@ -649,13 +693,13 @@ pub fn MsgpackUnpacker(CtxT: type, comptime handler: MsgpackHandler(CtxT), Reade
                 else => unreachable,
             }
 
-            try (handler.array_begin orelse return errNoImpl())(&self.ctx, arr_len);
+            try (handler.arrayBegin orelse return errNoImpl())(&self.ctx, arr_len);
 
             for (0..arr_len) |_| {
                 read += try self.next(1);
             }
 
-            if (handler.array_end) |f| {
+            if (handler.arrayEnd) |f| {
                 try f(&self.ctx);
             }
 
@@ -683,17 +727,25 @@ pub fn MsgpackUnpacker(CtxT: type, comptime handler: MsgpackHandler(CtxT), Reade
                     } else return errNoImpl(),
                     // fixmap, map 16, map 32
                     0x80...0x8f, 0xde, 0xdf => {
-                        if (handler.map_begin == null or handler.map_field == null) return errNoImpl();
+                        if (handler.mapBegin == null or handler.mapField == null) return errNoImpl();
                         read += try self.walkMap(header);
                     },
                     // fixarray, arr 16, arr 32
                     0x90...0x9f, 0xdc, 0xdd => read += try self.walkArr(header),
-                    // fixstr, str 8, str 16, str 32
-                    0xa0...0xbf, 0xd9, 0xda, 0xdb => if (handler.str orelse return errNoImpl()) |h_str| {
-                        const str, const n = try self.unpackStrAlloc(header);
+                    // fixstr, str 8
+                    0xa0...0xbf, 0xd9 => if (handler.str) |h_str| {
+                        var buf: [256]u8 = undefined;
+                        const str, const n = try self.unpackStr(header, &buf);
                         _ = try h_str(&self.ctx, str);
                         read += n;
-                    },
+                    } else return errNoImpl(),
+                    // str 16, str 32
+                    0xda, 0xdb => if (handler.str) |h_str| {
+                        const str, const n = try self.unpackStrAlloc(header);
+                        defer self.alloc.free(str);
+                        _ = try h_str(&self.ctx, str);
+                        read += n;
+                    } else return errNoImpl(),
                     // nil
                     0xc0 => (handler.nil orelse return errNoImpl())(&self.ctx),
                     // (never used)
@@ -790,35 +842,35 @@ test "test unpacker" {
             }
         }
 
-        pub fn f_int(s: *Self, v: i64) !void {
+        pub fn fmtInt(s: *Self, v: i64) !void {
             try std.fmt.format(s.writer, "{}, ", .{v});
         }
 
-        pub fn f_uint(s: *Self, v: u64) !void {
+        pub fn fmtUint(s: *Self, v: u64) !void {
             try std.fmt.format(s.writer, "{}, ", .{v});
         }
 
-        pub fn f_float(s: *Self, v: f64) !void {
+        pub fn fmtFloat(s: *Self, v: f64) !void {
             try std.fmt.format(s.writer, "{}, ", .{v});
         }
 
-        pub fn map_begin(s: *Self, _: usize) !void {
+        pub fn mapBegin(s: *Self, _: usize) !void {
             try s.writer.writeByte('{');
         }
 
-        pub fn map_field(s: *Self, key: []const u8) !void {
+        pub fn mapField(s: *Self, key: []const u8) !void {
             try std.fmt.format(s.writer, "\"{s}\" = ", .{key});
         }
 
-        pub fn map_end(s: *Self) !void {
+        pub fn mapEnd(s: *Self) !void {
             try s.writer.writeAll("}, ");
         }
 
-        pub fn arr_begin(s: *Self, _: usize) !void {
+        pub fn arrayBegin(s: *Self, _: usize) !void {
             try s.writer.writeByte('{');
         }
 
-        pub fn arr_end(s: *Self) !void {
+        pub fn arrayEnd(s: *Self) !void {
             try s.writer.writeAll("}, ");
         }
     };
@@ -826,18 +878,18 @@ test "test unpacker" {
     var out_buf: [1024]u8 = std.mem.zeroes([1024]u8);
     var ostream = std.io.FixedBufferStream([]u8){ .buffer = &out_buf, .pos = 0 };
 
-    var unpacker = MsgpackUnpacker(
+    var unpacker = Unpacker(
         FmtCtx,
         .{
             .bool = FmtCtx.f_bool,
-            .int = FmtCtx.f_int,
-            .uint = FmtCtx.f_uint,
-            .float = FmtCtx.f_float,
-            .map_begin = FmtCtx.map_begin,
-            .map_field = FmtCtx.map_field,
-            .array_begin = FmtCtx.arr_begin,
-            .array_end = FmtCtx.arr_end,
-            .map_end = FmtCtx.map_end,
+            .int = FmtCtx.fmtInt,
+            .uint = FmtCtx.fmtUint,
+            .float = FmtCtx.fmtFloat,
+            .mapBegin = FmtCtx.mapBegin,
+            .mapField = FmtCtx.mapField,
+            .arrayBegin = FmtCtx.arrayBegin,
+            .arrayEnd = FmtCtx.arrayEnd,
+            .mapEnd = FmtCtx.mapEnd,
         },
         Stream.Reader,
     ).init(istream.reader(), .{ .writer = ostream.writer() }, alloc);

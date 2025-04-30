@@ -110,12 +110,22 @@ const MsgpackUnpacker = struct {
         }
 
         pub fn unpackInt(self: *UnpackerImpl, v: i64) !void {
-            self.lua.pushInteger(@intCast(v)); // [+p]
+            if (v > std.math.maxInt(zlua.Integer)) {
+                std.debug.assert(v < 2e14);
+                self.lua.pushNumber(@floatFromInt(v));
+            } else {
+                self.lua.pushInteger(@intCast(v)); // [+p]
+            }
             try self.assign(); // pop
         }
 
         pub fn unpackUint(self: *UnpackerImpl, v: u64) !void {
-            self.lua.pushInteger(@intCast(v)); // [+p]
+            if (v > std.math.maxInt(zlua.Unsigned)) {
+                std.debug.assert(v < 2e14);
+                self.lua.pushNumber(@floatFromInt(v));
+            } else {
+                self.lua.pushUnsigned(@intCast(v)); // [+p]
+            }
             try self.assign(); // pop
         }
 

@@ -500,3 +500,354 @@ test "test writer" {
         try std.testing.expectEqualSlices(u8, ref, gen);
     }
 }
+
+// Unpacking
+
+pub fn MsgpackHandler(CtxT: type) type {
+    return struct {
+        const T = CtxT;
+
+        nil: ?fn (ud: *CtxT) anyerror!void = null,
+        bool: ?fn (ud: *CtxT, v: bool) anyerror!void = null,
+        uint: ?fn (ud: *CtxT, v: u64) anyerror!void = null,
+        int: ?fn (ud: *CtxT, v: i64) anyerror!void = null,
+        float: ?fn (ud: *CtxT, v: f64) anyerror!void = null,
+        str: ?fn (ud: *CtxT, str: []const u8) anyerror!void = null,
+        map_begin: ?fn (ud: *CtxT, len: usize) anyerror!void = null,
+        map_field: ?fn (ud: *CtxT, key: []const u8) anyerror!void = null,
+        map_end: ?fn (ud: *CtxT) anyerror!void = null,
+        array_begin: ?fn (ud: *CtxT, len: usize) anyerror!void = null,
+        array_end: ?fn (ud: *CtxT) anyerror!void = null,
+    };
+}
+
+const up_log = std.log.scoped(.msgpack_unpacker);
+
+fn errNoImpl() error{NotImplemented} {
+    std.debug.dumpCurrentStackTrace(null);
+    up_log.err("Not implemented", .{});
+    return error.NotImplemented;
+}
+
+const MsgpackError = error{
+    InvalidHeader,
+    MapKeyIsNotStr,
+};
+
+pub fn MsgpackUnpacker(CtxT: type, comptime handler: MsgpackHandler(CtxT), Reader: type) type {
+    return struct {
+        const Self = @This();
+        const BufferStream = std.io.BufferedReader(16384, Reader);
+
+        alloc: std.mem.Allocator,
+        ctx: CtxT,
+        stream: BufferStream,
+
+        fn unpackStrAlloc(self: *Self, header: u8) !struct { []u8, u64 } {
+            const reader = self.stream.reader();
+            switch (header) {
+                // fixstr
+                0xa0...0xbf => {
+                    const str_len: usize = @intCast(header & 0x1f);
+                    const str = try self.alloc.alloc(u8, str_len);
+                    _ = try reader.readAll(str);
+                    return .{ str, str_len };
+                },
+                // str 8
+                0xd9 => {
+                    const str_len: usize = @intCast(try reader.readByte());
+                    const str = try self.alloc.alloc(u8, str_len);
+                    _ = try reader.readAll(str);
+                    return .{ str, 1 + str_len };
+                },
+                // str 16
+                0xda => {
+                    var buf: [2]u8 = undefined;
+                    _ = try reader.readAll(&buf);
+                    const str_len: usize = (@as(u64, @intCast(buf[0])) << 8) | @as(u64, @intCast(buf[1]));
+                    const str = try self.alloc.alloc(u8, str_len);
+                    _ = try reader.readAll(str);
+                    return .{ str, 2 + str_len };
+                },
+                // str 32
+                0xdb => {
+                    var buf: [4]u8 = undefined;
+                    _ = try reader.readAll(&buf);
+                    const str_len: usize = (@as(u64, @intCast(buf[0])) << 24) | (@as(u64, @intCast(buf[1])) << 16) | (@as(u64, @intCast(buf[2])) << 8) | @as(u64, @intCast(buf[3]));
+                    const str = try self.alloc.alloc(u8, str_len);
+                    _ = try reader.readAll(str);
+                    return .{ str, 4 + str_len };
+                },
+                else => return error.InvalidHeader,
+            }
+        }
+
+        fn walkMap(self: *Self, header: u8) !u64 {
+            var read: u64 = 0;
+            var map_len: usize = 0;
+            const reader = self.stream.reader();
+            switch (header) {
+                // fixmap
+                0x80...0x8f => map_len = @intCast(header & 0x0f),
+                // map 16
+                0xde => {
+                    var buf: [2]u8 = undefined;
+                    read += try reader.readAll(&buf);
+                    map_len = (@as(u64, @intCast(buf[0])) << 8) | @as(u64, @intCast(buf[1]));
+                },
+                // map 32
+                0xdf => {
+                    var buf: [4]u8 = undefined;
+                    read += try reader.readAll(&buf);
+                    map_len = (@as(u64, @intCast(buf[0])) << 24) | (@as(u64, @intCast(buf[1])) << 16) | (@as(u64, @intCast(buf[2])) << 8) | @as(u64, @intCast(buf[3]));
+                },
+                else => unreachable,
+            }
+
+            try handler.map_begin.?(&self.ctx, map_len);
+
+            for (0..map_len) |_| {
+                // Read key
+                const key, const key_n = self.unpackStrAlloc(try reader.readByte()) catch |err| {
+                    if (err == MsgpackError.InvalidHeader) return MsgpackError.MapKeyIsNotStr;
+                    return err;
+                };
+                read += key_n + 1;
+                try handler.map_field.?(&self.ctx, key);
+                self.alloc.free(key);
+
+                // Process value
+                read += try self.next(1);
+            }
+
+            if (handler.map_end) |f| {
+                try f(&self.ctx);
+            }
+
+            return read;
+        }
+
+        fn walkArr(self: *Self, header: u8) !u64 {
+            var read: u64 = 0;
+            var arr_len: usize = 0;
+            const reader = self.stream.reader();
+            switch (header) {
+                // fixarray
+                0x90...0x9f => arr_len = @intCast(header & 0x0f),
+                // array 16
+                0xdc => {
+                    var buf: [2]u8 = undefined;
+                    read += try reader.readAll(&buf);
+                    arr_len = (@as(u64, @intCast(buf[0])) << 8) | @as(u64, @intCast(buf[1]));
+                },
+                // array 32
+                0xdd => {
+                    var buf: [4]u8 = undefined;
+                    read += try reader.readAll(&buf);
+                    arr_len = (@as(u64, @intCast(buf[0])) << 24) | (@as(u64, @intCast(buf[1])) << 16) | (@as(u64, @intCast(buf[2])) << 8) | @as(u64, @intCast(buf[3]));
+                },
+                else => unreachable,
+            }
+
+            try (handler.array_begin orelse return errNoImpl())(&self.ctx, arr_len);
+
+            for (0..arr_len) |_| {
+                read += try self.next(1);
+            }
+
+            if (handler.array_end) |f| {
+                try f(&self.ctx);
+            }
+
+            return read;
+        }
+
+        // fn unpackMapContent(self: *Self, n: usize) !u64 {
+        //     for (0..n) |_| {
+        //         var str_header: u8 = 0;
+        //     }
+        // }
+
+        pub fn next(self: *Self, limit_n: usize) anyerror!u64 {
+            var read: u64 = 0;
+            const reader = self.stream.reader();
+
+            for (0..limit_n) |_| {
+                const header = try reader.readByte();
+                read += 1;
+
+                try switch (header) {
+                    // positive fixint
+                    0x00...0x7f => if (handler.uint) |h_uint| {
+                        _ = try h_uint(&self.ctx, @intCast(header));
+                    } else return errNoImpl(),
+                    // fixmap, map 16, map 32
+                    0x80...0x8f, 0xde, 0xdf => {
+                        if (handler.map_begin == null or handler.map_field == null) return errNoImpl();
+                        read += try self.walkMap(header);
+                    },
+                    // fixarray, arr 16, arr 32
+                    0x90...0x9f, 0xdc, 0xdd => read += try self.walkArr(header),
+                    // fixstr, str 8, str 16, str 32
+                    0xa0...0xbf, 0xd9, 0xda, 0xdb => if (handler.str orelse return errNoImpl()) |h_str| {
+                        const str, const n = try self.unpackStrAlloc(header);
+                        _ = try h_str(&self.ctx, str);
+                        read += n;
+                    },
+                    // nil
+                    0xc0 => (handler.nil orelse return errNoImpl())(&self.ctx),
+                    // (never used)
+                    0xc1 => return error.InvalidHeader,
+                    // false
+                    0xc2 => (handler.bool orelse return errNoImpl())(&self.ctx, false),
+                    // true
+                    0xc3 => (handler.bool orelse return errNoImpl())(&self.ctx, true),
+                    // bin 8, bin 16, bin 32
+                    0xc4, 0xc5, 0xc6 => return errNoImpl(),
+                    // ext 8, ext 16, ext 32
+                    0xc7, 0xc8, 0xc9 => return errNoImpl(),
+                    // float 32
+                    0xca => if (handler.float) |h_float| {
+                        var buf: [4]u8 = undefined;
+                        read += try reader.readAll(&buf);
+                        const u = (@as(u32, @intCast(buf[0])) << 24) | (@as(u32, @intCast(buf[1])) << 16) | (@as(u32, @intCast(buf[2])) << 8) | @as(u32, @intCast(buf[3]));
+                        try h_float(&self.ctx, @floatCast(@as(f32, @bitCast(u))));
+                    } else return errNoImpl(),
+                    // float 64
+                    0xcb => if (handler.float) |h_float| {
+                        var buf: [8]u8 = undefined;
+                        read += try reader.readAll(&buf);
+                        var u: u64 = 0;
+                        inline for (0..8) |i| {
+                            u |= (@as(u64, @intCast(buf[i])) << (56 - i * 8));
+                        }
+                        try h_float(&self.ctx, @floatCast(@as(f64, @bitCast(u))));
+                    } else return errNoImpl(),
+                    // uint 8, 16, 32, 64
+                    inline 0xcc...0xcf => |h| if (handler.uint) |h_uint| {
+                        const nb = 1 << (h - 0xcc);
+                        var buf: [8]u8 = undefined;
+                        read += try reader.readAll(buf[0..nb]);
+
+                        const UType = @Type(std.builtin.Type{ .int = .{ .bits = nb * 8, .signedness = .unsigned } });
+                        var u: UType = 0;
+                        inline for (0..nb) |i| {
+                            u |= (@as(UType, @intCast(buf[i])) << ((nb - 1 - i) * 8));
+                        }
+                        try h_uint(&self.ctx, @intCast(u));
+                    } else return errNoImpl(),
+                    // int 8, 16, 32, 64
+                    inline 0xd0...0xd3 => |h| if (handler.int) |h_int| {
+                        const nb = 1 << (h - 0xd0);
+                        var buf: [8]u8 = undefined;
+                        read += try reader.readAll(buf[0..nb]);
+
+                        const UType = @Type(std.builtin.Type{ .int = .{ .bits = nb * 8, .signedness = .unsigned } });
+                        var u: UType = 0;
+                        inline for (0..nb) |i| {
+                            u |= (@as(UType, @intCast(buf[i])) << ((nb - 1 - i) * 8));
+                        }
+                        try h_int(&self.ctx, @bitCast(@as(u64, @intCast(u))));
+                    } else return errNoImpl(),
+                    // fixext 1, 2, 4, 8, 16
+                    0xd4...0xd8 => return errNoImpl(),
+                    // negative fixint
+                    0xe0...0xff => {},
+                };
+            }
+
+            return read;
+        }
+
+        pub fn init(reader: Reader, ctx: CtxT, alloc: std.mem.Allocator) Self {
+            return .{
+                .stream = BufferStream{ .unbuffered_reader = reader },
+                .ctx = ctx,
+                .alloc = alloc,
+            };
+        }
+    };
+}
+
+test "test unpacker" {
+    const ref = "\x84\xa3abc\xc2\xa3def7\xb4%%%%%%%%%%%%%%%%%%%%\xce\xba\xad\xf0\r\xb1this is an \xe5\x90\x91\xe9\x87\x8f\x93\xcb\xbf\xec\xcc\xcc\xcc\xcc\xcc\xcd\xcb?\xe0Q\xeb\x85\x1e\xb8R\xcb?\xd5UUUUUU";
+    const Stream = std.io.FixedBufferStream([]const u8);
+    var istream = Stream{ .buffer = ref, .pos = 0 };
+
+    var gpa = std.heap.DebugAllocator(.{}).init;
+    const alloc = gpa.allocator();
+
+    const FmtCtx = struct {
+        const Self = @This();
+
+        writer: std.io.FixedBufferStream([]u8).Writer,
+
+        pub fn f_bool(s: *Self, v: bool) !void {
+            if (v) {
+                _ = try s.writer.writeAll("true, ");
+            } else {
+                _ = try s.writer.writeAll("false, ");
+            }
+        }
+
+        pub fn f_int(s: *Self, v: i64) !void {
+            try std.fmt.format(s.writer, "{}, ", .{v});
+        }
+
+        pub fn f_uint(s: *Self, v: u64) !void {
+            try std.fmt.format(s.writer, "{}, ", .{v});
+        }
+
+        pub fn f_float(s: *Self, v: f64) !void {
+            try std.fmt.format(s.writer, "{}, ", .{v});
+        }
+
+        pub fn map_begin(s: *Self, _: usize) !void {
+            try s.writer.writeByte('{');
+        }
+
+        pub fn map_field(s: *Self, key: []const u8) !void {
+            try std.fmt.format(s.writer, "\"{s}\" = ", .{key});
+        }
+
+        pub fn map_end(s: *Self) !void {
+            try s.writer.writeAll("}, ");
+        }
+
+        pub fn arr_begin(s: *Self, _: usize) !void {
+            try s.writer.writeByte('{');
+        }
+
+        pub fn arr_end(s: *Self) !void {
+            try s.writer.writeAll("}, ");
+        }
+    };
+
+    var out_buf: [1024]u8 = std.mem.zeroes([1024]u8);
+    var ostream = std.io.FixedBufferStream([]u8){ .buffer = &out_buf, .pos = 0 };
+
+    var unpacker = MsgpackUnpacker(
+        FmtCtx,
+        .{
+            .bool = FmtCtx.f_bool,
+            .int = FmtCtx.f_int,
+            .uint = FmtCtx.f_uint,
+            .float = FmtCtx.f_float,
+            .map_begin = FmtCtx.map_begin,
+            .map_field = FmtCtx.map_field,
+            .array_begin = FmtCtx.arr_begin,
+            .array_end = FmtCtx.arr_end,
+            .map_end = FmtCtx.map_end,
+        },
+        Stream.Reader,
+    ).init(istream.reader(), .{ .writer = ostream.writer() }, alloc);
+    // try std.testing.expectError(error.NotImplemented, unpacker.next(1));
+    const u = try unpacker.next(1);
+    try std.testing.expectEqual(ref.len, u);
+
+    const should_unpack =
+        "{\"abc\" = false, \"def\" = 55, \"%%%%%%%%%%%%%%%%%%%%\" = 3131961357, \"this is an 向量\" = {-9e-1, 5.1e-1, 3.333333333333333e-1, }, }, ";
+    try std.testing.expectEqualStrings(should_unpack, ostream.getWritten());
+
+    try std.testing.expect(gpa.deinit() == .ok);
+}

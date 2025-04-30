@@ -145,8 +145,8 @@ def index():
 
 class Map:
     def __init__(self, file):
-        self.f = open(file, "r+b")
-        self.mm = mmap.mmap(self.f.fileno(), 0)
+        self.f = open(file, "rb")
+        self.mm = mmap.mmap(self.f.fileno(), 0, access=mmap.ACCESS_READ)
 
     def __del__(self):
         self.mm.close()

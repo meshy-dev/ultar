@@ -1,6 +1,8 @@
 #!/bin/bash
 #SBATCH --export=all
-#SBATCH --ntasks=8                  # total parallel tasks
+#SBATCH --array=0-63
+#SBATCH --ntasks=1
+#SBATCH --ntasks-per-node=2
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=2G
 
@@ -11,8 +13,8 @@ mapfile -t tar_files < <(
   printf '%s\n' "$DATA_PATH"/**/*.tar | sort
 )
 num_files=${#tar_files[@]}
-num_tasks=$SLURM_NTASKS
-task_id=$SLURM_PROCID # 0-based rank of this task
+num_tasks=$SLURM_ARRAY_TASK_COUNT
+task_id=$SLURM_ARRAY_TASK_ID # 0-based rank of this task
 
 # Single loop: pick every Nth file for this task and build "-f" args
 args=()

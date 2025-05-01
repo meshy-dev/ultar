@@ -74,6 +74,10 @@ pub const LuaDataLoader = struct {
             // state
             sent_rid: u64 = 0,
         },
+        close_file: struct {
+            // args
+            file_handle: u32,
+        },
         add_entry: struct {
             // args
             key: [:0]const u8,
@@ -122,6 +126,17 @@ pub const LuaDataLoader = struct {
             },
         };
 
+        return 0;
+    }
+
+    fn gCloseFile(lua: *Lua) !i32 {
+        const loader = try lua.toUserdata(Self, 1);
+        const handle: u32 = @intCast(try lua.toUnsigned(2));
+        loader.u_yielded_from = .{
+            .close_file = .{
+                .file_handle = handle,
+            },
+        };
         return 0;
     }
 
@@ -253,6 +268,11 @@ pub const LuaDataLoader = struct {
                         // We resume when we got the file handle back,
                         // Don't clear u_yielded_from
                     },
+                    .close_file => |*f| {
+                        if (self.loader.trySend(.{ .close_file = @bitCast(f.file_handle) })) |_| {
+                            self.u_yielded_from = null;
+                        }
+                    },
                     .add_entry => |*e| {
                         const row = &self.in_progress_row.?.data;
                         if (e.entry == null) {
@@ -299,7 +319,6 @@ pub const LuaDataLoader = struct {
                         const row = kv.value;
                         row.num_fullfilled += 1;
                     },
-                    else => @panic("Not implemented"),
                 }
             }
 
@@ -369,6 +388,8 @@ pub const LuaDataLoader = struct {
         self.lua.setField(-2, "c_loader"); // pop the self
         try Self.wrapCoyield(self.lua, "loader_open_file", Self.gOpenFile); // [+p]
         self.lua.setField(-2, "open_file"); // pop the function
+        try Self.wrapCoyield(self.lua, "loader_close_file", Self.gCloseFile); // [+p]
+        self.lua.setField(-2, "close_file"); // pop the function
         try Self.wrapCoyield(self.lua, "loader_add_entry", Self.gAddEntry); // [+p]
         self.lua.setField(-2, "add_entry"); // pop the function
         try Self.wrapCoyield(self.lua, "loader_finish_row", Self.gFinishRow); // [+p]

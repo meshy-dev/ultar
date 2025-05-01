@@ -33,7 +33,6 @@ pub const Request = union(enum) {
 
 pub const ResponsePayload = union(enum) {
     open_file: FileHandle,
-    close_file: struct {},
     read_block: struct {},
 };
 
@@ -82,6 +81,7 @@ pub const LoaderCtx = struct {
 
     file_slots: [max_file_slots]?std.fs.File = @splat(null),
     xfile_slots: [max_file_slots]xev.File = undefined,
+    file_refcount: [max_file_slots]u32 = @splat(0),
     file_slots_generation: [max_file_slots]u32 = std.mem.zeroes([max_file_slots]u32),
     file_slots_checksum: [max_file_slots]u8 = undefined,
 
@@ -153,6 +153,9 @@ pub const LoaderCtx = struct {
             self.sendResponseSynced(xreq.request_id, LoaderError.ReadError);
             return .disarm;
         };
+        const slot: usize = @intCast(xreq.req.file.idx);
+        self.fileDecRef(slot);
+
         if (actual != xreq.req.result_buffer.len) {
             std.debug.panic("Unhandled error: {} != {}", .{ actual, xreq.req.result_buffer.len });
         }
@@ -161,6 +164,22 @@ pub const LoaderCtx = struct {
 
         self.req_mem_pool.destroy(xreq);
         return .disarm;
+    }
+
+    fn fileAddRef(self: *Self, slot: usize) void {
+        // Should start on 1
+        std.debug.assert(self.file_refcount[slot] > 0);
+        self.file_refcount[slot] += 1;
+    }
+
+    fn fileDecRef(self: *Self, slot: usize) void {
+        std.debug.assert(self.file_refcount[slot] > 0);
+        self.file_refcount[slot] -= 1;
+        if (self.file_refcount[slot] == 0) {
+            const f = self.file_slots[slot] orelse unreachable;
+            f.close();
+            self.file_slots[slot] = null;
+        }
     }
 
     fn handleReq(self: *Self, req_id: u64, req: Request) void {
@@ -186,6 +205,7 @@ pub const LoaderCtx = struct {
                 h.path_checksum = path_checksum(file_path);
                 self.file_slots[slot] = f;
                 self.xfile_slots[slot] = xf;
+                self.file_refcount[slot] = 1;
                 self.file_slots_generation[slot] += 1; // gen 0 is reserved to catch errors
                 self.file_slots_checksum[slot] = h.path_checksum;
                 const gen = self.file_slots_generation[slot];
@@ -205,12 +225,7 @@ pub const LoaderCtx = struct {
 
                 const slot: usize = @intCast(file_handle.idx);
 
-                // Close the file
-                const f = self.file_slots[slot] orelse unreachable;
-                f.close();
-                self.file_slots[slot] = null;
-
-                self.sendResponseSynced(req_id, .{ .close_file = .{} });
+                self.fileDecRef(slot);
             },
 
             .read_block => |read_req| {
@@ -231,6 +246,8 @@ pub const LoaderCtx = struct {
                 };
                 xreq.request_id = req_id;
                 xreq.req = read_req;
+
+                self.fileAddRef(slot);
 
                 // Enqueue async read
                 xf.pread(

@@ -47,7 +47,7 @@ jobs:
         with:
           files: |
             ./libdataloader.dylib
-            ./indexer-${{ matrix.target }}
+            ./indexer-${{ matrix.target.triplet }}
 
       - name: Upload binaries to Release
         uses: softprops/action-gh-release@v2
@@ -55,6 +55,6 @@ jobs:
         with:
           files: |
             ./libdataloader.so
-            ./indexer-${{ matrix.target }}
+            ./indexer-${{ matrix.target.triplet }}
 
 

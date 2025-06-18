@@ -145,7 +145,8 @@ pub const LuaDataLoader = struct {
         const handle: u32 = @intCast(try lua.toUnsigned(2));
         // We yield after this function & the string ref should live long enough
         const key = try lua.toString(3);
-        const offset: u64 = @intCast(try lua.toUnsigned(4));
+        const raw: f64 = try lua.toNumber(4); // f64
+        const offset: u64 = @intFromFloat(raw);
         const size: u32 = @intCast(try lua.toUnsigned(5));
 
         loader.u_yielded_from = .{

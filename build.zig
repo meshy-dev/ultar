@@ -32,7 +32,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .root_source_file = b.path("lua_dataloader.zig"),
-        .strip = if (optimize == .ReleaseFast) true else null,
+        .strip = false,
     });
     lib_dataloader.root_module.addImport("xev", xev.module("xev"));
     lib_dataloader.root_module.addImport("zlua", zlua.module("zlua"));

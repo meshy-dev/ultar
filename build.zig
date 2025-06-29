@@ -18,7 +18,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("indexer.zig"),
         .target = target,
         .optimize = optimize,
-        .strip = if (optimize == .ReleaseFast) true else null,
+        .strip = false,
     });
     indexer.root_module.addImport("clap", clap.module("clap"));
     indexer.root_module.addImport("xev", xev.module("xev"));

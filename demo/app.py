@@ -190,14 +190,16 @@ def boxed_file():
     if file is None or base is None or end is None or k is None:
         return "Missing arguments"
 
-    em = f'<div><a href="/map_file?file={quote(file, safe=[])}&k={k}&base={base}&end={end}" target="_blank">Open {k}</a></div>'
-
     mime_type, _ = mimetypes.guess_type("test" + k, False)
     if mime_type:
+        em = f'<div><a href="/map_file?file={quote(file, safe=[])}&k={k}&base={base}&end={end}" target="_blank">Open {k}</a></div>'
+
         if mime_type.startswith("image"):
             em += f'<img src="/map_file?file={quote(file, safe=[])}&k={k}&base={base}&end={end}" class="img-fluid" style="max-height: 128px;"/>'
         if mime_type in ["text/plain", "text/html", "application/json"]:
             em += f'<div class="border p-1" style="width: auto; max-width: 20em; max-height: 10em; overflow: auto;"><pre><code>{map_file_internal(file, base, end).decode("utf-8")}</code></pre>'
+    else:
+        em = f'<div><a href="/map_file?file={quote(file, safe=[])}&k={k}&base={base}&end={end}" download="{quote(file, safe=[])}_{base}_{k}">Open {k}</a></div>'
 
     return em
 
@@ -262,10 +264,10 @@ def load_index():
             for k, o, s in zip(item["keys"], item["offsets"], item["sizes"]):
                 off = base_offset + o
                 size = s
-                d[k] = f"{off:08X}..{off+size:08X}"
-                l[
-                    k
-                ] = f"/boxed_file?file={quote(tar_path, safe=[])}&k={k}&base={off:x}&end={off+size:x}"
+                d[k] = f"{off:08X}..{off + size:08X}"
+                l[k] = (
+                    f"/boxed_file?file={quote(tar_path, safe=[])}&k={k}&base={off:x}&end={off + size:x}"
+                )
             data.append(d)
             links.append(l)
 

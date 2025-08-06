@@ -26,8 +26,19 @@ const ScanCtx = struct {
 };
 
 pub fn luaDumpStack(lua: *Lua) void {
+    // var level: i32 = 0;
+    // while (lua.getStack(level) catch null) |debug_info| {
+    //     logger.info("[{}] file {s} line {}: {s} ", .{
+    //         -level,
+    //         debug_info.source,
+    //         debug_info.current_line orelse -1,
+    //         debug_info.name orelse "unknown",
+    //     });
+    //     level += 1;
+    // }
+
     const top: usize = @intCast(lua.getTop());
-    var buf: [100]u8 = undefined;
+    var buf: [1024]u8 = undefined;
     for (1..top + 1) |_i| {
         const i: i32 = @intCast(_i);
         const t = lua.typeOf(i);
@@ -44,18 +55,26 @@ pub fn luaDumpStack(lua: *Lua) void {
                     value = "unknown number";
                     break;
                 };
-                value = std.fmt.bufPrint(&buf, "{d}", .{v}) catch "number too long??";
+                value = std.fmt.bufPrint(&buf, "{d}", .{v}) catch "fmt err";
             },
             .string => {
                 value = lua.toString(i) catch "unknown string";
             },
-            .table, .function, .thread, .userdata => {
-                value = "object";
+            .table => {
+                const len = lua.rawLen(i);
+                value = std.fmt.bufPrint(&buf, "table(len={d})", .{len}) catch "fmt err";
+            },
+            .function => {
+                value = "function";
+            },
+            .userdata => {
+                value = "userdata";
             },
             else => {
                 value = "unknown type";
             },
         }
+
         logger.info("Stack[{}]: {s}", .{ i, value });
     }
 }
@@ -285,6 +304,13 @@ const MsgpackUnpacker = struct {
         ctx.unpacker.ctx.deinit();
     }
 
+    pub fn luaDetor(lua: *Lua) !c_int {
+        const ctx = try lua.toUserdata(MsgpackUnpacker, 1);
+        ctx.msgpack_file.close();
+        ctx.unpacker.ctx.deinit();
+        return 0;
+    }
+
     fn newCtx(lua: *Lua) !i32 {
         const path = lua.toString(1) catch |err| return printLuaErr(lua, err);
 
@@ -331,14 +357,14 @@ const MsgpackUnpacker = struct {
 
 pub fn registerRt(lua: *Lua) !void {
     try lua.newMetatable(ScanCtx.meta_table); // [+p]
-    if (zlua.lang != .luau) {
-        lua.pushFunction(zlua.wrap(ScanCtx.luaDetor)); // [+p]
-        lua.setField(-2, "__gc"); // pop 1
-    }
     lua.newTable(); // [+p]
     lua.pushFunction(zlua.wrap(scanDir)); // [+p]
     lua.setField(-2, ScanCtx.f_iter); // pop 1
     lua.setField(-2, "__index"); // pop 1
+    if (zlua.lang != .luau) {
+        lua.pushFunction(zlua.wrap(ScanCtx.luaDetor)); // [+p]
+        lua.setField(-2, "__gc"); // pop 1
+    }
     lua.pop(1); // pop meta_table
 
     lua.pushFunction(zlua.wrap(newScanCtx)); // [+p]
@@ -349,6 +375,10 @@ pub fn registerRt(lua: *Lua) !void {
     lua.pushFunction(zlua.wrap(MsgpackUnpacker.iter)); // [+p]
     lua.setField(-2, MsgpackUnpacker.f_iter); // pop 1
     lua.setField(-2, "__index"); // pop 1
+    if (zlua.lang != .luau) {
+        lua.pushFunction(zlua.wrap(MsgpackUnpacker.luaDetor)); // [+p]
+        lua.setField(-2, "__gc"); // pop 1
+    }
     lua.pop(1); // pop meta_table
 
     lua.pushFunction(zlua.wrap(MsgpackUnpacker.newCtx)); // [+p]

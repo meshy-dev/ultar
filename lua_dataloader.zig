@@ -145,9 +145,8 @@ pub const LuaDataLoader = struct {
         const handle: u32 = try lua_rt.toUnsigned(lua, 2);
         // We yield after this function & the string ref should live long enough
         const key = try lua.toString(3);
-        const raw: f64 = try lua.toNumber(4); // f64
-        const offset: u64 = @intFromFloat(raw);
-        const size: u32 = try lua_rt.toUnsigned(lua, 2);
+        const offset: u64 = @intFromFloat(try lua.toNumber(4));
+        const size: u32 = try lua_rt.toUnsigned(lua, 5);
 
         loader.u_yielded_from = .{
             .add_entry = .{
@@ -206,10 +205,24 @@ pub const LuaDataLoader = struct {
         }
     }
 
+    fn luaPopAndRef(self: *Self) !i32 {
+        // Pops the top value from the Lua stack and returns a reference to it.
+        // This is used to store the result of a Lua function call in the registry.
+        if (zlua.lang == .luau) {
+            const ref = try self.lua.ref(-1);
+            self.lua.pop(1); // pop the value
+            return ref;
+        } else {
+            return try self.lua.ref(zlua.registry_index);
+        }
+    }
+
+    // This function retrieves a function reference from the Lua table at `table` with the name `field_name`.
+    // The function reference is stored in the registry and returned as an integer.
     fn getFieldAsFuncRef(self: *Self, table: i32, field_name: [:0]const u8) !i32 {
         _ = self.lua.getField(table, field_name);
         if (self.lua.isFunction(-1)) {
-            return try self.lua.ref(-1);
+            return self.luaPopAndRef(); // Pop the function and return its reference
         } else {
             const type_name = self.lua.typeName(self.lua.typeOf(-1));
             self.lua.pop(1);
@@ -446,7 +459,7 @@ pub const LuaDataLoader = struct {
         lua_rt.pushUnsigned(self.lua, @intCast(spec.rank));
         lua_rt.pushUnsigned(self.lua, @intCast(spec.world_size));
         self.lua.protectedCall(.{ .args = 2, .results = 1 }) catch |err| return self.printLuaErr(err);
-        self.u_ctx = self.lua.ref(-1) catch |err| return self.printLuaErr(err); // pop & store ref of ret value (user context)
+        self.u_ctx = self.luaPopAndRef() catch |err| return self.printLuaErr(err); // pop & store ref of ret value (user context)
 
         // Setup the generator as a coroutine
         _ = self.lua.rawGetIndex(zlua.registry_index, self.u_loader_fn.row_generator); // [+p]
@@ -476,6 +489,7 @@ pub const LuaDataLoader = struct {
     }
 
     pub fn deinit(self: *Self) void {
+        self.load_rid_to_row.deinit(self.alloc);
         self.loader.deinit();
         self.lua.deinit();
 

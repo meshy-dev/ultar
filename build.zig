@@ -4,22 +4,36 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const use_lua54 = b.option(bool, "use_lua54", "Use Lua 5.4 instead of Luau") orelse false;
+    const engine = b.option([]const u8, "lua", "Use specified lua engine (default to luajit). Available: luajit, luau, lua54") orelse "luajit";
 
     const clap = b.dependency("clap", .{ .target = target, .optimize = optimize });
     const xev = b.dependency("libxev", .{ .target = target, .optimize = optimize });
-    const zlua_54 = b.dependency("zlua", .{
-        .target = target,
-        .optimize = optimize,
-        .lang = .lua54,
-        .shared = false,
-    });
-    const zlua_luau = b.dependency("zlua", .{
-        .target = target,
-        .optimize = optimize,
-        .lang = .luau,
-        .shared = false,
-    });
+
+    var zlua: *std.Build.Dependency = undefined;
+    if (std.mem.eql(u8, engine, "luajit")) {
+        zlua = b.dependency("zlua", .{
+            .target = target,
+            .optimize = optimize,
+            .lang = .luajit,
+            .shared = false,
+        });
+    } else if (std.mem.eql(u8, engine, "lua54")) {
+        zlua = b.dependency("zlua", .{
+            .target = target,
+            .optimize = optimize,
+            .lang = .lua54,
+            .shared = false,
+        });
+    } else if (std.mem.eql(u8, engine, "luau")) {
+        zlua = b.dependency("zlua", .{
+            .target = target,
+            .optimize = optimize,
+            .lang = .luau,
+            .shared = false,
+        });
+    } else {
+        std.debug.panic("Unknown lua engine: {s}", .{engine});
+    }
 
     const indexer = b.addExecutable(.{
         .name = "indexer",
@@ -43,11 +57,7 @@ pub fn build(b: *std.Build) void {
         .strip = false,
     });
     lib_dataloader.root_module.addImport("xev", xev.module("xev"));
-    if (use_lua54) {
-        lib_dataloader.root_module.addImport("zlua", zlua_54.module("zlua"));
-    } else {
-        lib_dataloader.root_module.addImport("zlua", zlua_luau.module("zlua"));
-    }
+    lib_dataloader.root_module.addImport("zlua", zlua.module("zlua"));
     b.installArtifact(lib_dataloader);
 
     const test_step = b.step("test", "Run unit tests");

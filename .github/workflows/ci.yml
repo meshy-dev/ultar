@@ -17,9 +17,9 @@ jobs:
     strategy:
       matrix:
         target:
-          - { triplet: x86_64-linux-gnu.2.28, runner: ubuntu-latest }
-          - { triplet: aarch64-linux-gnu.2.28, runner: ubuntu-24.04-arm }
-          - { triplet: aarch64-macos, runner: macos-latest }
+          - { triplet: x86_64-linux-gnu.2.28, runner: ubuntu-latest, lua: luajit }
+          - { triplet: aarch64-linux-gnu.2.28, runner: ubuntu-24.04-arm, lua: luajit }
+          - { triplet: aarch64-macos, runner: macos-latest, lua: lua54 }
 
     steps:
       - name: Checkout code
@@ -32,7 +32,11 @@ jobs:
 
       - name: Build (ReleaseFast, ${{ matrix.target.triplet }})
         run: |
-          zig build -Doptimize=ReleaseFast -Dtarget=${{ matrix.target.triplet }} --summary all
+          zig build \
+            -Doptimize=ReleaseSafe \
+            -Dtarget=${{ matrix.target.triplet }} \
+            -Dlua=${{ matrix.target.lua }} \
+            --summary all
           mv ./zig-out/bin/indexer ./indexer-${{ matrix.target.triplet }}
           mv ./zig-out/lib/* ./
 

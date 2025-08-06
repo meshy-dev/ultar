@@ -47,8 +47,8 @@ BASE_TEMPLATE = """
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <title>WebDataset Index Browser</title>
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet"/>
-  <link href="https://fonts.cdnfonts.com/css/anonymous-pro" rel="stylesheet">
   <style>
+    @import url('https://fonts.googleapis.com/css2?family=Roboto+Mono:ital,wght@0,100..700;1,100..700&display=swap');
     #file-tree, #table-container {
       max-height: calc(100vh - 150px);
       overflow-y: auto;
@@ -61,16 +61,20 @@ BASE_TEMPLATE = """
     .h1, .h2, .h3, .h4, .h5, .h6,
     .display-1, .display-2, .display-3,
     .display-4, .display-5, .display-6 {
-      font-family: "Anonymous Pro", sans-serif;
-      font-weight: bold
+      font-family: "Roboto Mono", monospace;
+      font-optical-sizing: auto;
+      font-weight: bold;
+      font-style: normal;
     }
     html, body, .tooltip, .popover {
-      font-family: 'Anonymous Pro', sans-serif;
-      font-variant-emoji: emoji;
+      font-family: "Roboto Mono", monospace;
+      font-optical-sizing: auto;
+      font-style: normal;
     }
     code, kbd, pre, samp, .text-monospace {
-      font-family: 'Anonymous Pro', monospace;
-      font-variant-emoji: emoji;
+      font-family: "Roboto Mono", monospace;
+      font-optical-sizing: auto;
+      font-style: normal;
     }
   </style>
 </head>

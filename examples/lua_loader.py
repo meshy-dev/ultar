@@ -2,7 +2,7 @@ import ctypes
 from pathlib import Path
 import sys
 import re
-from tqdm import tqdm
+import time
 
 
 libdataloader = ctypes.CDLL("./zig-out/lib/libdataloader.so")
@@ -41,7 +41,7 @@ libdataloader.ultarReclaimRow.argtypes = [ctypes.c_void_p, ctypes.POINTER(Loaded
 libdataloader.ultarReclaimRow.restype = None
 
 
-src = Path(__file__).parent / "loader_rules.luau"
+src = Path(__file__).parent / "loader_rules.lua"
 src = src.open("r").read()
 src = re.sub(r"##stub##", sys.argv[1], src)
 print(src)
@@ -58,13 +58,16 @@ test_spec.debug = False
 loader = libdataloader.ultarCreateLuaLoader(test_spec)
 assert loader is not None
 
-pgbar = tqdm()
+time_start = time.perf_counter()
+
 while True:
     r = libdataloader.ultarNextRow(loader)
+    new_time = time.perf_counter()
+    print(f"Time taken for row: {new_time - time_start:.4f} seconds")
+    time_start = new_time
     if r:
         libdataloader.ultarReclaimRow(loader, r)
     else:
         break
-    pgbar.update(1)
 
 libdataloader.ultarDestroyLuaLoader(loader)

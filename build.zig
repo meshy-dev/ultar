@@ -9,7 +9,7 @@ pub fn build(b: *std.Build) void {
     const zlua = b.dependency("zlua", .{
         .target = target,
         .optimize = optimize,
-        .lang = .luau,
+        .lang = .lua54,
         .shared = false,
     });
 

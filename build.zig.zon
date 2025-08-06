@@ -8,7 +8,7 @@
         .hash = "clap-0.10.0-oBajB8fkAQB0JvsrWLar4YZrseSZ9irFxHB7Hvy_bvxb",
     },
     .zlua = .{
-            .url = "git+https://github.com/natecraddock/ziglua#5f19274632c94fc9c6ed6ab8506ac903d25c8303",
-            .hash = "zlua-0.1.0-hGRpCxsXBQD2CZVDwzHsRkyMrydDpxADn0px0x1IraT8",
-        },
+        .url = "git+https://github.com/natecraddock/ziglua?ref=0.4.0#9257242a6fea6069f06d0b831d22f8df47307bfa",
+        .hash = "zlua-0.4.0-hGRpC2rgBABehOIUe4yH9GhRxKvGBiHS25_ro61jFbTT",
+    },
 }, .paths = .{""} }

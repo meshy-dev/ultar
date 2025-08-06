@@ -19,8 +19,42 @@ const ScanCtx = struct {
     }
 };
 
+pub fn luaDumpStack(lua: *Lua) void {
+    const top: usize = @intCast(lua.getTop());
+    var buf: [100]u8 = undefined;
+    for (1..top + 1) |_i| {
+        const i: i32 = @intCast(_i);
+        const t = lua.typeOf(i);
+        var value: []const u8 = undefined;
+        switch (t) {
+            .nil => {
+                value = "nil";
+            },
+            .boolean => {
+                value = if (lua.toBoolean(i)) "true" else "false";
+            },
+            .number => {
+                const v = lua.toNumber(i) catch {
+                    value = "unknown number";
+                    break;
+                };
+                value = std.fmt.bufPrint(&buf, "{d}", .{v}) catch "number too long??";
+            },
+            .string => {
+                value = lua.toString(i) catch "unknown string";
+            },
+            .table, .function, .thread, .userdata => {
+                value = "object";
+            },
+            else => {
+                value = "unknown type";
+            },
+        }
+        logger.info("Stack[{}]: {s}", .{ i, value });
+    }
+}
+
 pub fn printLuaErr(lua: *Lua, err: zlua.Error) zlua.Error {
-    std.debug.dumpCurrentStackTrace(null);
     switch (err) {
         error.LuaError, error.LuaRuntime, error.LuaSyntax => {
             const err_msg = lua.toString(-1) catch "unknown error";
@@ -30,6 +64,8 @@ pub fn printLuaErr(lua: *Lua, err: zlua.Error) zlua.Error {
             logger.err("Lua op returned {}", .{err});
         },
     }
+    luaDumpStack(lua);
+    std.debug.dumpCurrentStackTrace(null);
     return err;
 }
 

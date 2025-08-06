@@ -131,7 +131,7 @@ pub const LuaDataLoader = struct {
 
     fn gCloseFile(lua: *Lua) !i32 {
         const loader = try lua.toUserdata(Self, 1);
-        const handle: u32 = @intCast(try lua.toUnsigned(2));
+        const handle: u32 = @intFromFloat(try lua.toNumber(2));
         loader.u_yielded_from = .{
             .close_file = .{
                 .file_handle = handle,
@@ -142,12 +142,12 @@ pub const LuaDataLoader = struct {
 
     fn gAddEntry(lua: *Lua) !i32 {
         const loader = try lua.toUserdata(Self, 1);
-        const handle: u32 = @intCast(try lua.toUnsigned(2));
+        const handle: u32 = @intFromFloat(try lua.toNumber(2));
         // We yield after this function & the string ref should live long enough
         const key = try lua.toString(3);
         const raw: f64 = try lua.toNumber(4); // f64
         const offset: u64 = @intFromFloat(raw);
-        const size: u32 = @intCast(try lua.toUnsigned(5));
+        const size: u32 = @intFromFloat(try lua.toNumber(5));
 
         loader.u_yielded_from = .{
             .add_entry = .{
@@ -176,8 +176,12 @@ pub const LuaDataLoader = struct {
 
         const fmt =
             \\return function(self, ...)
-            \\  {s}(self.c_loader, ...)
-            \\  return coroutine.yield()
+            \\    assert(
+            \\        type(self) == "table" and type(self.c_loader) == "userdata",
+            \\        "Invalid self, maybe you meant `g_loader:` instead of `g_loader.` ?"
+            \\    );
+            \\    {s}(self.c_loader, ...)
+            \\    return coroutine.yield()
             \\end
         ;
 
@@ -230,7 +234,13 @@ pub const LuaDataLoader = struct {
             return .yield;
         }
 
-        const status = self.lua.resumeThread(null, self.u_resume_nargs) catch |err| return self.printLuaErr(err);
+        var status: zlua.ResumeStatus = .ok;
+        if (zlua.lang == .lua54) {
+            var n_results: i32 = 0;
+            status = self.lua.resumeThread(null, self.u_resume_nargs, &n_results) catch |err| return self.printLuaErr(err);
+        } else {
+            status = self.lua.resumeThread(null, self.u_resume_nargs) catch |err| return self.printLuaErr(err);
+        }
         self.u_resume_nargs = 0;
 
         switch (status) {
@@ -398,15 +408,19 @@ pub const LuaDataLoader = struct {
         self.lua.setGlobal("g_loader"); // pop 1 & move to global
 
         // Compile src to bytecode & load into VM
-        const alloc = self.lua.allocator();
-        const src: [:0]const u8 = std.mem.span(spec.src);
-        const bc = zlua.compile(alloc, src, .{}) catch |err| {
-            logger.err("Error compiling Lua source: {}", .{err});
-            return err;
-        };
-        defer alloc.free(bc);
+        if (zlua.lang == .luau) {
+            const alloc = self.lua.allocator();
+            const src: [:0]const u8 = std.mem.span(spec.src);
+            const bc = zlua.compile(alloc, src, .{}) catch |err| {
+                logger.err("Error compiling Lua source: {}", .{err});
+                return err;
+            };
+            defer alloc.free(bc);
 
-        self.lua.loadBytecode("loader_spec_src", bc) catch |err| return self.printLuaErr(err);
+            self.lua.loadBytecode("loader_spec_src", bc) catch |err| return self.printLuaErr(err);
+        } else {
+            self.lua.loadString(spec.src) catch |err| return self.printLuaErr(err);
+        }
 
         // Call the bytecode that generates a context & its functions
         self.lua.protectedCall(.{ .results = 1 }) catch |err| return self.printLuaErr(err);

@@ -131,7 +131,7 @@ pub const LuaDataLoader = struct {
 
     fn gCloseFile(lua: *Lua) !i32 {
         const loader = try lua.toUserdata(Self, 1);
-        const handle: u32 = @intFromFloat(try lua.toNumber(2));
+        const handle: u32 = try lua_rt.toUnsigned(lua, 2);
         loader.u_yielded_from = .{
             .close_file = .{
                 .file_handle = handle,
@@ -142,12 +142,12 @@ pub const LuaDataLoader = struct {
 
     fn gAddEntry(lua: *Lua) !i32 {
         const loader = try lua.toUserdata(Self, 1);
-        const handle: u32 = @intFromFloat(try lua.toNumber(2));
+        const handle: u32 = try lua_rt.toUnsigned(lua, 2);
         // We yield after this function & the string ref should live long enough
         const key = try lua.toString(3);
         const raw: f64 = try lua.toNumber(4); // f64
         const offset: u64 = @intFromFloat(raw);
-        const size: u32 = @intFromFloat(try lua.toNumber(5));
+        const size: u32 = try lua_rt.toUnsigned(lua, 2);
 
         loader.u_yielded_from = .{
             .add_entry = .{
@@ -238,6 +238,8 @@ pub const LuaDataLoader = struct {
         if (zlua.lang == .lua54) {
             var n_results: i32 = 0;
             status = self.lua.resumeThread(null, self.u_resume_nargs, &n_results) catch |err| return self.printLuaErr(err);
+        } else if (zlua.lang == .luajit or zlua.lang == .lua51) {
+            status = self.lua.resumeThread(self.u_resume_nargs) catch |err| return self.printLuaErr(err);
         } else {
             status = self.lua.resumeThread(null, self.u_resume_nargs) catch |err| return self.printLuaErr(err);
         }
@@ -320,7 +322,7 @@ pub const LuaDataLoader = struct {
                 switch (payload) {
                     .open_file => |f| {
                         std.debug.assert((self.u_yielded_from orelse @panic("Unresolved open_file req")) == .open_file);
-                        self.lua.pushUnsigned(@intCast(@as(u32, @bitCast(f))));
+                        lua_rt.pushUnsigned(self.lua, @intCast(@as(u32, @bitCast(f))));
                         self.u_resume_nargs = 1;
                         self.u_yielded_from = null;
                     },
@@ -419,7 +421,8 @@ pub const LuaDataLoader = struct {
 
             self.lua.loadBytecode("loader_spec_src", bc) catch |err| return self.printLuaErr(err);
         } else {
-            self.lua.loadString(spec.src) catch |err| return self.printLuaErr(err);
+            const src: [:0]const u8 = std.mem.span(spec.src);
+            self.lua.loadString(src) catch |err| return self.printLuaErr(err);
         }
 
         // Call the bytecode that generates a context & its functions
@@ -440,8 +443,8 @@ pub const LuaDataLoader = struct {
 
         // Initialize the user provided context
         _ = self.lua.rawGetIndex(zlua.registry_index, self.u_loader_fn.init_ctx);
-        self.lua.pushUnsigned(@intCast(spec.rank));
-        self.lua.pushUnsigned(@intCast(spec.world_size));
+        lua_rt.pushUnsigned(self.lua, @intCast(spec.rank));
+        lua_rt.pushUnsigned(self.lua, @intCast(spec.world_size));
         self.lua.protectedCall(.{ .args = 2, .results = 1 }) catch |err| return self.printLuaErr(err);
         self.u_ctx = self.lua.ref(-1) catch |err| return self.printLuaErr(err); // pop & store ref of ret value (user context)
 

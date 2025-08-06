@@ -13,9 +13,15 @@ const ScanCtx = struct {
     const f_iter = "iter";
     const meta_table = "ScanCtxMT";
 
-    pub fn luaDetor(data: *anyopaque) void {
+    pub fn luauDetor(data: *anyopaque) void {
         const ctx: *ScanCtx = @ptrFromInt(@intFromPtr(data));
         ctx.dir.close();
+    }
+
+    pub fn luaDetor(lua: *Lua) !c_int {
+        const ctx = try lua.toUserdata(ScanCtx, 1);
+        ctx.dir.close();
+        return 0;
     }
 };
 
@@ -54,6 +60,24 @@ pub fn luaDumpStack(lua: *Lua) void {
     }
 }
 
+pub fn toUnsigned(lua: *Lua, idx: i32) !u32 {
+    if (zlua.lang == .luau or zlua.lang == .lua52) {
+        return lua.toUnsigned(idx);
+    } else {
+        const f = try lua.toNumber(idx);
+        return @intFromFloat(f);
+    }
+}
+
+pub fn pushUnsigned(lua: *Lua, v: u32) void {
+    if (zlua.lang == .luau or zlua.lang == .lua52) {
+        lua.pushUnsigned(v);
+    } else {
+        const f: f64 = @floatFromInt(v);
+        lua.pushNumber(f);
+    }
+}
+
 pub fn printLuaErr(lua: *Lua, err: zlua.Error) zlua.Error {
     switch (err) {
         error.LuaError, error.LuaRuntime, error.LuaSyntax => {
@@ -72,7 +96,13 @@ pub fn printLuaErr(lua: *Lua, err: zlua.Error) zlua.Error {
 fn newScanCtx(lua: *Lua) !i32 {
     const path = lua.toString(1) catch |err| return printLuaErr(lua, err);
 
-    const ctx = lua.newUserdataDtor(ScanCtx, zlua.wrap(ScanCtx.luaDetor));
+    const ctx = switch (zlua.lang) {
+        // Other runtimes use __gc metamethod to clean up userdata
+        .luau => lua.newUserdataDtor(ScanCtx, zlua.wrap(ScanCtx.luauDetor)),
+        .lua54 => lua.newUserdata(ScanCtx, 0),
+        else => lua.newUserdata(ScanCtx),
+    };
+
     ctx.dir = std.fs.cwd().openDir(path, .{ .iterate = true }) catch |err| {
         logger.warn("Failed to open directory {s}: {}", .{ path, err });
         return zlua.Error.LuaFile;
@@ -156,7 +186,7 @@ const MsgpackUnpacker = struct {
         }
 
         pub fn unpackUint(self: *UnpackerImpl, v: u64) !void {
-            if (v > std.math.maxInt(zlua.Unsigned)) {
+            if ((zlua.lang != .luau and zlua.lang != .lua52) or v > std.math.maxInt(zlua.Unsigned)) {
                 std.debug.assert(v < 2e14);
                 self.lua.pushNumber(@floatFromInt(v));
             } else {
@@ -249,7 +279,7 @@ const MsgpackUnpacker = struct {
     const meta_table = "MsgpackUnpackerMT";
     const g_new_ctx = "msgpack_unpacker";
 
-    pub fn luaDetor(data: *anyopaque) void {
+    pub fn luauDetor(data: *anyopaque) void {
         const ctx: *MsgpackUnpacker = @ptrFromInt(@intFromPtr(data));
         ctx.msgpack_file.close();
         ctx.unpacker.ctx.deinit();
@@ -258,7 +288,13 @@ const MsgpackUnpacker = struct {
     fn newCtx(lua: *Lua) !i32 {
         const path = lua.toString(1) catch |err| return printLuaErr(lua, err);
 
-        const ctx = lua.newUserdataDtor(MsgpackUnpacker, zlua.wrap(MsgpackUnpacker.luaDetor));
+        const ctx = switch (zlua.lang) {
+            // Other runtimes use __gc metamethod to clean up userdata
+            .luau => lua.newUserdataDtor(MsgpackUnpacker, zlua.wrap(MsgpackUnpacker.luauDetor)),
+            .lua54 => lua.newUserdata(MsgpackUnpacker, 0),
+            else => lua.newUserdata(MsgpackUnpacker),
+        };
+
         ctx.msgpack_file = std.fs.cwd().openFile(path, .{ .mode = .read_only }) catch |err| {
             logger.warn("Failed to open file {s}: {}", .{ path, err });
             return zlua.Error.LuaFile;
@@ -295,6 +331,10 @@ const MsgpackUnpacker = struct {
 
 pub fn registerRt(lua: *Lua) !void {
     try lua.newMetatable(ScanCtx.meta_table); // [+p]
+    if (zlua.lang != .luau) {
+        lua.pushFunction(zlua.wrap(ScanCtx.luaDetor)); // [+p]
+        lua.setField(-2, "__gc"); // pop 1
+    }
     lua.newTable(); // [+p]
     lua.pushFunction(zlua.wrap(scanDir)); // [+p]
     lua.setField(-2, ScanCtx.f_iter); // pop 1

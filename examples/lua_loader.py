@@ -60,11 +60,12 @@ assert loader is not None
 
 time_start = time.perf_counter()
 
-while True:
+for i in range(10000):
     r = libdataloader.ultarNextRow(loader)
-    new_time = time.perf_counter()
-    print(f"Time taken for row: {new_time - time_start:.4f} seconds")
-    time_start = new_time
+    if i % 1000 == 999:
+        new_time = time.perf_counter()
+        print(f"Time taken for 1000 row: {new_time - time_start:.4f} seconds")
+        time_start = new_time
     if r:
         libdataloader.ultarReclaimRow(loader, r)
     else:

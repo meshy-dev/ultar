@@ -63,7 +63,7 @@ return {
 				-- local s = string.format("row[%d] \"%s\" { ", row.iidx, row.str_idx)
 				local base = row.offset
 
-				local sampled_entries = sampleIndices(#row.keys, #row.keys // 2)
+				local sampled_entries = sampleIndices(#row.keys, math.floor(#row.keys / 2))
 
 				for _, i in ipairs(sampled_entries) do
 					local k = row.keys[i]
@@ -74,7 +74,7 @@ return {
 					g_loader:add_entry(tar, k, offset, size)
 
 					-- NOTE: Uncomment below to check failure/error behavior
-					g_loader.add_entry(tar, k .. "_fail", offset, size) -- Wrong syntax
+					-- g_loader.add_entry(tar, k .. "_fail", offset, size) -- Wrong syntax
 				end
 				-- s = s .. "}"
 				-- print(s, #row.keys)

@@ -37,24 +37,27 @@ pub fn build(b: *std.Build) void {
 
     const indexer = b.addExecutable(.{
         .name = "indexer",
-        .root_source_file = b.path("indexer.zig"),
-        .target = target,
-        .optimize = optimize,
-        .strip = false,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("indexer.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
     });
     indexer.root_module.addImport("clap", clap.module("clap"));
     indexer.root_module.addImport("xev", xev.module("xev"));
     b.installArtifact(indexer);
 
-    const lib_dataloader = b.addSharedLibrary(.{
+    const lib_dataloader = b.addLibrary(.{
         .name = "dataloader",
-        .link_libc = true,
-        .single_threaded = false,
-        .pic = true,
-        .target = target,
-        .optimize = optimize,
-        .root_source_file = b.path("lua_dataloader.zig"),
-        .strip = false,
+        .linkage = .dynamic,
+        .root_module = b.createModule(.{
+            .link_libc = true,
+            .single_threaded = false,
+            .pic = true,
+            .target = target,
+            .optimize = optimize,
+            .root_source_file = b.path("lua_dataloader.zig"),
+        }),
     });
     lib_dataloader.root_module.addImport("xev", xev.module("xev"));
     lib_dataloader.root_module.addImport("zlua", zlua.module("zlua"));
@@ -62,11 +65,11 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run unit tests");
 
-    const unit_tests = b.addTest(.{
+    const unit_tests = b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = b.path("tests.zig"),
         .target = target,
         .link_libc = true,
-    });
+    }) });
     unit_tests.root_module.addImport("xev", xev.module("xev"));
 
     const run_unit_tests = b.addRunArtifact(unit_tests);

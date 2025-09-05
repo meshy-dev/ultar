@@ -1,14 +1,14 @@
 .{ .name = .ultar, .version = "0.0.0", .fingerprint = 0x17f55a637e2667a4, .dependencies = .{
     .libxev = .{
-        .url = "git+https://github.com/mitchellh/libxev.git#94ed6af7b2aaaeab987fbf87fcee410063df715b",
-        .hash = "libxev-0.0.0-86vtc-zkEgB7uv1i0Sa6ytJETZQi_lHJrImu9mLb9moi",
+        .url = "git+https://github.com/zen-eth/libxev.git?ref=0.15.1#68f5dc7c512269d83b952d4bbda94c3c1bf4e4c6",
+        .hash = "libxev-0.0.0-86vtc2odEwBDzC8p8WoJl4IPhkBGNijDyppIFakxEzaL",
     },
     .clap = .{
-        .url = "git+https://github.com/Hejsil/zig-clap#a4e784da8399c51d5eeb5783e6a485b960d5c1f9",
-        .hash = "clap-0.10.0-oBajB8fkAQB0JvsrWLar4YZrseSZ9irFxHB7Hvy_bvxb",
+        .url = "https://github.com/Hejsil/zig-clap/archive/refs/tags/0.11.0.tar.gz",
+        .hash = "clap-0.11.0-oBajB-HnAQDPCKYzwF7rO3qDFwRcD39Q0DALlTSz5H7e",
     },
     .zlua = .{
-        .url = "git+https://github.com/natecraddock/ziglua?ref=0.4.0#9257242a6fea6069f06d0b831d22f8df47307bfa",
-        .hash = "zlua-0.4.0-hGRpC2rgBABehOIUe4yH9GhRxKvGBiHS25_ro61jFbTT",
+        .url = "git+https://github.com/natecraddock/ziglua.git#bf9fc6e6d9c24d5ba53b20acdab657f2fe6cb762",
+        .hash = "zlua-0.1.0-hGRpC444BQDrHc6QhcEeGh1eWMwFbl-c21vlGPWjKBfQ",
     },
 }, .paths = .{""} }

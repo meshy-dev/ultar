@@ -1,14 +1,34 @@
-.{ .name = .ultar, .version = "0.0.0", .fingerprint = 0x17f55a637e2667a4, .dependencies = .{
-    .libxev = .{
-        .url = "git+https://github.com/zen-eth/libxev.git?ref=0.15.1#68f5dc7c512269d83b952d4bbda94c3c1bf4e4c6",
-        .hash = "libxev-0.0.0-86vtc2odEwBDzC8p8WoJl4IPhkBGNijDyppIFakxEzaL",
+.{
+    .name = .ultar,
+    .version = "0.0.7",
+    .minimum_zig_version = "0.15.1",
+    .fingerprint = 0x17f55a637e2667a4,
+    .dependencies = .{
+        .libxev = .{
+            .url = "git+https://github.com/zen-eth/libxev.git?ref=0.15.1#68f5dc7c512269d83b952d4bbda94c3c1bf4e4c6",
+            .hash = "libxev-0.0.0-86vtc2odEwBDzC8p8WoJl4IPhkBGNijDyppIFakxEzaL",
+        },
+        .clap = .{
+            .url = "https://github.com/Hejsil/zig-clap/archive/refs/tags/0.11.0.tar.gz",
+            .hash = "clap-0.11.0-oBajB-HnAQDPCKYzwF7rO3qDFwRcD39Q0DALlTSz5H7e",
+        },
+        .zlua = .{
+            .url = "git+https://github.com/natecraddock/ziglua.git#bf9fc6e6d9c24d5ba53b20acdab657f2fe6cb762",
+            .hash = "zlua-0.1.0-hGRpC444BQDrHc6QhcEeGh1eWMwFbl-c21vlGPWjKBfQ",
+        },
     },
-    .clap = .{
-        .url = "https://github.com/Hejsil/zig-clap/archive/refs/tags/0.11.0.tar.gz",
-        .hash = "clap-0.11.0-oBajB-HnAQDPCKYzwF7rO3qDFwRcD39Q0DALlTSz5H7e",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "concurrent_ring.zig",
+        "dataloader.zig",
+        "indexer.zig",
+        "lua_dataloader.zig",
+        "lua_rt.zig",
+        "msgpack.zig",
+        "octal.zig",
+        "scanners.zig",
+        "tardefs.zig",
+        "tests.zig",
     },
-    .zlua = .{
-        .url = "git+https://github.com/natecraddock/ziglua.git#bf9fc6e6d9c24d5ba53b20acdab657f2fe6cb762",
-        .hash = "zlua-0.1.0-hGRpC444BQDrHc6QhcEeGh1eWMwFbl-c21vlGPWjKBfQ",
-    },
-}, .paths = .{""} }
+}

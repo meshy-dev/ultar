@@ -22,14 +22,19 @@ pub fn main() !void {
     defer stderr.flush() catch @panic("Error flushing stderr");
 
     const params = comptime clap.parseParamsComptime(
-        \\-h, --help             Display this help and exit.
-        \\-f, --file <str>...    Tar file(s) to index.
-        \\--fmt <str>            Output format (msgpack / jsonl).
+        \\-h, --help           Display this help and exit.
+        \\--fmt <STR>          Output format (msgpack / jsonl).
+        \\-f, --file <FILE>... Tar file(s) to index.
         \\
     );
 
+    const parsers = comptime .{
+        .STR = clap.parsers.string,
+        .FILE = clap.parsers.string,
+    };
+
     var diag = clap.Diagnostic{};
-    var res = clap.parse(clap.Help, &params, clap.parsers.default, .{
+    var res = clap.parse(clap.Help, &params, parsers, .{
         .diagnostic = &diag,
         .allocator = allocator,
     }) catch |err| {
@@ -42,15 +47,16 @@ pub fn main() !void {
     if (res.args.help != 0)
         return clap.help(stderr, clap.Help, &params, .{});
 
-    var tarfiles = try allocator.alloc(Indexer, res.args.file.len);
+    const num_tarfiles = res.args.file.len;
+    var indexers = try allocator.alloc(Indexer, num_tarfiles);
     defer {
-        for (tarfiles) |*t| {
+        for (indexers) |*t| {
             if (t.fs_file != null) {
                 t.state.deinit();
                 t.deinit();
             }
         }
-        allocator.free(tarfiles);
+        allocator.free(indexers);
     }
 
     const fmt = if (res.args.fmt) |fmt_str| (std.meta.stringToEnum(WdsIndexingState.SerializationFormat, fmt_str) orelse {
@@ -62,7 +68,7 @@ pub fn main() !void {
     defer loop.deinit();
 
     for (res.args.file, 0..) |fp, i| {
-        const tarfile = &tarfiles[i];
+        const indexer = &indexers[i];
         const out_fp = try std.mem.join(allocator, ".", &[_][]const u8{ fp, index_ext });
         defer allocator.free(out_fp);
         const out_file = std.fs.cwd().createFile(out_fp, .{ .truncate = true }) catch |err| {
@@ -70,8 +76,8 @@ pub fn main() !void {
             return err;
         };
         const state = try WdsIndexingState.init(allocator, &loop, out_file, fmt);
-        tarfile.* = try Indexer.initFp(state, fp);
-        tarfile.enqueueRead(&loop);
+        indexer.* = try Indexer.initFp(state, fp);
+        indexer.enqueueRead(&loop);
     }
 
     try loop.run(.until_done);

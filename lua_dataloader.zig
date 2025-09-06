@@ -273,14 +273,20 @@ pub const LuaDataLoader = struct {
     }
 
     pub fn nextRow(self: *Self) !?*LoadedRow {
+        var wait_time_ns: u64 = 1_024; // Start with 1us
+        const wait_time_cap: u64 = 1 << 24; // Cap at ~16ms
         while (true) {
             const n = self.queue_len;
             // Throttle & wait for IO if we have enough in-flight rows
+            // Compute wait time heuristic
             if (n < self.queue_size_rows) {
                 if (try self.resumeGenerator() == .ok and n == 0) {
                     // Generator completed
                     return null;
                 }
+                wait_time_ns = @max(wait_time_ns / 2, 1);
+            } else {
+                wait_time_ns = @min(wait_time_ns * 2, wait_time_cap);
             }
 
             // Handle the reason we yielded
@@ -396,8 +402,10 @@ pub const LuaDataLoader = struct {
                 }
             }
 
-            std.atomic.spinLoopHint();
-            std.Thread.yield() catch {};
+            if (wait_time_ns < 10_000) {
+                std.atomic.spinLoopHint();
+            }
+            std.Thread.sleep(wait_time_ns);
         }
     }
 

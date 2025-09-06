@@ -417,32 +417,32 @@ pub const Packer = struct {
     pub fn addInt(self: *Self, comptime T: type, v: T) !void {
         var buf: [9]u8 = undefined;
         const bytes = packInt(T, v, buf[0..]);
-        _ = try self.writer.write(bytes);
+        try self.writer.writeAll(bytes);
     }
 
     pub fn addFloat(self: *Self, comptime T: type, v: T) !void {
         var buf: [9]u8 = undefined;
         const bytes = packFloat(T, v, buf[0..]);
-        _ = try self.writer.write(bytes);
+        try self.writer.writeAll(bytes);
     }
 
     pub fn addStr(self: *Self, str: []const u8) !void {
         var buf: [5]u8 = undefined;
         const header_bytes = try packStrHeader(str.len, buf[0..]);
-        _ = try self.writer.write(header_bytes);
-        _ = try self.writer.write(str);
+        try self.writer.writeAll(header_bytes);
+        try self.writer.writeAll(str);
     }
 
     pub fn beginArray(self: *Self, len: usize) !void {
         var buf: [5]u8 = undefined;
         const header_bytes = try packArrayHeader(len, buf[0..]);
-        _ = try self.writer.write(header_bytes);
+        try self.writer.writeAll(header_bytes);
     }
 
     pub fn beginMap(self: *Self, len: usize) !void {
         var buf: [5]u8 = undefined;
         const header_bytes = try packMapHeader(len, buf[0..]);
-        _ = try self.writer.write(header_bytes);
+        try self.writer.writeAll(header_bytes);
     }
 };
 
@@ -548,20 +548,23 @@ pub fn Unpacker(CtxT: type, comptime handler: MsgpackHandler(CtxT)) type {
                 },
                 // str 8
                 0xd9 => {
-                    var buf: [1]u8 = .{0};
-                    read += try self.reader.readSliceShort(&buf);
-                    str_len = @intCast(buf[0]);
+                    var buf: u8 = 0;
+                    try self.reader.readSliceAll(@ptrCast(&buf));
+                    read += 1;
+                    str_len = @intCast(buf);
                 },
                 // str 16
                 0xda => {
                     var buf: [2]u8 = undefined;
-                    read += try self.reader.readSliceShort(&buf);
+                    try self.reader.readSliceAll(&buf);
+                    read += buf.len;
                     str_len = (@as(u64, @intCast(buf[0])) << 8) | @as(u64, @intCast(buf[1]));
                 },
                 // str 32
                 0xdb => {
                     var buf: [4]u8 = undefined;
-                    read += try self.reader.readSliceShort(&buf);
+                    try self.reader.readSliceAll(&buf);
+                    read += buf.len;
                     str_len = (@as(u64, @intCast(buf[0])) << 24) | (@as(u64, @intCast(buf[1])) << 16) | (@as(u64, @intCast(buf[2])) << 8) | @as(u64, @intCast(buf[3]));
                 },
                 else => return error.InvalidHeader,
@@ -584,20 +587,23 @@ pub fn Unpacker(CtxT: type, comptime handler: MsgpackHandler(CtxT)) type {
                 },
                 // str 8
                 0xd9 => {
-                    var buf: [1]u8 = .{0};
-                    read += try self.reader.readSliceShort(&buf);
-                    str_len = @intCast(buf[0]);
+                    var buf: u8 = 0;
+                    try self.reader.readSliceAll(@ptrCast(&buf));
+                    read += 1;
+                    str_len = @intCast(buf);
                 },
                 // str 16
                 0xda => {
                     var buf: [2]u8 = undefined;
-                    read += try self.reader.readSliceShort(&buf);
+                    try self.reader.readSliceAll(&buf);
+                    read += buf.len;
                     str_len = (@as(u64, @intCast(buf[0])) << 8) | @as(u64, @intCast(buf[1]));
                 },
                 // str 32
                 0xdb => {
                     var buf: [4]u8 = undefined;
-                    read += try self.reader.readSliceShort(&buf);
+                    try self.reader.readSliceAll(&buf);
+                    read += buf.len;
                     str_len = (@as(u64, @intCast(buf[0])) << 24) | (@as(u64, @intCast(buf[1])) << 16) | (@as(u64, @intCast(buf[2])) << 8) | @as(u64, @intCast(buf[3]));
                 },
                 else => return error.InvalidHeader,
@@ -617,13 +623,15 @@ pub fn Unpacker(CtxT: type, comptime handler: MsgpackHandler(CtxT)) type {
                 // map 16
                 0xde => {
                     var buf: [2]u8 = undefined;
-                    read += try self.reader.readSliceShort(&buf);
+                    try self.reader.readSliceAll(&buf);
+                    read += buf.len;
                     map_len = (@as(u64, @intCast(buf[0])) << 8) | @as(u64, @intCast(buf[1]));
                 },
                 // map 32
                 0xdf => {
                     var buf: [4]u8 = undefined;
-                    read += try self.reader.readSliceShort(&buf);
+                    try self.reader.readSliceAll(&buf);
+                    read += buf.len;
                     map_len = (@as(u64, @intCast(buf[0])) << 24) | (@as(u64, @intCast(buf[1])) << 16) | (@as(u64, @intCast(buf[2])) << 8) | @as(u64, @intCast(buf[3]));
                 },
                 else => unreachable,
@@ -634,7 +642,8 @@ pub fn Unpacker(CtxT: type, comptime handler: MsgpackHandler(CtxT)) type {
             for (0..map_len) |idx| {
                 // Read key
                 var key_header: u8 = 0;
-                read += try self.reader.readSliceShort(@ptrCast(&key_header));
+                try self.reader.readSliceAll(@ptrCast(&key_header));
+                read += 1;
                 if (Self.isShortStr(key_header)) {
                     var buf: [256]u8 = undefined;
                     const key, const key_n = self.unpackStr(key_header, &buf) catch |err| {
@@ -679,13 +688,15 @@ pub fn Unpacker(CtxT: type, comptime handler: MsgpackHandler(CtxT)) type {
                 // array 16
                 0xdc => {
                     var buf: [2]u8 = undefined;
-                    read += try self.reader.readSliceShort(&buf);
+                    try self.reader.readSliceAll(&buf);
+                    read += buf.len;
                     arr_len = (@as(u64, @intCast(buf[0])) << 8) | @as(u64, @intCast(buf[1]));
                 },
                 // array 32
                 0xdd => {
                     var buf: [4]u8 = undefined;
-                    read += try self.reader.readSliceShort(&buf);
+                    try self.reader.readSliceAll(&buf);
+                    read += buf.len;
                     arr_len = (@as(u64, @intCast(buf[0])) << 24) | (@as(u64, @intCast(buf[1])) << 16) | (@as(u64, @intCast(buf[2])) << 8) | @as(u64, @intCast(buf[3]));
                 },
                 else => unreachable,
@@ -715,9 +726,7 @@ pub fn Unpacker(CtxT: type, comptime handler: MsgpackHandler(CtxT)) type {
 
             for (0..limit_n) |_| {
                 var header: u8 = 0;
-                if (try self.reader.readSliceShort(@ptrCast(&header)) == 0) {
-                    return error.EndOfStream;
-                }
+                try self.reader.readSliceAll(@ptrCast(&header));
                 read += 1;
 
                 try switch (header) {
@@ -761,14 +770,16 @@ pub fn Unpacker(CtxT: type, comptime handler: MsgpackHandler(CtxT)) type {
                     // float 32
                     0xca => if (handler.float) |h_float| {
                         var buf: [4]u8 = undefined;
-                        read += try self.reader.readSliceShort(&buf);
+                        try self.reader.readSliceAll(&buf);
+                        read += buf.len;
                         const u = (@as(u32, @intCast(buf[0])) << 24) | (@as(u32, @intCast(buf[1])) << 16) | (@as(u32, @intCast(buf[2])) << 8) | @as(u32, @intCast(buf[3]));
                         try h_float(&self.ctx, @floatCast(@as(f32, @bitCast(u))));
                     } else return errNoImpl(),
                     // float 64
                     0xcb => if (handler.float) |h_float| {
                         var buf: [8]u8 = undefined;
-                        read += try self.reader.readSliceShort(&buf);
+                        try self.reader.readSliceAll(&buf);
+                        read += buf.len;
                         var u: u64 = 0;
                         inline for (0..8) |i| {
                             u |= (@as(u64, @intCast(buf[i])) << (56 - i * 8));

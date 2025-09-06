@@ -31,19 +31,18 @@ const Row = struct {
         data: []u8,
     };
 
+    node: std.DoublyLinkedList.Node = .{},
     arena: std.heap.ArenaAllocator,
     ext_row: LoadedRow = .{},
     entries: std.ArrayListUnmanaged(Entry),
     num_fullfilled: usize = 0,
 
-    const List = std.DoublyLinkedList(Row);
-
-    pub fn initAlloc(base_alloc: std.mem.Allocator) !*Row.List.Node {
-        var r = try base_alloc.create(Row.List.Node);
+    pub fn initAlloc(base_alloc: std.mem.Allocator) !*Row {
+        var r = try base_alloc.create(Row);
         errdefer base_alloc.destroy(r);
-        r.data.arena = std.heap.ArenaAllocator.init(base_alloc);
-        r.data.entries = try std.ArrayListUnmanaged(Entry).initCapacity(r.data.arena.allocator(), 8);
-        r.data.num_fullfilled = 0;
+        r.arena = std.heap.ArenaAllocator.init(base_alloc);
+        r.entries = try std.ArrayListUnmanaged(Entry).initCapacity(r.arena.allocator(), 8);
+        r.num_fullfilled = 0;
         return r;
     }
 
@@ -102,9 +101,10 @@ pub const LuaDataLoader = struct {
     u_completed: bool = false,
 
     queue_size_rows: usize = 4,
-    in_progress_row: ?*Row.List.Node = null,
-    queue: Row.List = .{},
-    free_list: Row.List = .{},
+    in_progress_row: ?*Row = null,
+    queue: std.DoublyLinkedList = .{},
+    queue_len: usize = 0,
+    free_list: std.DoublyLinkedList = .{},
     num_floating_rows: usize = 0,
 
     load_rid_to_row: std.AutoArrayHashMapUnmanaged(u64, *Row),
@@ -193,13 +193,15 @@ pub const LuaDataLoader = struct {
 
     fn newInprogressRow(self: *Self) !void {
         if (self.in_progress_row) |r| {
-            self.queue.append(r);
+            self.queue.append(&r.node);
+            self.queue_len += 1;
         }
 
-        self.in_progress_row = self.free_list.popFirst();
-
-        if (self.in_progress_row) |r| {
-            try r.data.reset();
+        const free_node_opt = self.free_list.popFirst();
+        if (free_node_opt) |free_node| {
+            var row: *Row = @fieldParentPtr("node", free_node);
+            try row.reset();
+            self.in_progress_row = row;
         } else {
             self.in_progress_row = try Row.initAlloc(self.alloc);
         }
@@ -271,14 +273,20 @@ pub const LuaDataLoader = struct {
     }
 
     pub fn nextRow(self: *Self) !?*LoadedRow {
+        var wait_time_ns: u64 = 1_024; // Start with 1us
+        const wait_time_cap: u64 = 1 << 24; // Cap at ~16ms
         while (true) {
-            const n = self.queue.len;
+            const n = self.queue_len;
             // Throttle & wait for IO if we have enough in-flight rows
+            // Compute wait time heuristic
             if (n < self.queue_size_rows) {
                 if (try self.resumeGenerator() == .ok and n == 0) {
                     // Generator completed
                     return null;
                 }
+                wait_time_ns = @max(wait_time_ns / 2, 1);
+            } else {
+                wait_time_ns = @min(wait_time_ns * 2, wait_time_cap);
             }
 
             // Handle the reason we yielded
@@ -300,12 +308,12 @@ pub const LuaDataLoader = struct {
                         }
                     },
                     .add_entry => |*e| {
-                        const row = &self.in_progress_row.?.data;
+                        const row = self.in_progress_row.?;
                         if (e.entry == null) {
                             const row_alloc = row.arena.allocator();
                             const key = try row_alloc.dupeZ(u8, e.key);
                             e.key = key;
-                            const row_data = try row_alloc.alignedAlloc(u8, 32, e.size);
+                            const row_data = try row_alloc.alignedAlloc(u8, .fromByteUnits(32), e.size);
                             try row.entries.append(row_alloc, .{
                                 .key = key,
                                 .data = row_data,
@@ -349,17 +357,18 @@ pub const LuaDataLoader = struct {
             }
 
             if (self.queue.first) |f_node| {
-                const first = &f_node.data;
+                const first: *Row = @fieldParentPtr("node", f_node);
 
-                logger.debug("Q len: {}, first: fullfilled = {}, entries = {}", .{ self.queue.len, first.num_fullfilled, first.entries.items.len });
+                logger.debug("Q len: {}, first: fullfilled = {}, entries = {}", .{ self.queue_len, first.num_fullfilled, first.entries.items.len });
 
                 if (first.num_fullfilled == first.entries.items.len) {
                     const node = self.queue.popFirst() orelse unreachable;
+                    self.queue_len -= 1;
                     self.num_floating_rows += 1;
                     if (self.num_floating_rows > Self.max_floating_rows) {
                         std.debug.panic("Too many floating (owned by client) rows > max: {}", .{Self.max_floating_rows});
                     }
-                    const row = &node.data;
+                    const row: *Row = @fieldParentPtr("node", node);
                     const alloc = row.arena.allocator();
                     const entries = row.entries.items;
                     var bytes: u64 = 0;
@@ -393,15 +402,16 @@ pub const LuaDataLoader = struct {
                 }
             }
 
-            std.atomic.spinLoopHint();
-            std.Thread.yield() catch {};
+            if (wait_time_ns < 10_000) {
+                std.atomic.spinLoopHint();
+            }
+            std.Thread.sleep(wait_time_ns);
         }
     }
 
     pub fn reclaimRow(self: *Self, c_row: *LoadedRow) void {
         const row: *Row = @fieldParentPtr("ext_row", c_row);
-        const node: *Row.List.Node = @fieldParentPtr("data", row);
-        self.free_list.append(node);
+        self.free_list.append(&row.node);
         self.num_floating_rows -= 1;
     }
 
@@ -493,16 +503,19 @@ pub const LuaDataLoader = struct {
         self.loader.deinit();
         self.lua.deinit();
 
-        while (self.queue.popFirst()) |r| {
-            r.data.deinit();
+        while (self.queue.popFirst()) |r_node| {
+            var r: *Row = @fieldParentPtr("node", r_node);
+            r.deinit();
             self.alloc.destroy(r);
         }
-        while (self.free_list.popFirst()) |r| {
-            r.data.deinit();
+        self.queue_len = 0;
+        while (self.free_list.popFirst()) |r_node| {
+            var r: *Row = @fieldParentPtr("node", r_node);
+            r.deinit();
             self.alloc.destroy(r);
         }
         if (self.in_progress_row) |r| {
-            r.data.deinit();
+            r.deinit();
             self.alloc.destroy(r);
         }
     }

@@ -156,7 +156,6 @@ fn scanDir(lua: *Lua) i32 {
 
 const MsgpackUnpacker = struct {
     const Self = @This();
-    const BufferedReader = std.io.BufferedReader(65536, std.fs.File.Reader);
 
     pub const UnpackerImpl = struct {
         lua: *Lua,
@@ -166,22 +165,23 @@ const MsgpackUnpacker = struct {
         arrayIdx: std.ArrayList(i32),
 
         pub fn init(lua: *Lua) UnpackerImpl {
-            const alloc = lua.allocator();
             return .{
                 .lua = lua,
-                .tables = std.ArrayList(i32).init(alloc),
-                .arrayIdx = std.ArrayList(i32).init(alloc),
+                .tables = std.ArrayList(i32).empty,
+                .arrayIdx = std.ArrayList(i32).empty,
             };
         }
 
         pub fn deinit(self: *UnpackerImpl) void {
-            self.tables.deinit();
-            self.arrayIdx.deinit();
+            const alloc = self.lua.allocator();
+            self.tables.deinit(alloc);
+            self.arrayIdx.deinit(alloc);
         }
 
         pub fn reset(self: *UnpackerImpl) void {
-            self.tables.clearRetainingCapacity();
-            self.arrayIdx.clearRetainingCapacity();
+            const alloc = self.lua.allocator();
+            self.tables.clearRetainingCapacity(alloc);
+            self.arrayIdx.clearRetainingCapacity(alloc);
         }
 
         pub fn unpackNil(self: *UnpackerImpl) !void {
@@ -228,7 +228,7 @@ const MsgpackUnpacker = struct {
             // Preallocate the table (num_rec is a hint to VM)
             self.lua.createTable(0, @intCast(l)); // [+p]
             const top = self.lua.getTop();
-            try self.tables.append(top);
+            try self.tables.append(self.lua.allocator(), top);
         }
 
         pub fn mapField(self: *UnpackerImpl, key: []const u8) !void {
@@ -244,8 +244,9 @@ const MsgpackUnpacker = struct {
         pub fn arrayBegin(self: *UnpackerImpl, s: usize) !void {
             self.lua.createTable(@intCast(s), 0);
             const top = self.lua.getTop();
-            try self.tables.append(top);
-            try self.arrayIdx.append(1); // lua array index starts at 1
+            const alloc = self.lua.allocator();
+            try self.tables.append(alloc, top);
+            try self.arrayIdx.append(alloc, 1); // lua array index starts at 1
         }
 
         pub fn arrayEnd(self: *UnpackerImpl) !void {
@@ -289,10 +290,12 @@ const MsgpackUnpacker = struct {
         .mapEnd = UnpackerImpl.mapEnd,
         .arrayBegin = UnpackerImpl.arrayBegin,
         .arrayEnd = UnpackerImpl.arrayEnd,
-    }, BufferedReader);
+    });
 
     msgpack_file: std.fs.File,
     unpacker: Unpacker,
+    read_buf: [65536]u8 = undefined,
+    reader: std.fs.File.Reader,
 
     const f_iter = "iter";
     const meta_table = "MsgpackUnpackerMT";
@@ -325,7 +328,8 @@ const MsgpackUnpacker = struct {
             logger.warn("Failed to open file {s}: {}", .{ path, err });
             return zlua.Error.LuaFile;
         };
-        ctx.unpacker = Unpacker.init(.{ .unbuffered_reader = ctx.msgpack_file.reader() }, UnpackerImpl.init(lua), lua.allocator());
+        ctx.reader = std.fs.File.readerStreaming(ctx.msgpack_file, &ctx.read_buf);
+        ctx.unpacker = .{ .reader = &ctx.reader.interface, .ctx = UnpackerImpl.init(lua), .alloc = lua.allocator() };
 
         _ = lua.getMetatableRegistry(MsgpackUnpacker.meta_table); // [+p]
         lua.setMetatable(-2); // pop 1

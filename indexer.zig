@@ -16,48 +16,59 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
+    var stderr_buffer: [1024]u8 = undefined;
+    var stderr_writer = std.fs.File.stderr().writer(&stderr_buffer);
+    const stderr = &stderr_writer.interface;
+    defer stderr.flush() catch @panic("Error flushing stderr");
+
     const params = comptime clap.parseParamsComptime(
-        \\-h, --help             Display this help and exit.
-        \\-f, --file <str>...    Tar file(s) to index.
-        \\--fmt <str>            Output format (msgpack / jsonl).
+        \\-h, --help           Display this help and exit.
+        \\--fmt <STR>          Output format (msgpack / jsonl).
+        \\-f, --file <FILE>... Tar file(s) to index.
         \\
     );
 
+    const parsers = comptime .{
+        .STR = clap.parsers.string,
+        .FILE = clap.parsers.string,
+    };
+
     var diag = clap.Diagnostic{};
-    var res = clap.parse(clap.Help, &params, clap.parsers.default, .{
+    var res = clap.parse(clap.Help, &params, parsers, .{
         .diagnostic = &diag,
         .allocator = allocator,
     }) catch |err| {
         // Report useful error and exit.
-        diag.report(std.io.getStdErr().writer(), err) catch {};
+        diag.report(stderr, err) catch {};
         return err;
     };
     defer res.deinit();
 
     if (res.args.help != 0)
-        return clap.help(std.io.getStdErr().writer(), clap.Help, &params, .{});
+        return clap.help(stderr, clap.Help, &params, .{});
 
-    var tarfiles = try allocator.alloc(Indexer, res.args.file.len);
+    const num_tarfiles = res.args.file.len;
+    var indexers = try allocator.alloc(Indexer, num_tarfiles);
     defer {
-        for (tarfiles) |*t| {
+        for (indexers) |*t| {
             if (t.fs_file != null) {
                 t.state.deinit();
                 t.deinit();
             }
         }
-        allocator.free(tarfiles);
+        allocator.free(indexers);
     }
 
     const fmt = if (res.args.fmt) |fmt_str| (std.meta.stringToEnum(WdsIndexingState.SerializationFormat, fmt_str) orelse {
         logger.err("Unrecognized format: {s}", .{fmt_str});
-        return clap.help(std.io.getStdErr().writer(), clap.Help, &params, .{});
+        return clap.help(stderr, clap.Help, &params, .{});
     }) else .msgpack;
 
     var loop = try xev.Loop.init(.{});
     defer loop.deinit();
 
     for (res.args.file, 0..) |fp, i| {
-        const tarfile = &tarfiles[i];
+        const indexer = &indexers[i];
         const out_fp = try std.mem.join(allocator, ".", &[_][]const u8{ fp, index_ext });
         defer allocator.free(out_fp);
         const out_file = std.fs.cwd().createFile(out_fp, .{ .truncate = true }) catch |err| {
@@ -65,8 +76,8 @@ pub fn main() !void {
             return err;
         };
         const state = try WdsIndexingState.init(allocator, &loop, out_file, fmt);
-        tarfile.* = try Indexer.initFp(state, fp);
-        tarfile.enqueueRead(&loop);
+        indexer.* = try Indexer.initFp(state, fp);
+        indexer.enqueueRead(&loop);
     }
 
     try loop.run(.until_done);
@@ -101,8 +112,8 @@ const WdsIndexingState = struct {
 
     pub const SerializationFormat = enum { msgpack, jsonl };
 
-    const MsgpackSer = M.Packer(OStream.Writer);
-    const JsonSer = std.json.WriteStream(OStream.Writer, .{ .checked_to_fixed_depth = 2 });
+    const MsgpackSer = M.Packer;
+    const JsonSer = std.json.Stringify;
     const Packer = union(enum) {
         msgpack: MsgpackSer,
         jsonl: JsonSer,
@@ -123,10 +134,9 @@ const WdsIndexingState = struct {
     row_arena: std.heap.ArenaAllocator,
 
     pub fn init(alloc: std.mem.Allocator, loop: *xev.Loop, output_file: std.fs.File, fmt: SerializationFormat) !Self {
-        const ostream = try OStream.init(loop, output_file);
         return .{
             .gpa = alloc,
-            .ostream = ostream,
+            .ostream = try OStream.init(loop, output_file),
             .row_buf = try std.ArrayListUnmanaged(Entry).initCapacity(alloc, 256),
             .row_arena = std.heap.ArenaAllocator.init(alloc),
             .fmt = fmt, // Don't init the serializer (they need &ostream)
@@ -140,8 +150,8 @@ const WdsIndexingState = struct {
     }
 
     fn writeRowMsgPack(self: *Self) !void {
-        const writer = self.ostream.writer();
-        var pack = MsgpackSer.init(writer);
+        const writer = &self.ostream.interface;
+        var pack = MsgpackSer{ .writer = writer };
 
         const items = self.row_buf.items;
         const num_entries = items.len;
@@ -166,8 +176,8 @@ const WdsIndexingState = struct {
     }
 
     fn writeRowJsonl(self: *Self) !void {
-        const writer = self.ostream.writer();
-        var json = std.json.writeStreamMaxDepth(writer, .{}, 2);
+        const writer = &self.ostream.interface;
+        var json = std.json.Stringify{ .writer = writer };
 
         const items = self.row_buf.items;
         try json.beginObject();
@@ -210,7 +220,7 @@ const WdsIndexingState = struct {
     }
 
     pub fn pushEntry(self: *Self, header: *tardefs.TarHeader, offset: usize, size: usize) !void {
-        if (size > std.math.maxInt(std.meta.FieldType(Entry, .size))) {
+        if (size > std.math.maxInt(std.meta.fieldInfo(Entry, .size).type)) {
             return IndexMetadataError.EntryTooLarge;
         }
 
@@ -233,7 +243,7 @@ const WdsIndexingState = struct {
 
         // Add entry to row_buf
         const offset_from_base = offset - self.current_row_base;
-        if (offset_from_base > std.math.maxInt(std.meta.FieldType(Entry, .offset_from_base))) {
+        if (offset_from_base > std.math.maxInt(std.meta.fieldInfo(Entry, .offset_from_base).type)) {
             return IndexMetadataError.RowTooLarge;
         }
         if (self.row_buf.items.len >= std.math.maxInt(i32)) {
@@ -250,7 +260,9 @@ const WdsIndexingState = struct {
         self.writeRow() catch |err| {
             logger.err("Error writing final row: {}", .{err});
         };
-        self.ostream.flush();
+        self.ostream.interface.flush() catch |err| {
+            logger.err("Error while flushing output file: {}", .{err});
+        };
     }
 
     pub fn scannedEntryCb(

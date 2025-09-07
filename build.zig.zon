@@ -16,6 +16,14 @@
             .url = "git+https://github.com/natecraddock/ziglua.git#bf9fc6e6d9c24d5ba53b20acdab657f2fe6cb762",
             .hash = "zlua-0.1.0-hGRpC444BQDrHc6QhcEeGh1eWMwFbl-c21vlGPWjKBfQ",
         },
+        .zap = .{
+            .url = "git+https://github.com/zigzap/zap#76679f308c702cd8880201e6e93914e1d836a54b",
+            .hash = "zap-0.10.6-GoeB8w-EJABTkxyoGH_Z8oMBYMxTBvn7YWk-DrJOHuDO",
+        },
+        .htmx = .{
+            .url = "git+https://github.com/bigskysoftware/htmx#d5de7d4a03bc534f373ba4bb3c06eb44ec3f6ca6",
+            .hash = "N-V-__8AAD6vzgU7z9lVpB2AYKo7QswLD6cZkPD-9ZJ3IWHf",
+        },
     },
     .paths = .{
         "build.zig",

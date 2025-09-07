@@ -38,6 +38,7 @@ jobs:
             -Dlua=${{ matrix.target.lua }} \
             --summary all
           mv ./zig-out/bin/indexer ./indexer-${{ matrix.target.triplet }}
+          mv ./zig-out/bin/ultar_httpd ./ultar_httpd-${{ matrix.target.triplet }}
           mv ./zig-out/lib/* ./
 
       - name: Test
@@ -45,20 +46,31 @@ jobs:
           zig build test --summary all
 
       # Upload binaries on release
-      - name: Upload binaries to Release
+      - name: Upload binaries to Release (macOS)
         uses: softprops/action-gh-release@v2
         if: github.ref_type == 'tag' && matrix.target.triplet == 'aarch64-macos'
         with:
           files: |
             ./libdataloader.dylib
             ./indexer-${{ matrix.target.triplet }}
+            ./ultar_httpd-${{ matrix.target.triplet }}
 
-      - name: Upload binaries to Release
+      - name: Upload binaries to Release (Linux x86_64)
         uses: softprops/action-gh-release@v2
         if: github.ref_type == 'tag' && matrix.target.triplet == 'x86_64-linux-gnu.2.28'
         with:
           files: |
             ./libdataloader.so
             ./indexer-${{ matrix.target.triplet }}
+            ./ultar_httpd-${{ matrix.target.triplet }}
+
+      - name: Upload binaries to Release (Linux aarch64)
+        uses: softprops/action-gh-release@v2
+        if: github.ref_type == 'tag' && matrix.target.triplet == 'aarch64-linux-gnu.2.28'
+        with:
+          files: |
+            ./libdataloader.so
+            ./indexer-${{ matrix.target.triplet }}
+            ./ultar_httpd-${{ matrix.target.triplet }}
 
 

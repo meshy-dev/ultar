@@ -16,3 +16,6 @@ zig-cache/
 
 *.tar
 *.utix
+
+.vscode/
+.DS_Store

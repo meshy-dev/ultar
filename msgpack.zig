@@ -912,3 +912,458 @@ test "test unpacker" {
 
     try std.testing.expect(gpa.deinit() == .ok);
 }
+
+// Streaming Scanner (tokenizer), inspired by std.json.Scanner
+// Provides a forward-only token stream over MessagePack without building a DOM.
+pub const Scanner = struct {
+    const Self = @This();
+
+    pub const TokenTag = enum {
+        end,
+        nil,
+        boolean,
+        uint,
+        int,
+        float,
+        string,
+        array_begin,
+        array_end,
+        map_begin,
+        map_key,
+        map_end,
+    };
+
+    pub const Token = union(TokenTag) {
+        end: void,
+        nil: void,
+        boolean: bool,
+        uint: u64,
+        int: i64,
+        float: f64,
+        string: []const u8,
+        array_begin: usize,
+        array_end: void,
+        map_begin: usize,
+        map_key: []const u8,
+        map_end: void,
+    };
+
+    const FrameKind = enum { array, map };
+    const Frame = struct {
+        kind: FrameKind,
+        remaining: usize, // for map: remaining key-value pairs
+        expect_key: bool, // only meaningful for map
+    };
+
+    reader: *std.io.Reader,
+    alloc: std.mem.Allocator,
+
+    // Small-string scratch buffer; returned slices are valid until next call
+    scratch: [256]u8 = undefined,
+    // If the last returned string was heap-allocated, keep it here for release()
+    last_alloc: ?[]u8 = null,
+
+    // Simple manual stack to track nested containers
+    frames: [64]Frame = undefined,
+    depth: usize = 0,
+
+    // If a container has just become complete, we synthesize a closing token
+    // on the next call without reading more bytes
+    pending_close: enum { none, array_end, map_end } = .none,
+
+    // Internal helpers
+    fn clearLastAlloc(self: *Self) void {
+        if (self.last_alloc) |buf| {
+            self.alloc.free(buf);
+            self.last_alloc = null;
+        }
+    }
+
+    fn pushArray(self: *Self, len: usize) void {
+        std.debug.assert(self.depth < self.frames.len);
+        self.frames[self.depth] = .{ .kind = .array, .remaining = len, .expect_key = false };
+        self.depth += 1;
+    }
+
+    fn pushMap(self: *Self, len: usize) void {
+        std.debug.assert(self.depth < self.frames.len);
+        self.frames[self.depth] = .{ .kind = .map, .remaining = len, .expect_key = true };
+        self.depth += 1;
+    }
+
+    fn parentNoteValueSeen(self: *Self) void {
+        if (self.depth == 0) return;
+        const top = &self.frames[self.depth - 1];
+        switch (top.kind) {
+            .array => {
+                std.debug.assert(top.remaining > 0);
+                top.remaining -= 1;
+            },
+            .map => {
+                // map value is counted, key is not
+                std.debug.assert(!top.expect_key);
+                std.debug.assert(top.remaining > 0);
+                top.remaining -= 1;
+                top.expect_key = true;
+            },
+        }
+    }
+
+    fn topClosed(self: *Self) bool {
+        if (self.depth == 0) return false;
+        const top = self.frames[self.depth - 1];
+        return switch (top.kind) {
+            .array => top.remaining == 0,
+            .map => top.remaining == 0 and top.expect_key,
+        };
+    }
+
+    fn synthesizeCloseIfAny(self: *Self) ?Token {
+        if (self.pending_close != .none) {
+            const k = self.pending_close;
+            self.pending_close = .none;
+            return switch (k) {
+                .array_end => Token{ .array_end = {} },
+                .map_end => Token{ .map_end = {} },
+                .none => unreachable,
+            };
+        }
+        while (self.topClosed()) {
+            const kind = self.frames[self.depth - 1].kind;
+            self.depth -= 1;
+            self.pending_close = switch (kind) {
+                .array => .array_end,
+                .map => .map_end,
+            };
+            const k = self.pending_close;
+            self.pending_close = .none;
+            return switch (k) {
+                .array_end => Token{ .array_end = {} },
+                .map_end => Token{ .map_end = {} },
+                .none => unreachable,
+            };
+        }
+        return null;
+    }
+
+    fn readByte(self: *Self) !?u8 {
+        var b: u8 = 0;
+        const n = try self.reader.readSliceShort(std.mem.asBytes(&b));
+        if (n == 0) return null;
+        return b;
+    }
+
+    fn readN(self: *Self, comptime N: usize) ![N]u8 {
+        var buf: [N]u8 = undefined;
+        // readSliceAll ensures we either fill or error
+        try self.reader.readSliceAll(&buf);
+        return buf;
+    }
+
+    fn parseStrBorrowOrAlloc(self: *Self, header: u8) ![]const u8 {
+        self.clearLastAlloc();
+        var str_len: usize = 0;
+        if (header >= 0xa0 and header <= 0xbf) {
+            str_len = @intCast(header & 0x1f);
+        } else if (header == 0xd9) {
+            const b = (try self.readN(1))[0];
+            str_len = b;
+        } else if (header == 0xda) {
+            const b = try self.readN(2);
+            str_len = (@as(u64, @intCast(b[0])) << 8) | @as(u64, @intCast(b[1]));
+        } else if (header == 0xdb) {
+            const b = try self.readN(4);
+            str_len = (@as(u64, @intCast(b[0])) << 24) | (@as(u64, @intCast(b[1])) << 16) | (@as(u64, @intCast(b[2])) << 8) | @as(u64, @intCast(b[3]));
+        } else {
+            return MsgpackError.InvalidHeader;
+        }
+        if (str_len <= self.scratch.len) {
+            try self.reader.readSliceAll(self.scratch[0..str_len]);
+            return self.scratch[0..str_len];
+        } else {
+            const buf = try self.alloc.alloc(u8, str_len);
+            self.last_alloc = buf;
+            try self.reader.readSliceAll(buf);
+            return buf;
+        }
+    }
+
+    pub fn release(self: *Self) void {
+        self.clearLastAlloc();
+    }
+
+    pub fn init(reader: *std.io.Reader, alloc: std.mem.Allocator) Self {
+        return .{ .reader = reader, .alloc = alloc };
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.clearLastAlloc();
+    }
+
+    pub fn next(self: *Self) anyerror!Token {
+        if (self.synthesizeCloseIfAny()) |tok| return tok;
+
+        // If we're inside a map and expect a key, enforce key is a string.
+        if (self.depth > 0) {
+            const top = self.frames[self.depth - 1];
+            if (top.kind == .map and top.expect_key) {
+                const mb = try self.readByte();
+                if (mb == null) {
+                    // EOF: only valid if all frames are already closed, which we handled above
+                    return Token{ .end = {} };
+                }
+                const header = mb.?;
+                // Parse string key
+                const key = self.parseStrBorrowOrAlloc(header) catch |err| {
+                    if (err == MsgpackError.InvalidHeader) {
+                        return MsgpackError.MapKeyIsNotStr;
+                    }
+                    return err;
+                };
+                // Update frame state: now expecting value
+                self.frames[self.depth - 1].expect_key = false;
+                return Token{ .map_key = key };
+            }
+        }
+
+        const mb = try self.readByte();
+        if (mb == null) {
+            return Token{ .end = {} };
+        }
+        const header = mb.?;
+
+        // Primitive and container tokens
+        switch (header) {
+            // positive fixint
+            0x00...0x7f => {
+                self.parentNoteValueSeen();
+                return Token{ .uint = @intCast(header) };
+            },
+            // fixmap
+            0x80...0x8f => {
+                const len: usize = @intCast(header & 0x0f);
+                self.parentNoteValueSeen();
+                self.pushMap(len);
+                return Token{ .map_begin = len };
+            },
+            // fixarray
+            0x90...0x9f => {
+                const len: usize = @intCast(header & 0x0f);
+                self.parentNoteValueSeen();
+                self.pushArray(len);
+                return Token{ .array_begin = len };
+            },
+            // array 16
+            0xdc => {
+                const b = try self.readN(2);
+                const len: usize = @intCast((@as(u64, @intCast(b[0])) << 8) | @as(u64, @intCast(b[1])));
+                self.parentNoteValueSeen();
+                self.pushArray(len);
+                return Token{ .array_begin = len };
+            },
+            // array 32
+            0xdd => {
+                const b = try self.readN(4);
+                const len: usize = @intCast((@as(u64, @intCast(b[0])) << 24) | (@as(u64, @intCast(b[1])) << 16) | (@as(u64, @intCast(b[2])) << 8) | @as(u64, @intCast(b[3])));
+                self.parentNoteValueSeen();
+                self.pushArray(len);
+                return Token{ .array_begin = len };
+            },
+            // fixstr, str8 handled below in string group
+            0xa0...0xbf, 0xd9 => {
+                self.parentNoteValueSeen();
+                const s = try self.parseStrBorrowOrAlloc(header);
+                return Token{ .string = s };
+            },
+            // nil
+            0xc0 => {
+                self.parentNoteValueSeen();
+                return Token{ .nil = {} };
+            },
+            // 0xc1 never used
+            0xc1 => return MsgpackError.InvalidHeader,
+            // false / true
+            0xc2 => {
+                self.parentNoteValueSeen();
+                return Token{ .boolean = false };
+            },
+            0xc3 => {
+                self.parentNoteValueSeen();
+                return Token{ .boolean = true };
+            },
+            // bin 8/16/32 - not implemented
+            0xc4, 0xc5, 0xc6 => return errNoImpl(),
+            // ext 8/16/32 - not implemented
+            0xc7, 0xc8, 0xc9 => return errNoImpl(),
+            // float 32
+            0xca => {
+                const b = try self.readN(4);
+                self.parentNoteValueSeen();
+                const u = (@as(u32, @intCast(b[0])) << 24) | (@as(u32, @intCast(b[1])) << 16) | (@as(u32, @intCast(b[2])) << 8) | @as(u32, @intCast(b[3]));
+                return Token{ .float = @floatCast(@as(f32, @bitCast(u))) };
+            },
+            // float 64
+            0xcb => {
+                const b = try self.readN(8);
+                self.parentNoteValueSeen();
+                var u: u64 = 0;
+                inline for (0..8) |i| u |= (@as(u64, @intCast(b[i])) << (56 - i * 8));
+                return Token{ .float = @floatCast(@as(f64, @bitCast(u))) };
+            },
+            // uint 8,16,32,64
+            inline 0xcc...0xcf => |h| {
+                const nb = 1 << (h - 0xcc);
+                var buf: [8]u8 = undefined;
+                _ = try self.reader.readSliceShort(buf[0..nb]);
+                var u: u64 = 0;
+                inline for (0..nb) |i| u |= (@as(u64, @intCast(buf[i])) << ((nb - 1 - i) * 8));
+                self.parentNoteValueSeen();
+                return Token{ .uint = u };
+            },
+            // int 8,16,32,64
+            inline 0xd0...0xd3 => |h| {
+                const nb = 1 << (h - 0xd0);
+                var buf: [8]u8 = undefined;
+                _ = try self.reader.readSliceShort(buf[0..nb]);
+                const UType = @Type(std.builtin.Type{ .int = .{ .bits = nb * 8, .signedness = .unsigned } });
+                var u: UType = 0;
+                inline for (0..nb) |i| u |= (@as(UType, @intCast(buf[i])) << ((nb - 1 - i) * 8));
+                self.parentNoteValueSeen();
+                return Token{ .int = @bitCast(@as(u64, @intCast(u))) };
+            },
+            // fixext family
+            0xd4...0xd8 => return errNoImpl(),
+            // str16, str32
+            0xda, 0xdb => {
+                self.parentNoteValueSeen();
+                const s = try self.parseStrBorrowOrAlloc(header);
+                return Token{ .string = s };
+            },
+            // map 16
+            0xde => {
+                const b = try self.readN(2);
+                const len: usize = @intCast((@as(u64, @intCast(b[0])) << 8) | @as(u64, @intCast(b[1])));
+                self.parentNoteValueSeen();
+                self.pushMap(len);
+                return Token{ .map_begin = len };
+            },
+            // map 32
+            0xdf => {
+                const b = try self.readN(4);
+                const len: usize = @intCast((@as(u64, @intCast(b[0])) << 24) | (@as(u64, @intCast(b[1])) << 16) | (@as(u64, @intCast(b[2])) << 8) | @as(u64, @intCast(b[3])));
+                self.parentNoteValueSeen();
+                self.pushMap(len);
+                return Token{ .map_begin = len };
+            },
+            // negative fixint
+            0xe0...0xff => {
+                const v: i8 = @bitCast(header);
+                self.parentNoteValueSeen();
+                return Token{ .int = v };
+            },
+        }
+    }
+};
+
+test "msgpack scanner - map with array" {
+    const ref = "\x84\xa3abc\xc2\xa3def7\xb4%%%%%%%%%%%%%%%%%%%%\xce\xba\xad\xf0\r\xb1this is an \xe5\x90\x91\xe9\x87\x8f\x93\xcb\xbf\xec\xcc\xcc\xcc\xcc\xcc\xcd\xcb?\xe0Q\xeb\x85\x1e\xb8R\xcb?\xd5UUUUUU";
+    var reader = std.io.Reader.fixed(ref);
+    var gpa = std.heap.DebugAllocator(.{}).init;
+    defer std.debug.assert(gpa.deinit() == .ok);
+    var sc = Scanner.init(&reader, gpa.allocator());
+    defer sc.deinit();
+
+    // { "abc": false, "def": 55, "%%%%...": 0xbaadf00d, "this is an 向量": [-0.9, 0.51, 1/3] }
+    var tok = try sc.next();
+    try std.testing.expectEqual(Scanner.TokenTag.map_begin, std.meta.activeTag(tok));
+    try std.testing.expectEqual(@as(usize, 4), tok.map_begin);
+
+    tok = try sc.next();
+    try std.testing.expectEqual(Scanner.TokenTag.map_key, std.meta.activeTag(tok));
+    try std.testing.expectEqualStrings("abc", tok.map_key);
+
+    tok = try sc.next();
+    try std.testing.expectEqual(Scanner.TokenTag.boolean, std.meta.activeTag(tok));
+    try std.testing.expect(!tok.boolean);
+
+    tok = try sc.next();
+    try std.testing.expectEqual(Scanner.TokenTag.map_key, std.meta.activeTag(tok));
+    try std.testing.expectEqualStrings("def", tok.map_key);
+
+    tok = try sc.next();
+    try std.testing.expectEqual(Scanner.TokenTag.uint, std.meta.activeTag(tok));
+    try std.testing.expectEqual(@as(u64, 55), tok.uint);
+
+    tok = try sc.next();
+    try std.testing.expectEqual(Scanner.TokenTag.map_key, std.meta.activeTag(tok));
+    try std.testing.expectEqualStrings("%%%%%%%%%%%%%%%%%%%%", tok.map_key);
+
+    tok = try sc.next();
+    try std.testing.expectEqual(Scanner.TokenTag.uint, std.meta.activeTag(tok));
+    try std.testing.expectEqual(@as(u64, 0xbaadf00d), tok.uint);
+
+    tok = try sc.next();
+    try std.testing.expectEqual(Scanner.TokenTag.map_key, std.meta.activeTag(tok));
+    try std.testing.expectEqualStrings("this is an 向量", tok.map_key);
+
+    tok = try sc.next();
+    try std.testing.expectEqual(Scanner.TokenTag.array_begin, std.meta.activeTag(tok));
+    try std.testing.expectEqual(@as(usize, 3), tok.array_begin);
+    tok = try sc.next();
+    try std.testing.expectEqual(Scanner.TokenTag.float, std.meta.activeTag(tok));
+    tok = try sc.next();
+    try std.testing.expectEqual(Scanner.TokenTag.float, std.meta.activeTag(tok));
+    tok = try sc.next();
+    try std.testing.expectEqual(Scanner.TokenTag.float, std.meta.activeTag(tok));
+    tok = try sc.next();
+    try std.testing.expectEqual(Scanner.TokenTag.array_end, std.meta.activeTag(tok));
+    tok = try sc.next();
+    try std.testing.expectEqual(Scanner.TokenTag.map_end, std.meta.activeTag(tok));
+}
+
+test "msgpack scanner - array 100" {
+    var buf: [1024]u8 = undefined;
+    var writer = std.io.Writer.fixed(&buf);
+    var pack = Packer{ .writer = &writer };
+    try pack.beginArray(100);
+    for (0..100) |i| try pack.addInt(usize, i);
+    try writer.flush();
+
+    var reader = std.io.Reader.fixed(buf[0..writer.end]);
+    var gpa = std.heap.DebugAllocator(.{}).init;
+    defer std.debug.assert(gpa.deinit() == .ok);
+    var sc = Scanner.init(&reader, gpa.allocator());
+    defer sc.deinit();
+
+    var tok = try sc.next();
+    try std.testing.expectEqual(Scanner.TokenTag.array_begin, @as(Scanner.TokenTag, tok));
+    try std.testing.expectEqual(@as(usize, 100), tok.array_begin);
+    var count: usize = 0;
+    while (count < 100) : (count += 1) {
+        tok = try sc.next();
+        try std.testing.expectEqual(Scanner.TokenTag.uint, @as(Scanner.TokenTag, tok));
+        try std.testing.expectEqual(@as(u64, count), tok.uint);
+    }
+    tok = try sc.next();
+    try std.testing.expectEqual(Scanner.TokenTag.array_end, @as(Scanner.TokenTag, tok));
+}
+
+test "msgpack scanner - long string alloc" {
+    var buf: [4096]u8 = undefined;
+    var writer = std.io.Writer.fixed(&buf);
+    var pack = Packer{ .writer = &writer };
+    var long: [300]u8 = undefined;
+    @memset(&long, 'A');
+    try pack.addStr(&long);
+    try writer.flush();
+
+    var reader = std.io.Reader.fixed(buf[0..writer.end]);
+    var gpa = std.heap.DebugAllocator(.{}).init;
+    defer std.debug.assert(gpa.deinit() == .ok);
+    var sc = Scanner.init(&reader, gpa.allocator());
+    defer sc.deinit();
+
+    const tok = try sc.next();
+    try std.testing.expectEqual(Scanner.TokenTag.string, @as(Scanner.TokenTag, tok));
+    try std.testing.expectEqual(@as(usize, 300), tok.string.len);
+}

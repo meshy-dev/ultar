@@ -1,0 +1,17 @@
+{
+  # Enable HTTP/3
+  servers :443 {
+    protocols h1 h2 h3
+  }
+}
+
+:80 {
+  encode zstd gzip
+  redir https://{host}{uri}
+}
+
+:443 {
+  encode zstd gzip
+  tls internal
+  reverse_proxy 127.0.0.1:3000
+}

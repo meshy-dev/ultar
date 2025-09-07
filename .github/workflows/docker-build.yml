@@ -32,7 +32,7 @@ jobs:
       - name: Prepare metadata
         id: meta
         run: |
-          IMAGE="ghcr.io/${GITHUB_REPOSITORY#*/}/${GITHUB_REPOSITORY##*/}"
+          IMAGE="ghcr.io/meshy-dev/${GITHUB_REPOSITORY##*/}"
           TAG="${{ github.event.release.tag_name }}"
           echo "image=$IMAGE" >> $GITHUB_OUTPUT
           echo "tag=$TAG" >> $GITHUB_OUTPUT

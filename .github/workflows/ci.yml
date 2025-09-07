@@ -20,8 +20,6 @@ jobs:
           - { triplet: x86_64-linux-gnu.2.28, runner: ubuntu-22.04, lua: luajit }
           - { triplet: aarch64-linux-gnu.2.28, runner: ubuntu-24.04-arm, lua: luajit }
           - { triplet: aarch64-macos, runner: macos-latest, lua: lua54 }
-          - { triplet: x86_64-linux-musl, runner: ubuntu-22.04, lua: luajit }
-          - { triplet: aarch64-linux-musl, runner: ubuntu-24.04-arm, lua: lua54 }
 
     steps:
       - name: Checkout code

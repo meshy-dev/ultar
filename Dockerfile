@@ -1,7 +1,9 @@
-# syntax=docker/dockerfile:1.4
-# Multi-stage build for Ultar HTTP server behind Caddy with HTTP/3 and compression
+FROM ubuntu:24.04
 
-FROM caddy:alpine
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends wget ca-certificates curl gnupg libcap2-bin caddy && \
+    rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
@@ -14,17 +16,14 @@ ARG GH_REPO="meshy-dev/ultar"
 ARG VERSION="latest"
 ARG TRIPLET="auto"
 
-# Install wget/ca-certs to fetch release binary
-RUN apk add --no-cache wget ca-certificates && update-ca-certificates
-
 # Download ultar_httpd from GitHub Releases; allow 'latest' which resolves via redirect
 RUN set -eux; \
     arch="$(uname -m)"; \
     triplet="${TRIPLET}"; \
     if [ "$triplet" = "auto" ]; then \
       case "$arch" in \
-        x86_64) triplet="x86_64-linux-musl" ;; \
-        aarch64) triplet="aarch64-linux-musl" ;; \
+        x86_64) triplet="x86_64-linux-gnu.2.28" ;; \
+        aarch64) triplet="aarch64-linux-gnu.2.28" ;; \
         *) echo "Unsupported architecture: $arch" >&2; exit 1 ;; \
       esac; \
     fi; \
@@ -32,6 +31,9 @@ RUN set -eux; \
     if [ "${VERSION}" = "latest" ]; then url="$base_url/latest/download/ultar_httpd-${triplet}"; else url="$base_url/download/${VERSION}/ultar_httpd-${triplet}"; fi; \
     wget -O /usr/local/bin/ultar_httpd "$url"; \
     chmod +x /usr/local/bin/ultar_httpd
+
+# Allow Caddy (running as non-root) to bind to :80/:443
+RUN /sbin/setcap cap_net_bind_service=+ep /usr/bin/caddy || true
 
 # Copy Caddy configuration
 COPY Caddyfile /etc/caddy/Caddyfile
@@ -47,6 +49,6 @@ EXPOSE 80/tcp 443/tcp 443/udp
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 CMD wget -qO- http://127.0.0.1:80/ || exit 1
 
 # Run ultar_httpd on 3000 and proxy via Caddy
-CMD ["sh", "-c", "ultar_httpd --addr 0.0.0.0 --port 3000 & exec caddy run --config /etc/caddy/Caddyfile --adapter caddyfile"]
+CMD ["sh", "-c", "ultar_httpd -d $DATA_PATH --addr 0.0.0.0 --port 3000 & exec caddy run --config /etc/caddy/Caddyfile --adapter caddyfile"]
 
 

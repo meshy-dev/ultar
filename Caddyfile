@@ -7,10 +7,10 @@
 
 :80 {
   encode zstd gzip
-  redir https://{host}{uri}
+  redir https://{$SITE_HOSTNAME:localhost}
 }
 
-:443 {
+{$SITE_HOSTNAME:localhost}:443 {
   encode zstd gzip
   tls internal
   reverse_proxy 127.0.0.1:3000

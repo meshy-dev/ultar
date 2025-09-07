@@ -10,7 +10,7 @@ ENV XDG_DATA_HOME=/app/.local/share
 ENV XDG_CONFIG_HOME=/app/.config
 
 # Build args to locate the release asset
-ARG GH_REPO="owner/repo"
+ARG GH_REPO="meshy-dev/ultar"
 ARG VERSION="latest"
 ARG TRIPLET="auto"
 
@@ -23,8 +23,8 @@ RUN set -eux; \
     triplet="${TRIPLET}"; \
     if [ "$triplet" = "auto" ]; then \
       case "$arch" in \
-        x86_64) triplet="x86_64-linux-gnu.2.28" ;; \
-        aarch64) triplet="aarch64-linux-gnu.2.28" ;; \
+        x86_64) triplet="x86_64-linux-musl" ;; \
+        aarch64) triplet="aarch64-linux-musl" ;; \
         *) echo "Unsupported architecture: $arch" >&2; exit 1 ;; \
       esac; \
     fi; \
@@ -35,13 +35,6 @@ RUN set -eux; \
 
 # Copy Caddy configuration
 COPY Caddyfile /etc/caddy/Caddyfile
-
-# Create non-root user and setup writable dirs
-RUN adduser -D -H -s /sbin/nologin ultar && \
-    mkdir -p /app/.local/share/caddy /app/.config/caddy && \
-    chown -R ultar:ultar /app
-
-USER ultar
 
 # Data directory can be mounted here
 ENV DATA_PATH=/data

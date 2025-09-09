@@ -1,134 +1,16 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const zap = @import("zap");
 const clap = @import("clap");
 const msgpack = @import("msgpack");
 const htmx_embed = @import("htmx_embed");
-const preview_image = @import("preview/image.zig");
-const preview_json = @import("preview/json.zig");
+// preview templates handled via mustache
+const os = std.os;
 
-const Html = struct {
-    pub const before_body =
-        \\<!doctype html>
-        \\<html lang="en">
-        \\<head>
-        \\  <meta charset="utf-8"/>
-        \\  <meta name="viewport" content="width=device-width, initial-scale=1"/>
-        \\  <title>WebDataset Index Browser</title>
-        \\  <meta name="color-scheme" content="dark"/>
-        \\  <link rel="preconnect" href="https://fonts.googleapis.com">
-        \\  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-        \\  <link href="https://fonts.googleapis.com/css2?family=SUSE&display=swap" rel="stylesheet">
-        \\  <style>
-        \\    :root {
-        \\      color-scheme: dark;
-        \\      /* Catppuccin Mocha */
-        \\      --ctp-rosewater: #f5e0dc;
-        \\      --ctp-flamingo: #f2cdcd;
-        \\      --ctp-pink: #f5c2e7;
-        \\      --ctp-mauve: #cba6f7;
-        \\      --ctp-red: #f38ba8;
-        \\      --ctp-maroon: #eba0ac;
-        \\      --ctp-peach: #fab387;
-        \\      --ctp-yellow: #f9e2af;
-        \\      --ctp-green: #a6e3a1;
-        \\      --ctp-teal: #94e2d5;
-        \\      --ctp-sky: #89dceb;
-        \\      --ctp-sapphire: #74c7ec;
-        \\      --ctp-blue: #89b4fa;
-        \\      --ctp-lavender: #b4befe;
-        \\      --ctp-text: #cdd6f4;
-        \\      --ctp-subtext1: #bac2de;
-        \\      --ctp-subtext0: #a6adc8;
-        \\      --ctp-overlay2: #9399b2;
-        \\      --ctp-overlay1: #7f849c;
-        \\      --ctp-overlay0: #6c7086;
-        \\      --ctp-surface2: #585b70;
-        \\      --ctp-surface1: #45475a;
-        \\      --ctp-surface0: #313244;
-        \\      --ctp-base: #1e1e2e;
-        \\      --ctp-mantle: #181825;
-        \\      --ctp-crust: #11111b;
-        \\      /* Site tokens mapped to Mocha (+extra dark) */
-        \\      --bg: var(--ctp-crust);
-        \\      --panel: var(--ctp-mantle);
-        \\      --text: var(--ctp-text);
-        \\      --muted: var(--ctp-subtext0);
-        \\      --border: var(--ctp-overlay0);
-        \\      --accent: var(--ctp-blue);
-        \\      --accent-2: var(--ctp-sapphire);
-        \\    }
-        \\    html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text); font-family: system-ui, -apple-system, "Segoe UI", Roboto, Ubuntu, Cantarell, "Noto Sans", sans-serif; }
-        \\    a { color: var(--accent); text-decoration: none; }
-        \\    a:hover { color: var(--ctp-sky); text-decoration: underline; }
-        \\    .suse { font-family: "SUSE", sans-serif; }
-        \\    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; letter-spacing: .02em; }
-        \\    .title { margin: 0 0 8px; font-weight: 700; }
-        \\    .app { display: flex; gap: 16px; padding: 16px; box-sizing: border-box; height: 100vh; }
-        \\    .pane { background: var(--panel); border: 1px solid var(--border); border-radius: 4px; display: flex; flex-direction: column; padding: 0; overflow: hidden; }
-        \\    .status-bar { background: var(--ctp-mantle); }
-        \\    #file-tree.pane { flex: 0 0 20rem; max-width: 20rem; }
-        \\    #table-container.pane { flex: 1 1 auto; }
-        \\    #file-tree-list.htmx-request, #table-container.htmx-request { opacity: 0.6; transition: opacity 200ms linear; }
-        \\    .nav-list { list-style: none; margin: 0; padding: 0; }
-        \\    .nav-item { border-bottom: 1px solid var(--border); }
-        \\    .nav-item a { display: block; padding: 6px 8px; color: var(--text); }
-        \\    .nav-item a:hover { background: var(--ctp-surface0); color: var(--accent); }
-        \\    .pane-body { flex: 1 1 auto; min-height: 0; overflow-y: auto; overflow-x: auto; padding: 12px 0 12px 12px; scrollbar-gutter: stable; }
-        \\    #table-container .pane-body { background: var(--ctp-surface0); }
-        \\    .status-bar { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 8px 12px; border-top: 1px solid var(--border); color: var(--muted); }
-        \\    .table-wrap { overflow: visible; min-width: 100%; }
-        \\    /* Visible scrollbars (Firefox + WebKit) */
-        \\    .pane-body { scrollbar-width: auto; scrollbar-color: var(--ctp-overlay1) var(--ctp-surface1); }
-        \\    .pane-body::-webkit-scrollbar { width: 12px; height: 10px; }
-        \\    .pane-body::-webkit-scrollbar-track { background: var(--ctp-surface1); }
-        \\    .pane-body::-webkit-scrollbar-thumb { background: var(--ctp-overlay1); border: 2px solid var(--ctp-surface1); border-radius: 4px; }
-        \\    .pane-body::-webkit-scrollbar-thumb:hover { background: var(--ctp-overlay2); }
-        \\    .table { width: max-content; min-width: 100%; border-collapse: collapse; font-size: 14px; table-layout: auto; background: var(--panel); color: var(--text); border-radius: 4px; }
-        \\    .table thead th { position: sticky; top: 0; background: var(--ctp-surface0); text-align: left; padding: 8px; border-bottom: 1px solid var(--border); color: var(--ctp-subtext1); }
-        \\    .table tbody td { padding: 6px 8px; border-bottom: 1px solid var(--border); vertical-align: top; }
-        \\    .table tr:hover td { background: var(--ctp-surface0); }
-        \\    a.mono { color: var(--accent-2); }
-        \\    /* Sticky right columns for str_idx and iidx */
-        \\    :root { --right-col-width: 7ch; --right-col-2-width: 16ch; }
-        \\    .table { position: relative; }
-        \\    .sticky-right-2 { position: sticky; right: var(--right-col-width); background: var(--ctp-surface0); z-index: 8; min-width: var(--right-col-2-width); max-width: var(--right-col-2-width); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-        \\    .sticky-right { position: sticky; right: 0; background: var(--ctp-surface0); z-index: 9; min-width: var(--right-col-width); max-width: var(--right-col-width); text-align: right; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-        \\    tbody td.sticky-right, tbody td.sticky-right-2 { background: var(--panel); }
-        \\    thead th.sticky-right, thead th.sticky-right-2 { box-shadow: -1px 0 0 0 var(--border) inset; z-index: 10; }
-        \\  </style>
-        \\</head>
-        \\
-        \\<body>
-        \\  <div class="app">
-        \\    <aside id="file-tree" class="pane">
-        \\      <div class="pane-body">
-        \\        <div id="file-tree-list" class="suse">
-    ;
+const TemplateCache = @import("TemplateCache.zig");
 
-    pub const after_before_htmx =
-        \\        </div>
-        \\      </div>
-        \\      <div class="status-bar"><span class="suse">Ultar Index Viewer</span></div>
-        \\    </aside>
-        \\
-        \\    <main id="table-container" class="pane">
-        \\    </main>
-        \\  </div>
-        \\  <script>
-    ;
-
-    pub const after_after_htmx =
-        \\</script>
-        \\</body>
-        \\</html>
-    ;
-
-    pub const nav_list_open = "<ul class=\"nav-list\">";
-    pub const nav_list_close = "</ul>";
-    pub const table_wrap_open = "<div class=\"table-wrap\">";
-    pub const table_open = "<table class=\"table\"><thead><tr>";
-    pub const table_head_close_body_open = "</tr></thead><tbody>";
-};
+const urlDecodeBuf = @import("encodings.zig").urlDecodeBuf;
+const urlEncodeAlloc = @import("encodings.zig").urlEncodeAlloc;
 
 // Global gpa
 var gpa_instance = std.heap.GeneralPurposeAllocator(.{}){};
@@ -138,13 +20,7 @@ const gpa = gpa_instance.allocator();
 var base_dir_buf: [std.fs.MAX_PATH_BYTES]u8 = undefined;
 var base_dir: []const u8 = undefined;
 
-fn trimTrailingSep(path: []const u8) []const u8 {
-    var end: usize = path.len;
-    while (end > 1 and path[end - 1] == std.fs.path.sep) {
-        end -= 1;
-    }
-    return path[0..end];
-}
+var template_cache: TemplateCache = undefined;
 
 // Join and normalize a path under base_dir; reject traversal outside base_dir
 fn buildSafePathAlloc(alloc: std.mem.Allocator, rel: []const u8) ![]u8 {
@@ -155,24 +31,21 @@ fn buildSafePathAlloc(alloc: std.mem.Allocator, rel: []const u8) ![]u8 {
     return resolved; // allocated with alloc; caller frees (arena in route handlers)
 }
 
-fn urlEncodeAlloc(alloc: std.mem.Allocator, input: []const u8) ![]u8 {
-    var out = try std.ArrayList(u8).initCapacity(alloc, input.len * 3);
-    errdefer out.deinit(alloc);
-    for (input) |b| {
-        const is_unreserved = (b >= 'A' and b <= 'Z') or (b >= 'a' and b <= 'z') or (b >= '0' and b <= '9') or b == '-' or b == '_' or b == '.' or b == '~';
-        if (is_unreserved) {
-            try out.append(alloc, b);
-        } else {
-            try out.append(alloc, '%');
-            const hex = "0123456789ABCDEF";
-            try out.append(alloc, hex[b >> 4]);
-            try out.append(alloc, hex[b & 0x0F]);
-        }
+fn findMimeTypeAlloc(alloc: std.mem.Allocator, file_name: []const u8) ![]const u8 {
+    // zig std considers .* to be no extension, however this is ultar keys
+    // thus we don't use std.fs.path.extension
+    var i = file_name.len;
+    while (i > 0 and file_name[i - 1] != '.') {
+        i -= 1;
     }
-    return out.toOwnedSlice(alloc);
-}
+    const e = file_name[i..];
 
-// Deprecated: rely on zap's getParamStr for decoded params.
+    const obj = zap.fio.http_mimetype_find(@constCast(e.ptr), e.len);
+
+    if (obj == 0) return try alloc.dupe(u8, "application/octet-stream");
+
+    return try zap.util.fio2strAlloc(alloc, obj);
+}
 
 // Directory entry structure
 const DirEntry = struct {
@@ -218,6 +91,14 @@ fn utixFieldFromKey(key: []const u8) UtixField {
     return .unknown;
 }
 
+fn trimTrailingSep(path: []const u8) []const u8 {
+    var end: usize = path.len;
+    while (end > 1 and path[end - 1] == std.fs.path.sep) {
+        end -= 1;
+    }
+    return path[0..end];
+}
+
 // Initialize base directory
 fn initBaseDir() !void {
     // Prefer DATA_PATH env var; fallback to current working directory
@@ -227,9 +108,8 @@ fn initBaseDir() !void {
         const abs = if (std.fs.path.isAbsolute(env_slice))
             env_slice
         else blk: {
-            var arena = std.heap.ArenaAllocator.init(gpa);
-            defer arena.deinit();
-            const abs_join = try std.fs.path.resolve(arena.allocator(), &[_][]const u8{ ".", env_slice });
+            const abs_join = try std.fs.path.resolve(gpa, &[_][]const u8{ ".", env_slice });
+            defer gpa.free(abs_join);
             break :blk abs_join;
         };
         base_dir = try gpa.dupe(u8, trimTrailingSep(abs));
@@ -403,56 +283,72 @@ fn listDirectory(alloc: std.mem.Allocator, path: []const u8) ![]DirEntry {
     return entries.toOwnedSlice(alloc);
 }
 
+pub fn dumpError(r: zap.Request, trace: ?*std.builtin.StackTrace) void {
+    var slices = r.getParamSlices();
+    while (slices.next()) |param| {
+        std.debug.print("Param: {s}={s}\n", .{ param.name, param.value });
+    }
+    if (trace) |t| {
+        std.debug.dumpStackTrace(t.*);
+    }
+}
+
 pub fn onRequest(r: zap.Request) anyerror!void {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
     // Handle different routes
     if (r.path) |path| {
         if (std.mem.eql(u8, path, "/")) {
-            handleIndex(r) catch |err| {
-                std.debug.print("Error handling index: {}\n", .{err});
-                if (@errorReturnTrace()) |trace| {
-                    std.debug.dumpStackTrace(trace.*);
-                }
+            handleIndex(alloc, r) catch {
+                dumpError(r, @errorReturnTrace());
                 r.sendBody("Internal Server Error") catch {};
             };
         } else if (std.mem.startsWith(u8, path, "/browse")) {
-            handleBrowse(r) catch |err| {
-                std.debug.print("Error handling browse: {}\n", .{err});
-                if (@errorReturnTrace()) |trace| {
-                    std.debug.dumpStackTrace(trace.*);
-                }
+            handleBrowse(alloc, r) catch {
+                dumpError(r, @errorReturnTrace());
                 r.sendBody("Internal Server Error") catch {};
             };
         } else if (std.mem.startsWith(u8, path, "/load")) {
-            handleLoad(r) catch |err| {
-                std.debug.print("Error handling load: {}\n", .{err});
-                if (@errorReturnTrace()) |trace| {
-                    std.debug.dumpStackTrace(trace.*);
-                }
+            handleLoad(alloc, r) catch {
+                dumpError(r, @errorReturnTrace());
                 r.sendBody("Internal Server Error") catch {};
             };
         } else if (std.mem.startsWith(u8, path, "/map_file")) {
-            handleMapFile(r) catch |err| {
-                std.debug.print("Error handling map_file: {}\n", .{err});
-                if (@errorReturnTrace()) |trace| {
-                    std.debug.dumpStackTrace(trace.*);
+            handleMapFile(alloc, r) catch |err| {
+                dumpError(r, @errorReturnTrace());
+                switch (err) {
+                    MapFileClientError.missing_parameters,
+                    InvalidRangeStrError.invalid_base_offset,
+                    InvalidRangeStrError.invalid_end_offset,
+                    MapFileClientError.invalid_offset_range,
+                    => {
+                        r.setStatus(.bad_request);
+                        r.sendBody("Bad Request") catch {};
+                    },
+                    else => {
+                        r.setStatus(.internal_server_error);
+                        r.sendBody("Internal Server Error") catch {};
+                    },
                 }
-                r.sendBody("Internal Server Error") catch {};
             };
         } else if (std.mem.startsWith(u8, path, "/boxed_file")) {
-            handleBoxedFile(r) catch |err| {
-                std.debug.print("Error handling boxed_file: {}\n", .{err});
-                if (@errorReturnTrace()) |trace| {
-                    std.debug.dumpStackTrace(trace.*);
+            handleBoxedFile(alloc, r) catch |err| {
+                dumpError(r, @errorReturnTrace());
+                switch (err) {
+                    BoxedFileClientError.missing_parameters,
+                    InvalidRangeStrError.invalid_base_offset,
+                    InvalidRangeStrError.invalid_end_offset,
+                    => {
+                        r.setStatus(.bad_request);
+                        r.sendBody("Bad Request") catch {};
+                    },
+                    else => {
+                        r.setStatus(.internal_server_error);
+                        r.sendBody("Internal Server Error") catch {};
+                    },
                 }
-                r.sendBody("Internal Server Error") catch {};
-            };
-        } else if (std.mem.startsWith(u8, path, "/assets/preview/json/setup")) {
-            handleJsonPreviewSetup(r) catch |err| {
-                std.debug.print("Error handling json setup: {}\n", .{err});
-                if (@errorReturnTrace()) |trace| {
-                    std.debug.dumpStackTrace(trace.*);
-                }
-                r.sendBody("") catch {};
             };
         } else {
             r.setStatus(.not_found);
@@ -464,148 +360,65 @@ pub fn onRequest(r: zap.Request) anyerror!void {
     }
 }
 
-fn handleIndex(r: zap.Request) !void {
-    var arena = std.heap.ArenaAllocator.init(gpa);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-
-    r.parseQuery();
-
+fn handleIndex(arena: std.mem.Allocator, r: zap.Request) !void {
     // Always render with an empty list and trigger browse after load
-    const initial_dir = r.getParamStr(alloc, "dir") catch null orelse "";
-    const initial_file = r.getParamStr(alloc, "file") catch null orelse "";
-    const enc_initial_dir = try urlEncodeAlloc(alloc, initial_dir);
-    defer alloc.free(enc_initial_dir);
-    var loader = try std.fmt.allocPrint(alloc, "<ul class=\"nav-list\" hx-get=\"/browse?dir={s}\" hx-trigger=\"load\" hx-target=\"#file-tree-list\" hx-swap=\"innerHTML\"></ul>", .{enc_initial_dir});
-    defer alloc.free(loader);
+    const dir_raw = r.getParamSlice("dir") orelse "";
+    const initial_dir = try urlDecodeBuf(dir_raw, try arena.alloc(u8, dir_raw.len));
+    const file_raw = r.getParamSlice("file") orelse "";
+    const initial_file = try urlDecodeBuf(file_raw, try arena.alloc(u8, file_raw.len));
+    const enc_initial_dir = try urlEncodeAlloc(arena, initial_dir);
+    var loader = try std.fmt.allocPrint(arena, "<ul class=\"nav-list\" hx-get=\"/browse?dir={s}\" hx-trigger=\"load\" hx-target=\"#file-tree-list\" hx-swap=\"innerHTML\"></ul>", .{enc_initial_dir});
     if (initial_file.len > 5 and std.mem.endsWith(u8, initial_file, ".utix")) {
-        const enc_initial_file = try urlEncodeAlloc(alloc, initial_file);
-        defer alloc.free(enc_initial_file);
-        const table_loader = try std.fmt.allocPrint(alloc, "<div style=\"display:none\" hx-get=\"/load?file={s}\" hx-trigger=\"load\" hx-target=\"#table-container\" hx-swap=\"innerHTML\"></div>", .{enc_initial_file});
-        defer alloc.free(table_loader);
-        const combined = try std.fmt.allocPrint(alloc, "{s}{s}", .{ loader, table_loader });
+        const enc_initial_file = try urlEncodeAlloc(arena, initial_file);
+        const table_loader = try std.fmt.allocPrint(arena, "<div style=\"display:none\" hx-get=\"/load?file={s}\" hx-trigger=\"load\" hx-target=\"#table-container\" hx-swap=\"innerHTML\"></div>", .{enc_initial_file});
+        const combined = try std.fmt.allocPrint(arena, "{s}{s}", .{ loader, table_loader });
         loader = combined;
     }
 
-    const full_html = try renderBody(alloc, loader);
-    try r.sendBody(full_html);
+    const tpl = try template_cache.get("ultar_httpd/templates/base.html");
+    var mustache = try zap.Mustache.fromData(tpl);
+    defer mustache.deinit();
+
+    const data = .{ .body = loader, .htmx_js = htmx_embed.htmx_js };
+    var built = mustache.build(data);
+    defer built.deinit();
+    const s = built.str() orelse return error.Unexpected;
+    try r.sendBody(s);
 }
 
-fn handleBrowse(r: zap.Request) !void {
-    var arena = std.heap.ArenaAllocator.init(gpa);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-
-    r.parseQuery();
-
+fn handleBrowse(arena: std.mem.Allocator, r: zap.Request) !void {
     // Parse directory parameter
-    const dir_param = r.getParamStr(alloc, "dir") catch null orelse "";
+    const dir_raw = r.getParamSlice("dir") orelse "";
+    const dir_param = try urlDecodeBuf(dir_raw, try arena.alloc(u8, dir_raw.len));
 
-    std.debug.print("handleBrowse dir_param: {s}\n", .{dir_param});
+    const entries = try listDirectory(arena, dir_param);
 
-    const entries = try listDirectory(alloc, dir_param);
+    const Parent = struct { show: bool, parent: []const u8 };
+    const parent_info: Parent = .{ .show = dir_param.len > 0, .parent = if (dir_param.len > 0) (std.fs.path.dirname(dir_param) orelse "") else "" };
 
-    var html = try std.ArrayList(u8).initCapacity(alloc, 0);
-    defer html.deinit(alloc);
-
-    try html.appendSlice(alloc, Html.nav_list_open);
-
-    // Add parent directory link if not at root
-    if (dir_param.len > 0) {
-        const parent = std.fs.path.dirname(dir_param) orelse "";
-        try html.writer(alloc).print("<li class=\"nav-item\"><a href=\"/?dir={s}\" hx-get=\"/browse?dir={s}\" hx-target=\"#file-tree-list\" hx-swap=\"innerHTML\" hx-push-url=\"/?dir={s}\">⬆️ ..</a></li>", .{ parent, parent, parent });
-    }
-
+    const Item = struct { is_dir: bool, name: []const u8, rel_path_enc: []const u8, dir_enc: []const u8 };
+    var items = try std.ArrayList(Item).initCapacity(arena, entries.len);
+    const enc_dir_param = try urlEncodeAlloc(arena, dir_param);
     for (entries) |entry| {
-        const icon = if (entry.typ == .dir) "📁" else "📄";
-        const endpoint = if (entry.typ == .dir) "browse" else "load";
-        const target = if (entry.typ == .dir) "#file-tree-list" else "#table-container";
-
-        try html.appendSlice(alloc, "<li class=\"nav-item\">");
-        const enc_rel = try urlEncodeAlloc(alloc, entry.rel_path);
-        defer alloc.free(enc_rel);
-        const enc_dir = try urlEncodeAlloc(alloc, dir_param);
-        defer alloc.free(enc_dir);
-        const push_url = if (entry.typ == .dir)
-            try std.fmt.allocPrint(alloc, "/?dir={s}", .{enc_rel})
-        else
-            try std.fmt.allocPrint(alloc, "/?dir={s}&file={s}", .{ enc_dir, enc_rel });
-        defer alloc.free(push_url);
-
-        try html.writer(alloc).print("<a href=\"/{s}?{s}\" hx-get=\"/{s}?{s}\" hx-target=\"{s}\" hx-indicator=\"#file-tree-list\" hx-swap=\"innerHTML\" hx-push-url=\"{s}\">{s} {s}</a></li>", .{
-            endpoint,
-            if (entry.typ == .dir)
-                (try std.fmt.allocPrint(alloc, "dir={s}", .{enc_rel}))
-            else
-                (try std.fmt.allocPrint(alloc, "file={s}", .{enc_rel})),
-            endpoint,
-            if (entry.typ == .dir)
-                (try std.fmt.allocPrint(alloc, "dir={s}", .{enc_rel}))
-            else
-                (try std.fmt.allocPrint(alloc, "file={s}", .{enc_rel})),
-            target,
-            push_url,
-            icon,
-            entry.name,
-        });
+        const enc_rel = try urlEncodeAlloc(arena, entry.rel_path);
+        try items.append(arena, .{ .is_dir = entry.typ == .dir, .name = entry.name, .rel_path_enc = enc_rel, .dir_enc = enc_dir_param });
     }
-    try html.appendSlice(alloc, Html.nav_list_close);
 
-    try r.sendBody(html.items);
+    const list_tpl = try template_cache.get("ultar_httpd/templates/file_list.html");
+    var mustache = try zap.Mustache.fromData(list_tpl);
+    defer mustache.deinit();
+
+    const data = .{ .show_parent = parent_info.show, .parent = parent_info.parent, .entries = items.items };
+    var built = mustache.build(data);
+    defer built.deinit();
+    const s = built.str() orelse return error.Unexpected;
+    try r.sendBody(s);
 }
 
-fn handleJsonPreviewSetup(r: zap.Request) !void {
-    // Inject once: lightweight runtime that fetches data-src from .json-code,
-    // pretty-prints, and highlights using highlight.js loaded from CDN.
-    const snippet =
-        \\<link id="hljs-css" rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.11.1/styles/github-dark.min.css">
-        \\<script id="hljs-js" src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.11.1/highlight.min.js"></script>
-        \\<script id="ultar-json-rt">(function(){
-        \\  async function ensure(){
-        \\    if(!window.hljs){
-        \\      await new Promise(r=>{ var s=document.getElementById('hljs-js'); if(s && !s.dataset._loaded){ s.addEventListener('load', ()=>{s.dataset._loaded='1'; r();}, {once:true}); } else { r(); } });
-        \\    }
-        \\  }
-        \\  async function init(el){
-        \\    const url = el.getAttribute('data-src');
-        \\    if(!url) return;
-        \\    const res = await fetch(url);
-        \\    const txt = await res.text();
-        \\    let out = txt;
-        \\    try { out = JSON.stringify(JSON.parse(txt), null, 2); } catch(e){}
-        \\    el.textContent = out;
-        \\    await ensure();
-        \\    if(window.hljs){ window.hljs.highlightElement(el); }
-        \\  }
-        \\  function scan(){ document.querySelectorAll('.json-code:not([data-initialized])').forEach(function(el){ el.setAttribute('data-initialized','1'); init(el); }); }
-        \\  document.body.addEventListener('htmx:afterSwap', scan);
-        \\  scan();
-        \\})();</script>
-    ;
-    r.setHeader("Content-Type", "text/html; charset=utf-8") catch {};
-    try r.sendBody(snippet);
-}
-
-// Render body content with base template
-fn renderBody(alloc: std.mem.Allocator, body_html: []const u8) ![]const u8 {
-    var result = try std.ArrayList(u8).initCapacity(alloc, 0);
-    try result.appendSlice(alloc, Html.before_body);
-    try result.appendSlice(alloc, body_html);
-    try result.appendSlice(alloc, Html.after_before_htmx);
-    try result.appendSlice(alloc, htmx_embed.htmx_js);
-    try result.appendSlice(alloc, Html.after_after_htmx);
-    return result.toOwnedSlice(alloc);
-}
-
-fn handleLoad(r: zap.Request) !void {
-    var arena = std.heap.ArenaAllocator.init(gpa);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-
-    r.parseQuery();
-
+fn handleLoad(arena: std.mem.Allocator, r: zap.Request) !void {
     // Parse query parameter: support new 'file' and legacy 'path'
-    const path_param = r.getParamStr(alloc, "file") catch (r.getParamStr(alloc, "path") catch null) orelse "";
+    const raw_file = r.getParamSlice("file") orelse (r.getParamSlice("path") orelse "");
+    const path_param = try urlDecodeBuf(raw_file, try arena.alloc(u8, raw_file.len));
 
     if (path_param.len == 0) {
         try r.sendBody("<p>No path specified</p>");
@@ -613,8 +426,7 @@ fn handleLoad(r: zap.Request) !void {
     }
 
     // Build full path to .utix file
-    const full_path = try buildSafePathAlloc(alloc, path_param);
-    defer alloc.free(full_path);
+    const full_path = try buildSafePathAlloc(arena, path_param);
 
     // Check if file exists
     std.fs.accessAbsolute(full_path, .{}) catch {
@@ -623,21 +435,16 @@ fn handleLoad(r: zap.Request) !void {
     };
 
     // Parse the .utix file
-    const entries = parseUtixFile(alloc, full_path) catch {
+    const entries = parseUtixFile(arena, full_path) catch {
         std.debug.print("Error parsing .utix file\n", .{});
         try r.sendBody("<p>Error parsing index file</p>");
         return;
     };
-    defer alloc.free(entries);
 
     if (entries.len == 0) {
         try r.sendBody("<p>No items found in the index file.</p>");
         return;
     }
-
-    // Generate HTML table within a scrolling pane body and a bottom status bar
-    var html = try std.ArrayList(u8).initCapacity(alloc, 0);
-    defer html.deinit(alloc);
 
     // Get tar file path (remove .utix extension)
     const tar_path = if (std.mem.endsWith(u8, path_param, ".utix"))
@@ -645,12 +452,8 @@ fn handleLoad(r: zap.Request) !void {
     else
         path_param;
 
-    try html.appendSlice(alloc, "<div class=\"pane-body\">");
-    try html.appendSlice(alloc, Html.table_wrap_open);
-    try html.appendSlice(alloc, Html.table_open);
-
     // Compute union of keys across entries
-    var key_set = std.StringHashMap(void).init(alloc);
+    var key_set = std.StringHashMap(void).init(arena);
     defer key_set.deinit();
     for (entries) |e| {
         for (e.keys) |k| {
@@ -659,11 +462,10 @@ fn handleLoad(r: zap.Request) !void {
     }
 
     // Build a stable ordered list of keys (sorted)
-    var all_keys_list = try std.ArrayList([]const u8).initCapacity(alloc, key_set.count());
-    defer all_keys_list.deinit(alloc);
+    var all_keys_list = try std.ArrayList([]const u8).initCapacity(arena, key_set.count());
     var it = key_set.iterator();
     while (it.next()) |kv| {
-        try all_keys_list.append(alloc, kv.key_ptr.*);
+        try all_keys_list.append(arena, kv.key_ptr.*);
     }
     std.mem.sort([]const u8, all_keys_list.items, {}, struct {
         fn lessThan(_: void, a: []const u8, b: []const u8) bool {
@@ -671,75 +473,55 @@ fn handleLoad(r: zap.Request) !void {
         }
     }.lessThan);
 
-    // Render headers for union keys
+    const Header = struct { name: []const u8 };
+    const Cell = struct { has: bool, k: []const u8, range_str: []const u8 };
+    const Row = struct { cells: []const Cell, id_value: []const u8, row_idx: i64 };
+
+    var headers = try std.ArrayList(Header).initCapacity(arena, all_keys_list.items.len);
     for (all_keys_list.items) |k| {
-        try html.writer(alloc).print("<th class=\"suse\">{s}</th>", .{k});
+        try headers.append(arena, .{ .name = k });
     }
-    // Pinned right headers: str_idx and iidx
-    try html.appendSlice(alloc, "<th class=\"sticky-right-2 suse\">id</th>");
-    try html.appendSlice(alloc, "<th class=\"sticky-right suse\">row</th>");
-    try html.appendSlice(alloc, Html.table_head_close_body_open);
 
-    // Generate table rows
-    for (entries, 0..) |entry, idx| {
-        try html.writer(alloc).print("<tr data-index=\"{d}\">", .{idx});
+    const enc_file = try urlEncodeAlloc(arena, tar_path);
 
-        // For quick lookup: map key -> index within this entry
-        var per_row = std.StringHashMap(usize).init(alloc);
+    var rows = try std.ArrayList(Row).initCapacity(arena, entries.len);
+    for (entries) |entry| {
+        var per_row = std.StringHashMap(usize).init(arena);
         defer per_row.deinit();
         for (entry.keys, 0..) |k, kidx| {
             try per_row.put(k, kidx);
         }
 
+        var cells = try std.ArrayList(Cell).initCapacity(arena, all_keys_list.items.len);
         for (all_keys_list.items) |k| {
             if (per_row.get(k)) |kidx| {
                 if (kidx < entry.offsets.len and kidx < entry.sizes.len) {
                     const offset = entry.offset + entry.offsets[kidx];
                     const size = entry.sizes[kidx];
-                    const range_str = try std.fmt.allocPrint(alloc, "{X:0>8}..{X:0>8}", .{ offset, offset + size });
-                    defer alloc.free(range_str);
-                    const id_value = if (entry.str_idx.len > 0) entry.str_idx else blk: {
-                        const tmp = try std.fmt.allocPrint(alloc, "{X}", .{entry.iidx});
-                        break :blk tmp;
-                    };
-                    defer if (id_value.ptr != entry.str_idx.ptr) alloc.free(id_value);
-                    const enc_file = try urlEncodeAlloc(alloc, tar_path);
-                    defer alloc.free(enc_file);
-                    const enc_k = try urlEncodeAlloc(alloc, k);
-                    defer alloc.free(enc_k);
-                    const enc_id = try urlEncodeAlloc(alloc, id_value);
-                    defer alloc.free(enc_id);
-                    const link = try std.fmt.allocPrint(alloc, "/boxed_file?file={s}&k={s}&base={x}&end={x}&id={s}", .{ enc_file, enc_k, offset, offset + size, enc_id });
-                    defer alloc.free(link);
-                    try html.writer(alloc).print("<td><a class=\"mono\" hx-get=\"{s}\" hx-swap=\"outerHTML\">{s}</a></td>", .{ link, range_str });
+                    const range_str = try std.fmt.allocPrint(arena, "{X:0>8}..{X:0>8}", .{ offset, offset + size });
+                    const enc_k = try urlEncodeAlloc(arena, k);
+                    try cells.append(arena, .{ .has = true, .k = enc_k, .range_str = range_str });
                 } else {
-                    try html.appendSlice(alloc, "<td></td>");
+                    try cells.append(arena, .{ .has = false, .k = "", .range_str = "" });
                 }
             } else {
-                try html.appendSlice(alloc, "<td></td>");
+                try cells.append(arena, .{ .has = false, .k = "", .range_str = "" });
             }
         }
-        // Pinned right cells
-        const id_value_row = if (entry.str_idx.len > 0) entry.str_idx else blk: {
-            const tmp = try std.fmt.allocPrint(alloc, "{X}", .{entry.iidx});
-            break :blk tmp;
-        };
-        defer if (id_value_row.ptr != entry.str_idx.ptr) alloc.free(id_value_row);
-        const row_str = try std.fmt.allocPrint(alloc, "{d}", .{entry.iidx});
-        defer alloc.free(row_str);
-        const row_trim = if (row_str.len > 5) row_str[row_str.len - 5 ..] else row_str;
-        try html.writer(alloc).print("<td class=\"sticky-right-2 mono\">{s}</td>", .{id_value_row});
-        try html.writer(alloc).print("<td class=\"sticky-right mono\">{s}</td>", .{row_trim});
 
-        try html.appendSlice(alloc, "</tr>");
+        const id_value = if (entry.str_idx.len > 0) entry.str_idx else try std.fmt.allocPrint(arena, "{X}", .{entry.iidx});
+        try rows.append(arena, .{ .cells = cells.items, .id_value = id_value, .row_idx = @intCast(entry.iidx) });
     }
 
-    try html.appendSlice(alloc, "</tbody></table></div></div>");
+    const load_tpl = try template_cache.get("ultar_httpd/templates/load_table.html");
+    var mustache = try zap.Mustache.fromData(load_tpl);
+    defer mustache.deinit();
 
-    // Bottom status bar with the utix/tar path
-    try html.writer(alloc).print("<div class=\"status-bar\"><span class=\"suse\">{s}</span></div>", .{tar_path});
-
-    try r.sendBody(html.items);
+    const data = .{ .enc_file = enc_file, .headers = headers.items, .rows = rows.items, .tar_path = tar_path };
+    var built = mustache.build(data);
+    defer built.deinit();
+    const s = built.str() orelse return error.Unexpected;
+    try r.sendBody(s);
 }
 
 fn sanitizeFilename(alloc: std.mem.Allocator, name: []const u8) ![]u8 {
@@ -755,98 +537,81 @@ fn sanitizeFilename(alloc: std.mem.Allocator, name: []const u8) ![]u8 {
     return buf;
 }
 
-fn handleMapFile(r: zap.Request) !void {
-    var arena = std.heap.ArenaAllocator.init(gpa);
-    defer arena.deinit();
-    const alloc = arena.allocator();
+const InvalidRangeStrError = error{
+    invalid_base_offset,
+    invalid_end_offset,
+};
 
-    r.parseQuery();
+fn parseRangeStr(range_str: []const u8) !struct { u64, u64 } {
+    var parts = std.mem.splitSequence(u8, range_str, "..");
+    const base = std.fmt.parseInt(u64, parts.next() orelse return error.invalid_base_offset, 16) catch return error.invalid_base_offset;
+    const end = std.fmt.parseInt(u64, parts.next() orelse return error.invalid_end_offset, 16) catch return error.invalid_end_offset;
 
+    return .{ base, end };
+}
+
+const MapFileClientError = error{
+    missing_parameters,
+    invalid_offset_range,
+} || InvalidRangeStrError;
+
+fn handleMapFile(arena: std.mem.Allocator, r: zap.Request) !void {
     // Parse query parameters (decoded via zap)
-    const file_param = r.getParamStr(alloc, "file") catch null orelse "";
-    const base_param = r.getParamStr(alloc, "base") catch null orelse "";
-    const end_param = r.getParamStr(alloc, "end") catch null orelse "";
-    const k_param = r.getParamStr(alloc, "k") catch null orelse "";
-    const id_param = r.getParamStr(alloc, "id") catch null;
+    const file_raw = r.getParamSlice("file") orelse "";
+    const file_param = try urlDecodeBuf(file_raw, try arena.alloc(u8, file_raw.len));
+    const range_str = r.getParamSlice("range_str") orelse "";
+    const k_raw = r.getParamSlice("k") orelse "";
+    const k_param = try urlDecodeBuf(k_raw, try arena.alloc(u8, k_raw.len));
+    const id_raw_opt = r.getParamSlice("id");
+    const id_param = if (id_raw_opt) |id_raw| blk: {
+        break :blk try urlDecodeBuf(id_raw, try arena.alloc(u8, id_raw.len));
+    } else null;
 
-    if (file_param.len == 0 or base_param.len == 0 or end_param.len == 0 or k_param.len == 0) {
-        r.setStatus(.bad_request);
-        try r.sendBody("Missing required parameters");
-        return;
+    if (file_param.len == 0 or range_str.len <= 2 or k_param.len == 0) {
+        return MapFileClientError.missing_parameters;
     }
 
     // Parse hex values
-    const base_offset = std.fmt.parseInt(u64, base_param, 16) catch {
-        r.setStatus(.bad_request);
-        try r.sendBody("Invalid base offset");
-        return;
-    };
-
-    const end_offset = std.fmt.parseInt(u64, end_param, 16) catch {
-        r.setStatus(.bad_request);
-        try r.sendBody("Invalid end offset");
-        return;
-    };
+    const base_offset, const end_offset = try parseRangeStr(range_str);
 
     if (end_offset <= base_offset) {
-        r.setStatus(.bad_request);
-        try r.sendBody("Invalid offset range");
-        return;
+        return MapFileClientError.invalid_offset_range;
     }
 
     // Build full file path
-    const full_path = try buildSafePathAlloc(alloc, file_param);
-    defer alloc.free(full_path);
+    const full_path = try buildSafePathAlloc(arena, file_param);
 
     // Open and memory map the file
-    var file = std.fs.openFileAbsolute(full_path, .{}) catch {
-        r.setStatus(.not_found);
-        try r.sendBody("File not found");
-        return;
-    };
+    var file = try std.fs.openFileAbsolute(full_path, .{});
     defer file.close();
 
     const file_size = try file.getEndPos();
     if (end_offset > file_size) {
-        r.setStatus(.bad_request);
-        try r.sendBody("End offset exceeds file size");
-        return;
+        return MapFileClientError.invalid_offset_range;
     }
 
     // Read the data
-    const data_size = end_offset - base_offset;
-    const data = try alloc.alloc(u8, data_size);
-    defer alloc.free(data);
-
-    _ = try file.seekTo(base_offset);
-    const bytes_read = try file.read(data);
-    if (bytes_read != data_size) {
-        r.setStatus(.internal_server_error);
-        try r.sendBody("Failed to read file data");
-        return;
-    }
+    const read_buf = try arena.alloc(u8, 16384);
+    var reader = file.reader(read_buf);
+    try reader.seekTo(base_offset);
+    const data = try reader.interface.readAlloc(arena, end_offset - base_offset);
 
     // Set appropriate MIME type
-    const mime_type = getMimeType(k_param);
-    if (mime_type) |mt| {
-        r.setHeader("Content-Type", mt) catch {};
-    }
+    const mime_type = try findMimeTypeAlloc(arena, k_param);
+    r.setHeader("Content-Type", mime_type) catch {};
 
     // Content-Disposition filename: {str_idx}.{key}
     if (id_param) |id_val| {
-        const cleaned_id = try sanitizeFilename(alloc, id_val);
-        defer alloc.free(cleaned_id);
+        const cleaned_id = try sanitizeFilename(arena, id_val);
         var filename: []const u8 = undefined;
         if (k_param.len > 0 and k_param[0] == '.') {
-            filename = try std.fmt.allocPrint(alloc, "{s}{s}", .{ cleaned_id, k_param });
+            filename = try std.fmt.allocPrint(arena, "{s}{s}", .{ cleaned_id, k_param });
         } else if (k_param.len > 0) {
-            filename = try std.fmt.allocPrint(alloc, "{s}.{s}", .{ cleaned_id, k_param });
+            filename = try std.fmt.allocPrint(arena, "{s}.{s}", .{ cleaned_id, k_param });
         } else {
-            filename = try std.fmt.allocPrint(alloc, "{s}", .{cleaned_id});
+            filename = try std.fmt.allocPrint(arena, "{s}", .{cleaned_id});
         }
-        defer alloc.free(filename);
-        const header_val = try std.fmt.allocPrint(alloc, "attachment; filename=\"{s}\"", .{filename});
-        defer alloc.free(header_val);
+        const header_val = try std.fmt.allocPrint(arena, "attachment; filename=\"{s}\"", .{filename});
         r.setHeader("Content-Disposition", header_val) catch {};
     }
 
@@ -855,138 +620,67 @@ fn handleMapFile(r: zap.Request) !void {
     try r.sendBody(data);
 }
 
-// Get MIME type for file extension
-fn getMimeType(filename: []const u8) ?[]const u8 {
-    if (std.mem.endsWith(u8, filename, ".jpg") or std.mem.endsWith(u8, filename, ".jpeg")) {
-        return "image/jpeg";
-    } else if (std.mem.endsWith(u8, filename, ".png")) {
-        return "image/png";
-    } else if (std.mem.endsWith(u8, filename, ".gif")) {
-        return "image/gif";
-    } else if (std.mem.endsWith(u8, filename, ".webp")) {
-        return "image/webp";
-    } else if (std.mem.endsWith(u8, filename, ".svg")) {
-        return "image/svg+xml";
-    } else if (std.mem.endsWith(u8, filename, ".txt")) {
-        return "text/plain";
-    } else if (std.mem.endsWith(u8, filename, ".html") or std.mem.endsWith(u8, filename, ".htm")) {
-        return "text/html";
-    } else if (std.mem.endsWith(u8, filename, ".json")) {
-        return "application/json";
-    } else if (std.mem.endsWith(u8, filename, ".xml")) {
-        return "application/xml";
-    } else if (std.mem.endsWith(u8, filename, ".pdf")) {
-        return "application/pdf";
-    } else if (std.mem.endsWith(u8, filename, ".zip")) {
-        return "application/zip";
-    } else if (std.mem.endsWith(u8, filename, ".tar")) {
-        return "application/x-tar";
-    } else {
-        return null;
-    }
-}
+const BoxedFileClientError = error{
+    missing_parameters,
+    invalid_base_offset,
+    invalid_end_offset,
+};
 
-fn handleBoxedFile(r: zap.Request) !void {
-    var arena = std.heap.ArenaAllocator.init(gpa);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-
-    r.parseQuery();
-
+fn handleBoxedFile(arena: std.mem.Allocator, r: zap.Request) !void {
     // Parse query parameters
-    const file_param = r.getParamStr(alloc, "file") catch null orelse "";
-    const base_param = r.getParamStr(alloc, "base") catch null orelse "";
-    const end_param = r.getParamStr(alloc, "end") catch null orelse "";
-    const k_param = r.getParamStr(alloc, "k") catch null orelse "";
-    const id_param = r.getParamStr(alloc, "id") catch null orelse "";
+    const file_raw = r.getParamSlice("file") orelse "";
+    const file_param = try urlDecodeBuf(file_raw, try arena.alloc(u8, file_raw.len));
+    const range_str_raw = r.getParamSlice("range_str") orelse "";
+    const range_str_param = try urlDecodeBuf(range_str_raw, try arena.alloc(u8, range_str_raw.len));
+    const k_raw = r.getParamSlice("k") orelse "";
+    const k_param = try urlDecodeBuf(k_raw, try arena.alloc(u8, k_raw.len));
+    const id_raw = r.getParamSlice("id") orelse "";
+    const id_param = try urlDecodeBuf(id_raw, try arena.alloc(u8, id_raw.len));
 
-    if (file_param.len == 0 or base_param.len == 0 or end_param.len == 0 or k_param.len == 0) {
-        r.setStatus(.bad_request);
-        try r.sendBody("<p>Missing parameters</p>");
-        return;
+    if (file_param.len == 0 or range_str_param.len <= 2 or k_param.len == 0) {
+        return BoxedFileClientError.missing_parameters;
     }
 
     // Validate offsets
-    _ = std.fmt.parseInt(u64, base_param, 16) catch {
-        r.setStatus(.bad_request);
-        try r.sendBody("<p>Invalid base offset</p>");
-        return;
-    };
-    const end_offset = std.fmt.parseInt(u64, end_param, 16) catch {
-        r.setStatus(.bad_request);
-        try r.sendBody("<p>Invalid end offset</p>");
-        return;
-    };
-    _ = end_offset; // only format validation here; actual safety in map_file
-
-    // Build download URL to the map_file endpoint (include id for naming)
-    const enc_file = try urlEncodeAlloc(alloc, file_param);
-    defer alloc.free(enc_file);
-    const enc_k = try urlEncodeAlloc(alloc, k_param);
-    defer alloc.free(enc_k);
-    const enc_base = try urlEncodeAlloc(alloc, base_param);
-    defer alloc.free(enc_base);
-    const enc_end = try urlEncodeAlloc(alloc, end_param);
-    defer alloc.free(enc_end);
-    const enc_id = try urlEncodeAlloc(alloc, id_param);
-    defer alloc.free(enc_id);
-    const download_url = try std.fmt.allocPrint(
-        alloc,
-        "/map_file?file={s}&k={s}&base={s}&end={s}&id={s}",
-        .{ enc_file, enc_k, enc_base, enc_end, enc_id },
-    );
-    defer alloc.free(download_url);
+    _ = try parseRangeStr(range_str_param);
 
     // Decide preview based on MIME type
-    const mt = getMimeType(k_param);
+    const mime_type = try findMimeTypeAlloc(arena, k_param);
 
-    var html = try std.ArrayList(u8).initCapacity(alloc, 0);
-    defer html.deinit(alloc);
-
-    // Always include a download link
-    try html.writer(alloc).print(
-        "<div class=\"boxed-preview\"><div><a class=\"suse\" href=\"{s}\" download>download</a></div>",
-        .{download_url},
-    );
-
-    const mt_str = mt orelse "";
-    std.debug.print("key={s} mimeType: {s}\n", .{ k_param, mt_str });
-
-    if (mt) |mime_type| {
-        if (std.mem.startsWith(u8, mime_type, "image/")) {
-            const snip = try preview_image.render(alloc, download_url);
-            defer alloc.free(snip);
-            try html.appendSlice(alloc, snip);
-        } else if (std.mem.eql(u8, mime_type, "application/json")) {
-            const snip = try preview_json.render(alloc, download_url);
-            defer alloc.free(snip);
-            try html.appendSlice(alloc, snip);
-        } else if (std.mem.startsWith(u8, mime_type, "video/")) {
-            try html.writer(alloc).print(
-                "<div style=\"margin-top:6px\"><video controls src=\"{s}\" style=\"max-width:512px; max-height:384px;\"></video></div>",
-                .{download_url},
-            );
-        } else if (std.mem.startsWith(u8, mime_type, "audio/")) {
-            try html.writer(alloc).print(
-                "<div style=\"margin-top:6px\"><audio controls src=\"{s}\"></audio></div>",
-                .{download_url},
-            );
-        } else if (std.mem.startsWith(u8, mime_type, "text/")) {
-            try html.writer(alloc).print(
-                "<div style=\"margin-top:6px\"><iframe src=\"{s}\" style=\"width:100%; max-width:720px; height:360px; background:var(--ctp-crust); border:1px solid var(--border);\"></iframe></div>",
-                .{download_url},
-            );
-        } else {
-            // Fallback embed
-            try html.writer(alloc).print(
-                "<div style=\"margin-top:6px\"><embed src=\"{s}\" type=\"{s}\" style=\"max-width:720px; height:360px; border:1px solid var(--border);\"/></div>",
-                .{ download_url, mime_type },
-            );
-        }
+    // Select a partial based on mime type
+    var partial_path: []const u8 = undefined;
+    if (std.mem.startsWith(u8, mime_type, "image/")) {
+        partial_path = "ultar_httpd/templates/boxed/image.html";
+    } else if (std.mem.eql(u8, mime_type, "application/json")) {
+        partial_path = "ultar_httpd/templates/boxed/json.html";
+    } else if (std.mem.startsWith(u8, mime_type, "video/")) {
+        partial_path = "ultar_httpd/templates/boxed/video.html";
+    } else if (std.mem.startsWith(u8, mime_type, "audio/")) {
+        partial_path = "ultar_httpd/templates/boxed/audio.html";
+    } else if (std.mem.startsWith(u8, mime_type, "text/")) {
+        partial_path = "ultar_httpd/templates/boxed/text.html";
+    } else {
+        partial_path = "ultar_httpd/templates/boxed/other.html";
     }
 
-    try html.appendSlice(alloc, "</div>");
-    try r.sendBody(html.items);
+    const download_url = try std.fmt.allocPrint(arena, "/map_file?file={s}&k={s}&range_str={s}&id={s}", .{ file_param, k_param, range_str_param, id_param });
+
+    const partial_tpl = try template_cache.get(partial_path);
+    var partial = try zap.Mustache.fromData(partial_tpl);
+    defer partial.deinit();
+    const partial_data = .{ .mime_type = mime_type, .download_url = download_url };
+    var partial_built = partial.build(partial_data);
+    defer partial_built.deinit();
+    const partial_html = partial_built.str() orelse return error.Unexpected;
+
+    const boxed_tpl = try template_cache.get("ultar_httpd/templates/boxed_file.html");
+    var mustache = try zap.Mustache.fromData(boxed_tpl);
+    defer mustache.deinit();
+    const wrapper_data = .{ .partial_html = partial_html, .mime_type = mime_type, .download_url = download_url };
+    var built = mustache.build(wrapper_data);
+    defer built.deinit();
+    const s = built.str() orelse return error.Unexpected;
+    try r.sendBody(s);
 }
 
 pub fn main() !void {
@@ -1042,6 +736,11 @@ pub fn main() !void {
         try initBaseDir();
     }
     defer gpa.free(base_dir);
+
+    // Initialize template cache
+    template_cache = TemplateCache.init(gpa);
+    defer template_cache.deinit();
+    template_cache.setupWatcher();
 
     var addr_buf: [1024]u8 = undefined;
     std.mem.copyForwards(u8, addr_buf[0..addr.len], addr);

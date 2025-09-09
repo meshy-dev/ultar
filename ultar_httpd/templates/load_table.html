@@ -1,0 +1,33 @@
+<div class="pane-body">
+  <div class="table-wrap">
+    <table class="table" hx-vals='{"file":"{{enc_file}}"}'>
+      <thead>
+        <tr>
+          {{#headers}}
+          <th class="suse">{{name}}</th>
+          {{/headers}}
+          <th class="sticky-right-2 suse">id</th>
+          <th class="sticky-right suse">row</th>
+        </tr>
+      </thead>
+      <tbody>
+        {{#rows}}
+        <tr hx-vals='{"id":"{{id_value}}"}'>
+          {{#cells}}
+          <td hx-vals='{"k":"{{k}}", "range_str":"{{range_str}}"}'>
+            {{#has}}
+            <a class="mono" hx-get="/boxed_file" hx-swap="outerHTML">{{range_str}}</a>
+            {{/has}}
+          </td>
+          {{/cells}}
+          <td class="sticky-right-2 mono">{{id_value}}</td>
+          <td class="sticky-right mono">{{row_idx}}</td>
+        </tr>
+        {{/rows}}
+      </tbody>
+    </table>
+  </div>
+</div>
+<div class="status-bar"><span class="suse">{{tar_path}}</span></div>
+
+

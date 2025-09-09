@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>WebDataset Index Browser</title>
+  <meta name="color-scheme" content="dark"/>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:ital,wght@0,400;0,700&family=SUSE&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      color-scheme: dark;
+      /* Catppuccin Mocha */
+      --ctp-rosewater: #f5e0dc;
+      --ctp-flamingo: #f2cdcd;
+      --ctp-pink: #f5c2e7;
+      --ctp-mauve: #cba6f7;
+      --ctp-red: #f38ba8;
+      --ctp-maroon: #eba0ac;
+      --ctp-peach: #fab387;
+      --ctp-yellow: #f9e2af;
+      --ctp-green: #a6e3a1;
+      --ctp-teal: #94e2d5;
+      --ctp-sky: #89dceb;
+      --ctp-sapphire: #74c7ec;
+      --ctp-blue: #89b4fa;
+      --ctp-lavender: #b4befe;
+      --ctp-text: #cdd6f4;
+      --ctp-subtext1: #bac2de;
+      --ctp-subtext0: #a6adc8;
+      --ctp-overlay2: #9399b2;
+      --ctp-overlay1: #7f849c;
+      --ctp-overlay0: #6c7086;
+      --ctp-surface2: #585b70;
+      --ctp-surface1: #45475a;
+      --ctp-surface0: #313244;
+      --ctp-base: #1e1e2e;
+      --ctp-mantle: #181825;
+      --ctp-crust: #11111b;
+      /* Site tokens mapped to Mocha (+extra dark) */
+      --bg: var(--ctp-crust);
+      --panel: var(--ctp-mantle);
+      --text: var(--ctp-text);
+      --muted: var(--ctp-subtext0);
+      --border: var(--ctp-overlay0);
+      --accent: var(--ctp-blue);
+      --accent-2: var(--ctp-sapphire);
+    }
+    html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text); font-family: system-ui, -apple-system, "Segoe UI", Roboto, Ubuntu, Cantarell, "Noto Sans", sans-serif; }
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { color: var(--ctp-sky); text-decoration: underline; }
+    .suse { font-family: "SUSE", sans-serif; }
+    .mono { font-family: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
+    .title { font-weight: 700; }
+    .app { display: flex; gap: 12px; padding: 12px; box-sizing: border-box; height: 100vh; }
+    .pane { background: var(--panel); border: 1px solid var(--border); border-radius: 4px; display: flex; flex-direction: column; padding: 0; overflow: hidden; }
+    .status-bar { background: var(--ctp-mantle); }
+    #file-tree.pane { flex: 0 0 20rem; max-width: 20rem; }
+    #table-container.pane { flex: 1 1 auto; }
+    #file-tree-list.htmx-request, #table-container.htmx-request { opacity: 0.6; transition: opacity 200ms linear; }
+    .nav-list { list-style: none; margin: 0; padding: 0; }
+    .nav-item a { display: block; padding: 6px 8px; color: var(--text); }
+    .nav-item a:hover { background: var(--ctp-surface0); color: var(--accent); }
+    .pane-body { flex: 1 1 auto; min-height: 0; overflow-y: auto; overflow-x: auto; padding: 12px 0 12px 12px; scrollbar-gutter: stable; }
+    #table-container .pane-body { background: var(--ctp-surface0); }
+    .status-bar { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 8px 12px; border-top: 1px solid var(--border); color: var(--muted); }
+    .table-wrap { overflow: visible; min-width: 100%; }
+    /* Visible scrollbars (Firefox + WebKit) */
+    .pane-body { scrollbar-width: auto; scrollbar-color: var(--ctp-overlay1) var(--ctp-surface1); }
+    .pane-body::-webkit-scrollbar { width: 12px; height: 10px; }
+    .pane-body::-webkit-scrollbar-track { background: var(--ctp-surface1); }
+    .pane-body::-webkit-scrollbar-thumb { background: var(--ctp-overlay1); border: 2px solid var(--ctp-surface1); border-radius: 4px; }
+    .pane-body::-webkit-scrollbar-thumb:hover { background: var(--ctp-overlay2); }
+    .table { width: max-content; min-width: 100%; border-collapse: collapse; font-size: 14px; table-layout: auto; background: var(--panel); color: var(--text); border-radius: 4px; }
+    .table thead th { position: sticky; top: 0; background: var(--ctp-surface0); text-align: left; padding: 8px; border-bottom: 1px solid var(--border); color: var(--ctp-subtext1); }
+    .table tbody td { padding: 6px 8px; border-bottom: 1px solid var(--border); vertical-align: top; }
+    .table tr:hover td { background: var(--ctp-surface0); }
+    a.mono { color: var(--accent-2); }
+    :root { --right-col-width: 7ch; --right-col-2-width: 16ch; }
+    .table { position: relative; }
+    .sticky-right-2 { position: sticky; right: var(--right-col-width); background: var(--ctp-surface0); z-index: 8; min-width: var(--right-col-2-width); max-width: var(--right-col-2-width); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .sticky-right { position: sticky; right: 0; background: var(--ctp-surface0); z-index: 9; min-width: var(--right-col-width); max-width: var(--right-col-width); text-align: right; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    tbody td.sticky-right, tbody td.sticky-right-2 { background: var(--panel); }
+    thead th.sticky-right, thead th.sticky-right-2 { box-shadow: -1px 0 0 0 var(--border) inset; z-index: 10; }
+    .image-preview img { max-width: 20rem; max-height: 20rem; }
+    div .json-preview { display: block; overflow: auto; max-width: 30rem; max-height: 20rem; padding: 8px; border: 1px solid var(--border); background: var(--ctp-crust); border-radius: 4px; }
+    .json-preview pre { margin: 0; }
+  </style>
+</head>
+
+<body>
+  <div class="app">
+    <aside id="file-tree" class="pane">
+      <div class="pane-body">
+        <div id="file-tree-list" class="suse">
+          {{{body}}}
+        </div>
+      </div>
+      <div class="status-bar"><span class="suse title">Ultar Index Viewer</span></div>
+    </aside>
+
+    <main id="table-container" class="pane">
+    </main>
+  </div>
+  <script>{{{htmx_js}}}</script>
+  <style id="hljs-css">
+    /* Catppuccin Mocha for highlight.js (inline, no CDN) */
+    .hljs { color: var(--ctp-text); background: var(--ctp-crust); font-family: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
+    .hljs-keyword, .hljs-literal { color: var(--ctp-mauve); font-weight: 600; }
+    .hljs-string { color: var(--ctp-green); }
+    .hljs-number { color: var(--ctp-peach); }
+    .hljs-attr, .hljs-attribute, .hljs-property, .hljs-attr-name { color: var(--ctp-blue); }
+    .hljs-punctuation { color: var(--ctp-overlay2); }
+    .hljs-comment, .hljs-quote { color: var(--ctp-overlay1); font-style: italic; }
+    .hljs-title, .hljs-section, .hljs-name { color: var(--ctp-sapphire); }
+    .hljs-built_in, .hljs-type, .hljs-class { color: var(--ctp-yellow); }
+    .hljs-variable, .hljs-template-variable { color: var(--ctp-red); }
+    .hljs-symbol, .hljs-bullet { color: var(--ctp-teal); }
+    .hljs-addition { color: var(--ctp-green); background: rgba(166, 227, 161, 0.10); }
+    .hljs-deletion { color: var(--ctp-red); background: rgba(243, 139, 168, 0.10); }
+    .hljs-strong { font-weight: 700; }
+    .hljs-emphasis { font-style: italic; }
+  </style>
+  <script id="hljs-js" src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.11.1/highlight.min.js" defer></script>
+  <script id="ultar-json-rt" defer>(function(){
+    async function ensure(){
+      if(!window.hljs){
+        await new Promise(r=>{ var s=document.getElementById('hljs-js'); if(s && !s.dataset._loaded){ s.addEventListener('load', ()=>{s.dataset._loaded='1'; r();}, {once:true}); } else { r(); } });
+      }
+    }
+    async function init(el){
+      const url = el.getAttribute('data-src');
+      if(!url) return;
+      const res = await fetch(url);
+      const txt = await res.text();
+      let out = txt;
+      try { out = JSON.stringify(JSON.parse(txt), null, 2); } catch(e){}
+      await ensure();
+      if(window.hljs) {
+        el.innerHTML = window.hljs.highlight(out, {language: 'json'}).value;
+      } else {
+        el.textContent = out;
+      }
+    }
+    function scan(){ document.querySelectorAll('.json-code:not([data-initialized])').forEach(function(el){ el.setAttribute('data-initialized','1'); init(el); }); }
+    document.body.addEventListener('htmx:afterSwap', scan);
+    scan();
+  })();</script>
+</body>
+</html>

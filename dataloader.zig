@@ -91,6 +91,7 @@ pub const LoaderCtx = struct {
     req_cnt: u64 = 0,
     is_running: bool = false,
     is_draining: bool = false,
+    last_slot: usize = 0,
 
     debug_max_req_id: u64 = std.math.maxInt(u64),
     tick: u64 = 0,
@@ -100,8 +101,11 @@ pub const LoaderCtx = struct {
 
     fn findFreeFileSlot(self: *Self) !FileHandle {
         // This isn't called too often, just linear scan
-        for (self.file_slots, 0..) |f, i| {
+        for (0..max_file_slots) |offset| {
+            const i = (self.last_slot + offset) % max_file_slots;
+            const f = self.file_slots[i];
             if (f == null) {
+                self.last_slot = (i + 1) % max_file_slots;
                 return .{
                     .idx = @intCast(i),
                     .generation = 0,

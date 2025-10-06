@@ -61,8 +61,6 @@ jobs:
         with:
           files: |
             ./libdataloader.so
-            ./indexer-${{ matrix.target.triplet }}
-            ./ultar_httpd-${{ matrix.target.triplet }}
 
       - name: Upload binaries to Release (Linux aarch64)
         uses: softprops/action-gh-release@v2
@@ -70,15 +68,12 @@ jobs:
         with:
           files: |
             ./libdataloader.so
-            ./indexer-${{ matrix.target.triplet }}
-            ./ultar_httpd-${{ matrix.target.triplet }}
 
       - name: Upload binaries to Release (Linux x86_64)
         uses: softprops/action-gh-release@v2
         if: github.ref_type == 'tag' && matrix.target.triplet == 'x86_64-linux-musl'
         with:
           files: |
-            ./libdataloader.so
             ./indexer-${{ matrix.target.triplet }}
             ./ultar_httpd-${{ matrix.target.triplet }}
 
@@ -87,6 +82,5 @@ jobs:
         if: github.ref_type == 'tag' && matrix.target.triplet == 'aarch64-linux-musl'
         with:
           files: |
-            ./libdataloader.so
             ./indexer-${{ matrix.target.triplet }}
             ./ultar_httpd-${{ matrix.target.triplet }}

@@ -274,7 +274,7 @@ pub const LoaderCtx = struct {
     }
 
     fn run_worker(self: *Self) void {
-        self.worker_thread.?.setName("dataloader_io_worker") catch {};
+        (self.worker_thread orelse @panic("Thread is null in run_worker")).setName("dataloader_io_worker") catch {};
 
         while (self.is_running) {
             self.tick += 1;

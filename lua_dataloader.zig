@@ -308,7 +308,7 @@ pub const LuaDataLoader = struct {
                         }
                     },
                     .add_entry => |*e| {
-                        const row = self.in_progress_row.?;
+                        const row = self.in_progress_row orelse @panic("No in-progress row while trying to .add_entry");
                         if (e.entry == null) {
                             const row_alloc = row.arena.allocator();
                             const key = try row_alloc.dupeZ(u8, e.key);
@@ -324,7 +324,7 @@ pub const LuaDataLoader = struct {
                             .read_block = .{
                                 .file = @bitCast(e.file_handle),
                                 .base = e.offset,
-                                .result_buffer = e.entry.?.data, //
+                                .result_buffer = (e.entry orelse @panic("Entry is null in .add_entry")).data, //
                             },
                         })) |rid| {
                             self.u_yielded_from = null;

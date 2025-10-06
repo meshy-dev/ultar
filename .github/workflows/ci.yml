@@ -30,7 +30,7 @@ jobs:
         with:
           version: 0.15.1
 
-      - name: Build (ReleaseFast, ${{ matrix.target.triplet }})
+      - name: Build (ReleaseSafe, ${{ matrix.target.triplet }})
         run: |
           zig build \
             -Doptimize=ReleaseSafe \
@@ -39,48 +39,14 @@ jobs:
             --summary all
           mv ./zig-out/bin/indexer ./indexer-${{ matrix.target.triplet }}
           mv ./zig-out/bin/ultar_httpd ./ultar_httpd-${{ matrix.target.triplet }}
-          mv ./zig-out/lib/* ./
+          if [[ matrix.target.triplet =~ linux ]]; then
+            mv ./zig-out/lib/libdataloader.so ./libdataloader-${{ matrix.target.triplet }}.so
+          fi
 
       - name: Test
         run: |
           zig build test --summary all
 
-      # Upload binaries on release
-      - name: Upload binaries to Release (macOS)
+      - name: Upload binaries to Release
         uses: softprops/action-gh-release@v2
-        if: github.ref_type == 'tag' && matrix.target.triplet == 'aarch64-macos'
-        with:
-          files: |
-            ./libdataloader.dylib
-            ./indexer-${{ matrix.target.triplet }}
-            ./ultar_httpd-${{ matrix.target.triplet }}
-
-      - name: Upload binaries to Release (Linux x86_64)
-        uses: softprops/action-gh-release@v2
-        if: github.ref_type == 'tag' && matrix.target.triplet == 'x86_64-linux-gnu.2.28'
-        with:
-          files: |
-            ./libdataloader.so
-
-      # - name: Upload binaries to Release (Linux aarch64)
-      #   uses: softprops/action-gh-release@v2
-      #   if: github.ref_type == 'tag' && matrix.target.triplet == 'aarch64-linux-gnu.2.28'
-      #   with:
-      #     files: |
-      #       ./libdataloader.so
-
-      - name: Upload binaries to Release (Linux x86_64)
-        uses: softprops/action-gh-release@v2
-        if: github.ref_type == 'tag' && matrix.target.triplet == 'x86_64-linux-musl'
-        with:
-          files: |
-            ./indexer-${{ matrix.target.triplet }}
-            ./ultar_httpd-${{ matrix.target.triplet }}
-
-      - name: Upload binaries to Release (Linux aarch64)
-        uses: softprops/action-gh-release@v2
-        if: github.ref_type == 'tag' && matrix.target.triplet == 'aarch64-linux-musl'
-        with:
-          files: |
-            ./indexer-${{ matrix.target.triplet }}
-            ./ultar_httpd-${{ matrix.target.triplet }}
+        if: github.ref_type == 'tag'

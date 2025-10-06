@@ -52,4 +52,6 @@ jobs:
         if: github.ref_type == 'tag'
         with:
           files: |
-            ./*
+            ./libdataloader-${{ matrix.target.triplet }}.so
+            ./indexer-${{ matrix.target.triplet }}
+            ./ultar_httpd-${{ matrix.target.triplet }}

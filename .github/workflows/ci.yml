@@ -39,7 +39,7 @@ jobs:
             --summary all
           mv ./zig-out/bin/indexer ./indexer-${{ matrix.target.triplet }}
           mv ./zig-out/bin/ultar_httpd ./ultar_httpd-${{ matrix.target.triplet }}
-          if [[ matrix.target.triplet =~ linux ]]; then
+          if [[ "${{ matrix.target.triplet }}" =~ linux ]]; then
             mv ./zig-out/lib/libdataloader.so ./libdataloader-${{ matrix.target.triplet }}.so
           fi
 

@@ -553,6 +553,7 @@ fn createLuaLoader(spec: LuaLoaderSpec) !*LuaLoaderCCtx {
 
 export fn ultarCreateLuaLoader(spec: LuaLoaderSpec) ?*LuaLoaderCCtx {
     return createLuaLoader(spec) catch {
+        std.debug.dumpCurrentStackTrace(null);
         return @ptrFromInt(0);
     };
 }

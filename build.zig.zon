@@ -5,8 +5,8 @@
     .fingerprint = 0x17f55a637e2667a4,
     .dependencies = .{
         .libxev = .{
-            .url = "git+https://github.com/zen-eth/libxev.git?ref=0.15.1#68f5dc7c512269d83b952d4bbda94c3c1bf4e4c6",
-            .hash = "libxev-0.0.0-86vtc2odEwBDzC8p8WoJl4IPhkBGNijDyppIFakxEzaL",
+            .url = "git+https://github.com/mitchellh/libxev.git#34fa50878aec6e5fa8f532867001ab3c36fae23e",
+            .hash = "libxev-0.0.0-86vtc4IcEwCqEYxEYoN_3KXmc6A9VLcm22aVImfvecYs",
         },
         .clap = .{
             .url = "https://github.com/Hejsil/zig-clap/archive/refs/tags/0.11.0.tar.gz",

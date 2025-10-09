@@ -697,14 +697,15 @@ pub fn main() !void {
     const params = comptime clap.parseParamsComptime(
         \\-h, --help           Display this help and exit.
         \\--addr <STR>         Bind address (default 0.0.0.0).
-        \\-p, --port <INT>     Port to listen on (default 3000).
+        \\-p, --port <PORT>     Port to listen on (default 3000).
         \\-d, --data <DIR>     Data root directory (overrides DATA_PATH).
         \\-t, --threads <INT>  Number of threads (default 4).
         \\
     );
     const parsers = comptime .{
         .STR = clap.parsers.string,
-        .INT = clap.parsers.int(u16, 10),
+        .PORT = clap.parsers.int(u16, 10),
+        .INT = clap.parsers.int(isize, 10),
         .DIR = clap.parsers.string,
     };
     var diag = clap.Diagnostic{};
@@ -723,6 +724,8 @@ pub fn main() !void {
     const addr = res.args.addr orelse "0.0.0.0";
     const port: u16 = res.args.port orelse 3000;
 
+    std.log.info("Launching with args of addr={s}:{} data={s} threads={?}", .{ addr, port, res.args.data orelse "?", res.args.threads });
+
     // Initialize base directory (override if provided)
     if (res.args.data) |data_dir| {
         const abs = if (std.fs.path.isAbsolute(data_dir))
@@ -734,6 +737,7 @@ pub fn main() !void {
         base_dir = try gpa.dupe(u8, abs);
     } else {
         try initBaseDir();
+        std.log.warn("Using DATA_PATH or cwd as base dir: {s}", .{base_dir});
     }
     defer gpa.free(base_dir);
 
@@ -755,9 +759,10 @@ pub fn main() !void {
     });
     try listener.listen();
 
-    std.debug.print("Listening on {s}:{d}\n", .{ addr, port });
-
     const threads = res.args.threads orelse 4;
+
+    std.log.info("Listening on {s}:{d} with {} threads\n", .{ addr, port, threads });
+
     zap.start(.{
         .threads = @intCast(threads),
         .workers = 1, // 1 worker enables sharing state between threads

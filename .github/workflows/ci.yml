@@ -49,11 +49,13 @@ jobs:
 
       - name: Upload binaries to GitHub Release
         if: github.event_name == 'release'
-        uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            ./indexer-${{ matrix.target.name }}
-            ./ultar_httpd-${{ matrix.target.name }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${{ github.ref_name }}" \
+            ./indexer-${{ matrix.target.name }} \
+            ./ultar_httpd-${{ matrix.target.name }} \
+            --clobber
 
   # Build Python wheels (ABI3 stable ABI, Python 3.11+)
   python-wheels:
@@ -168,6 +170,7 @@ jobs:
 
       - name: Upload wheel to GitHub Release
         if: github.event_name == 'release'
-        uses: softprops/action-gh-release@v2
-        with:
-          files: python/dist/*.whl
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${{ github.ref_name }}" python/dist/*.whl --clobber

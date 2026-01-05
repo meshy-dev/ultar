@@ -5,24 +5,24 @@
     .fingerprint = 0x17f55a637e2667a4,
     .dependencies = .{
         .libxev = .{
-            .url = "git+https://github.com/mitchellh/libxev.git#34fa50878aec6e5fa8f532867001ab3c36fae23e",
-            .hash = "libxev-0.0.0-86vtc4IcEwCqEYxEYoN_3KXmc6A9VLcm22aVImfvecYs",
+            .url = "git+https://github.com/mitchellh/libxev.git#42d4ead52667e03619dcd5b1a3ca8ef7d5dd24ed",
+            .hash = "libxev-0.0.0-86vtc0IbEwBzMSXa-ZPZ8JpcV4Mw1SrsTuvtJmFAQ7Uu",
         },
         .clap = .{
             .url = "https://github.com/Hejsil/zig-clap/archive/refs/tags/0.11.0.tar.gz",
             .hash = "clap-0.11.0-oBajB-HnAQDPCKYzwF7rO3qDFwRcD39Q0DALlTSz5H7e",
         },
         .zlua = .{
-            .url = "git+https://github.com/natecraddock/ziglua.git#bf9fc6e6d9c24d5ba53b20acdab657f2fe6cb762",
-            .hash = "zlua-0.1.0-hGRpC444BQDrHc6QhcEeGh1eWMwFbl-c21vlGPWjKBfQ",
+            .url = "git+https://github.com/natecraddock/ziglua.git#315b7f25efd29d9e2143d6c0ab685bb7f640450f",
+            .hash = "zlua-0.1.0-hGRpCww-BQCx3cX6zbKWfTgOx6B7Peo4P17RK2hm7-xV",
         },
         .zap = .{
             .url = "git+https://github.com/zigzap/zap#76679f308c702cd8880201e6e93914e1d836a54b",
             .hash = "zap-0.10.6-GoeB8w-EJABTkxyoGH_Z8oMBYMxTBvn7YWk-DrJOHuDO",
         },
         .htmx = .{
-            .url = "git+https://github.com/bigskysoftware/htmx#d5de7d4a03bc534f373ba4bb3c06eb44ec3f6ca6",
-            .hash = "N-V-__8AAD6vzgU7z9lVpB2AYKo7QswLD6cZkPD-9ZJ3IWHf",
+            .url = "git+https://github.com/bigskysoftware/htmx#749d5f2f4ca34acb36a16a40a3565c5e2eb3e6b5",
+            .hash = "N-V-__8AAAvD1QV-sFQVBHYXjmkKuArczjVeaSdSTMCYRXb3",
         },
     },
     .paths = .{

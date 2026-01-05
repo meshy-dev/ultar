@@ -141,6 +141,11 @@ pub fn build(b: *std.Build) void {
     webapp.linkLibC();
     b.installArtifact(webapp);
 
+    // Named step for building CLI tools only (no Lua/dataloader)
+    const cli_step = b.step("cli", "Build CLI tools (indexer, ultar_httpd)");
+    cli_step.dependOn(&b.addInstallArtifact(indexer, .{}).step);
+    cli_step.dependOn(&b.addInstallArtifact(webapp, .{}).step);
+
     // Add a step to run the webapp
     const run_webapp = b.addRunArtifact(webapp);
     const run_step = b.step("run", "Run the web application");

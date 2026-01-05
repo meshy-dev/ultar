@@ -18,10 +18,11 @@ jobs:
     strategy:
       matrix:
         target:
-          # Linux uses musl for fully static binaries
-          - { name: x86_64-linux, triplet: x86_64-linux-musl, runner: ubuntu-22.04, cpu: x86_64_v3 }
-          - { name: aarch64-linux, triplet: aarch64-linux-musl, runner: ubuntu-24.04-arm, cpu: neoverse_v2 }
-          - { name: aarch64-macos, triplet: aarch64-macos, runner: macos-latest, cpu: apple_m1 }
+          # Linux uses musl for fully static binaries, luajit for Lua
+          - { name: x86_64-linux, triplet: x86_64-linux-musl, runner: ubuntu-22.04, cpu: x86_64_v3, lua: luajit }
+          - { name: aarch64-linux, triplet: aarch64-linux-musl, runner: ubuntu-24.04-arm, cpu: neoverse_v2, lua: luajit }
+          # macOS must use lua54 (luajit doesn't build with zlua on mac)
+          - { name: aarch64-macos, triplet: aarch64-macos, runner: macos-latest, cpu: apple_m1, lua: lua54 }
 
     steps:
       - name: Checkout code
@@ -38,6 +39,7 @@ jobs:
             -Doptimize=ReleaseSafe \
             -Dtarget=${{ matrix.target.triplet }} \
             -Dcpu=${{ matrix.target.cpu }} \
+            -Dlua=${{ matrix.target.lua }} \
             --summary all
           mv ./zig-out/bin/indexer ./indexer-${{ matrix.target.name }}
           mv ./zig-out/bin/ultar_httpd ./ultar_httpd-${{ matrix.target.name }}

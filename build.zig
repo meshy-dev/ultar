@@ -87,18 +87,21 @@ pub fn build(b: *std.Build) void {
     // Named step for building Python bindings
     const python_step = b.step("python-bindings", "Build Python ABI3 extension module");
     const python_lib = buildPythonBindingsStep(b, target, optimize, lua_dataloader_mod, python_exe);
-    const install_python = b.addInstallArtifact(python_lib, .{});
-    python_step.dependOn(&install_python.step);
 
-    // Also copy to python/src/ultar_dataloader/ for development (PYTHONPATH usage)
-    // This ensures `PYTHONPATH=python/src python ...` always uses the latest build
-    const copy_to_dev = b.addSystemCommand(&.{ "cp", "-f" });
-    copy_to_dev.addArtifactArg(python_lib);
-    copy_to_dev.addArg("python/src/ultar_dataloader/_native.abi3.so");
-    copy_to_dev.step.dependOn(&python_lib.step);
-    python_step.dependOn(&copy_to_dev.step);
+    // Install directly into python/src/ultar_dataloader/ (used by both dev and wheel builds)
+    // Use shell to copy with correct extension based on what was built
+    const copy_native = b.addSystemCommand(&.{
+        "sh", "-c",
+        \\for f in zig-out/lib/*_native.abi3.*; do
+        \\  ext="${f##*.}"
+        \\  cp -f "$f" "python/src/ultar_dataloader/_native.abi3.$ext"
+        \\done
+        ,
+    });
+    copy_native.step.dependOn(&b.addInstallArtifact(python_lib, .{}).step);
+    python_step.dependOn(&copy_native.step);
 
-    // Copy lua-types to python package for development
+    // Copy lua-types to python package
     const copy_lua_types = b.addSystemCommand(&.{
         "cp", "-rf", "lua-types/ultar", "python/src/ultar_dataloader/lua-types/",
     });

@@ -12,7 +12,7 @@
 The project is built with `zig`. You should be able to build it with a `zig>=0.15` install.
 
 ```sh
-zig build -Doptimize=ReleaseFast
+zig build -Doptimize=ReleaseSafe
 ```
 
 ## Install

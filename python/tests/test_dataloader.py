@@ -12,53 +12,9 @@ DATA_DIR = Path("/data/datasets/meshylatv/avocado_20251017/val")
 INDEX_FILE = DATA_DIR / "shard_0000_of_0256.base.tar.utix"
 TAR_FILE = DATA_DIR / "shard_0000_of_0256.base.tar"
 
-# Lua script that loads data from tar files
-# Config is passed as 3rd argument to init_ctx
-LUA_SCRIPT = """
-return {
-    init_ctx = function(rank, world_size, config)
-        -- Store config values in context for row_generator
-        return {
-            tar_path = config.tar_path,
-            idx_path = config.idx_path,
-            max_rows = tonumber(config.max_rows) or -1,
-        }
-    end,
-
-    row_generator = function(ctx)
-        local tar = g_loader:open_file(ctx.tar_path)
-        local utix = msgpack_unpacker(ctx.idx_path)
-
-        local row_count = 0
-        for row in utix:iter() do
-            if ctx.max_rows > 0 and row_count >= ctx.max_rows then
-                break
-            end
-
-            local base = row.offset
-            local entries_added = 0
-
-            for i = 1, #row.keys do
-                local k = row.keys[i]
-                local size = row.sizes[i]
-                -- Skip zero-size entries (directory markers like ._)
-                if size > 0 then
-                    local offset = base + row.offsets[i]
-                    g_loader:add_entry(tar, k, offset, size)
-                    entries_added = entries_added + 1
-                end
-            end
-
-            if entries_added > 0 then
-                g_loader:finish_row()
-                row_count = row_count + 1
-            end
-        end
-
-        g_loader:close_file(tar)
-    end,
-}
-"""
+# Load Lua script from external file
+SCRIPT_FILE = Path(__file__).parent / "loader_script.lua"
+LUA_SCRIPT = SCRIPT_FILE.read_text()
 
 
 def test_basic_loading():

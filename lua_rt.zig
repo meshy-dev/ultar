@@ -359,7 +359,33 @@ const MsgpackUnpacker = struct {
     }
 };
 
+/// Module loader for ultar.utix - returns { open = function(path) }
+fn utixModuleLoader(lua: *Lua) i32 {
+    lua.createTable(0, 1); // [+p] module table
+    lua.pushFunction(zlua.wrap(MsgpackUnpacker.newCtx)); // [+p]
+    lua.setField(-2, "open"); // pop, set module.open
+    return 1; // return module table
+}
+
+/// Module loader for ultar.scandir - returns { open = function(path) }
+fn scandirModuleLoader(lua: *Lua) i32 {
+    lua.createTable(0, 1); // [+p] module table
+    lua.pushFunction(zlua.wrap(newScanCtx)); // [+p]
+    lua.setField(-2, "open"); // pop, set module.open
+    return 1; // return module table
+}
+
+/// Register a module loader in package.preload[name]
+fn registerPreload(lua: *Lua, name: [:0]const u8, loader_fn: zlua.CFn) !void {
+    _ = try lua.getGlobal("package"); // [+p]
+    _ = lua.getField(-1, "preload"); // [+p]
+    lua.pushFunction(loader_fn); // [+p]
+    lua.setField(-2, name); // pop loader_fn
+    lua.pop(2); // pop preload, package
+}
+
 pub fn registerRt(lua: *Lua) !void {
+    // Register metatables for userdata types
     try lua.newMetatable(ScanCtx.meta_table); // [+p]
     lua.newTable(); // [+p]
     lua.pushFunction(zlua.wrap(scanDir)); // [+p]
@@ -370,9 +396,6 @@ pub fn registerRt(lua: *Lua) !void {
         lua.setField(-2, "__gc"); // pop 1
     }
     lua.pop(1); // pop meta_table
-
-    lua.pushFunction(zlua.wrap(newScanCtx)); // [+p]
-    lua.setGlobal(ScanCtx.g_new_ctx); // pop 1
 
     try lua.newMetatable(MsgpackUnpacker.meta_table); // [+p]
     lua.newTable(); // [+p]
@@ -385,6 +408,7 @@ pub fn registerRt(lua: *Lua) !void {
     }
     lua.pop(1); // pop meta_table
 
-    lua.pushFunction(zlua.wrap(MsgpackUnpacker.newCtx)); // [+p]
-    lua.setGlobal(MsgpackUnpacker.g_new_ctx); // pop 1
+    // Register modules in package.preload
+    try registerPreload(lua, "ultar.utix", zlua.wrap(utixModuleLoader));
+    try registerPreload(lua, "ultar.scandir", zlua.wrap(scandirModuleLoader));
 }

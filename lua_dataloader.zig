@@ -184,7 +184,7 @@ pub const LuaDataLoader = struct {
             \\return function(self, ...)
             \\    assert(
             \\        type(self) == "table" and type(self.c_loader) == "userdata",
-            \\        "Invalid self, maybe you meant `g_loader:` instead of `g_loader.` ?"
+            \\        "Invalid self, use `loader:method()` not `loader.method()`"
             \\    );
             \\    {s}(self.c_loader, ...)
             \\    return coroutine.yield()
@@ -434,22 +434,50 @@ pub const LuaDataLoader = struct {
         self.num_floating_rows -= 1;
     }
 
+    /// Module loader for ultar.loader - returns the loader interface table
+    fn loaderModuleLoader(lua: *Lua) !i32 {
+        // Get self from upvalue
+        const self = try lua.toUserdata(Self, Lua.upvalueIndex(1));
+
+        // Create the module table with loader methods
+        lua.createTable(0, 5); // [+p] module table
+
+        // Store c_loader reference for method calls
+        lua.pushLightUserdata(self); // [+p]
+        lua.setField(-2, "c_loader"); // pop
+
+        // Add methods
+        try Self.wrapCoyield(lua, "loader_open_file", Self.gOpenFile); // [+p]
+        lua.setField(-2, "open_file"); // pop
+        try Self.wrapCoyield(lua, "loader_close_file", Self.gCloseFile); // [+p]
+        lua.setField(-2, "close_file"); // pop
+        try Self.wrapCoyield(lua, "loader_add_entry", Self.gAddEntry); // [+p]
+        lua.setField(-2, "add_entry"); // pop
+        try Self.wrapCoyield(lua, "loader_finish_row", Self.gFinishRow); // [+p]
+        lua.setField(-2, "finish_row"); // pop
+
+        return 1; // return module table
+    }
+
+    /// Register the loader module in package.preload["ultar.loader"]
+    fn registerLoaderModule(self: *Self) !void {
+        _ = try self.lua.getGlobal("package"); // [+p]
+        _ = self.lua.getField(-1, "preload"); // [+p]
+
+        // Create closure with self as upvalue
+        self.lua.pushLightUserdata(self); // [+p] upvalue
+        self.lua.pushClosure(zlua.wrap(Self.loaderModuleLoader), 1); // pop upvalue, push closure
+
+        self.lua.setField(-2, "ultar.loader"); // pop closure
+        self.lua.pop(2); // pop preload, package
+    }
+
     fn initLua(self: *Self, spec: LuaLoaderSpec) !void {
         self.lua.openLibs();
         lua_rt.registerRt(self.lua) catch |err| return self.printLuaErr(err);
 
-        self.lua.createTable(0, 2); // [+p]
-        self.lua.pushLightUserdata(self); // [+p]
-        self.lua.setField(-2, "c_loader"); // pop the self
-        try Self.wrapCoyield(self.lua, "loader_open_file", Self.gOpenFile); // [+p]
-        self.lua.setField(-2, "open_file"); // pop the function
-        try Self.wrapCoyield(self.lua, "loader_close_file", Self.gCloseFile); // [+p]
-        self.lua.setField(-2, "close_file"); // pop the function
-        try Self.wrapCoyield(self.lua, "loader_add_entry", Self.gAddEntry); // [+p]
-        self.lua.setField(-2, "add_entry"); // pop the function
-        try Self.wrapCoyield(self.lua, "loader_finish_row", Self.gFinishRow); // [+p]
-        self.lua.setField(-2, "finish_row"); // pop the function
-        self.lua.setGlobal("g_loader"); // pop 1 & move to global
+        // Register ultar.loader module
+        self.registerLoaderModule() catch |err| return self.printLuaErr(err);
 
         // Compile src to bytecode & load into VM
         if (zlua.lang == .luau) {

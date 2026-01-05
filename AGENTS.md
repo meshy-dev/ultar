@@ -21,6 +21,7 @@ A file for [guiding coding agents](https://agents.md/).
 
 - Shared Zig code: `*.zig`
 - Python ABI3 bindings: `python/`
+- Lua LSP type stubs: `lua-types/`
 - Webapp, zig version: `ultar_httpd/`
 
 ## Zig documentation and std are authoritative

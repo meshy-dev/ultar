@@ -9,14 +9,9 @@
 
 ## Contribute / Develop
 
-The project is built with `zig`. You should be able to build it with a `zig>=0.14` install.
-
-Don't know how to install `zig`? This project is also setup with `pixi` to manage a `conda-forge` based environment.
-
-Given that webdataset & ML is very python based, having `pixi` is a good idea anyways.
+The project is built with `zig`. You should be able to build it with a `zig>=0.15` install.
 
 ```sh
-pixi shell
 zig build -Doptimize=ReleaseFast
 ```
 
@@ -45,3 +40,103 @@ It runs sligthly too fast for local NVMe storage so I didn't bother a instrument
 Simple single-process event loop based IO provided by `libxev` & thus wielding the full power of `IO_URING`.
 
 Have I mentioned it's written with [zig](https://ziglang.org)
+
+## Python Bindings
+
+The `python/` directory contains ABI3-compatible Python bindings for the Lua dataloader.
+
+```bash
+# Build
+zig build python-bindings -Doptimize=ReleaseSafe
+
+# Build wheel
+python -m build --wheel --no-isolation python/
+
+# Install
+pip install python/dist/*.whl
+```
+
+See `python/README.md` for usage details.
+
+## Lua Scripting API
+
+The dataloader uses Lua scripts for flexible data loading pipelines. Scripts use standard Lua `require()` to import modules:
+
+```lua
+local loader = require("ultar.loader")
+local utix = require("ultar.utix")
+
+return {
+    init_ctx = function(rank, world_size, config)
+        return {
+            tar_path = config.tar_path,
+            idx_path = config.idx_path,
+        }
+    end,
+
+    row_generator = function(ctx)
+        local tar = loader:open_file(ctx.tar_path)
+        local idx = utix.open(ctx.idx_path)
+
+        for row in idx:iter() do
+            for i = 1, #row.keys do
+                if row.sizes[i] > 0 then
+                    loader:add_entry(tar, row.keys[i],
+                        row.offset + row.offsets[i], row.sizes[i])
+                end
+            end
+            loader:finish_row()
+        end
+
+        loader:close_file(tar)
+    end,
+}
+```
+
+### Available Modules
+
+| Module | Description |
+|--------|-------------|
+| `ultar.loader` | Async data loading interface - open files, add entries, finish rows |
+| `ultar.utix` | Read `.utix` (msgpack) index files |
+| `ultar.scandir` | Directory scanning utilities |
+
+### LSP Integration
+
+We ship type stubs for [LuaLS](https://luals.github.io/) (the standard Lua language server). This provides:
+
+- **Autocompletion** for all ultar modules
+- **Hover documentation** with function signatures
+- **Type checking** for parameters
+- **Go to definition** support
+
+#### Quick Setup (Recommended)
+
+If you've installed `ultar-dataloader` via pip, use the CLI to set up LSP:
+
+```bash
+cd your-project/
+ultar-dataloader init-lsp
+```
+
+This creates a `.luarc.json` pointing to the type stubs shipped with the package.
+
+#### Manual Setup
+
+For development or custom setups, add `.luarc.json` to your project root:
+
+```json
+{
+  "$schema": "https://raw.githubusercontent.com/LuaLS/vscode-lua/master/setting/schema.json",
+  "workspace.library": [
+    "/path/to/ultar/lua-types"
+  ],
+  "runtime.version": "LuaJIT"
+}
+```
+
+Or get the path programmatically:
+
+```bash
+ultar-dataloader types-path
+```

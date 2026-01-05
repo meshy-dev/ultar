@@ -90,6 +90,20 @@ pub fn build(b: *std.Build) void {
     const install_python = b.addInstallArtifact(python_lib, .{});
     python_step.dependOn(&install_python.step);
 
+    // Also copy to python/src/ultar_dataloader/ for development (PYTHONPATH usage)
+    // This ensures `PYTHONPATH=python/src python ...` always uses the latest build
+    const copy_to_dev = b.addSystemCommand(&.{ "cp", "-f" });
+    copy_to_dev.addArtifactArg(python_lib);
+    copy_to_dev.addArg("python/src/ultar_dataloader/_native.abi3.so");
+    copy_to_dev.step.dependOn(&python_lib.step);
+    python_step.dependOn(&copy_to_dev.step);
+
+    // Copy lua-types to python package for development
+    const copy_lua_types = b.addSystemCommand(&.{
+        "cp", "-rf", "lua-types/ultar", "python/src/ultar_dataloader/lua-types/",
+    });
+    python_step.dependOn(&copy_lua_types.step);
+
     // Add Zap dependency
     const zap = b.dependency("zap", .{
         .target = target,

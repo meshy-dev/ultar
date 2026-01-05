@@ -11,6 +11,9 @@ dependencies = []
 torch = ["torch>=2.0"]
 dev = ["torch>=2.0", "pytest>=7.0"]
 
+[project.scripts]
+ultar-dataloader = "ultar_dataloader.cli:main"
+
 [build-system]
 requires = ["setuptools>=61", "wheel"]
 build-backend = "setuptools.build_meta"
@@ -20,7 +23,7 @@ packages = ["ultar_dataloader"]
 package-dir = {"" = "src"}
 
 [tool.setuptools.package-data]
-ultar_dataloader = ["*.so", "*.pyd", "*.dll", "*.pyi", "py.typed"]
+ultar_dataloader = ["*.so", "*.pyd", "*.dll", "*.pyi", "py.typed", "lua-types/**/*.lua"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

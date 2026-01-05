@@ -6,6 +6,9 @@ build/
 dist/
 *.egg-info/
 
+# Copied from root lua-types/ during build
+src/ultar_dataloader/lua-types/
+
 # Python bytecode
 __pycache__/
 *.py[cod]

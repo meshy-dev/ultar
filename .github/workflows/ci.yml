@@ -40,22 +40,16 @@ jobs:
             -Dtarget=${{ matrix.target.triplet }} \
             -Dcpu=${{ matrix.target.cpu }} \
             --summary all
-          mv ./zig-out/bin/indexer ./indexer-${{ matrix.target.name }}
-          mv ./zig-out/bin/ultar_httpd ./ultar_httpd-${{ matrix.target.name }}
 
       - name: Test
         run: |
           zig build test --summary all
 
-      - name: Upload binaries to GitHub Release
-        if: github.event_name == 'release'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh release upload "${{ github.ref_name }}" \
-            ./indexer-${{ matrix.target.name }} \
-            ./ultar_httpd-${{ matrix.target.name }} \
-            --clobber
+      - name: Upload CLI artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: cli-${{ matrix.target.name }}
+          path: zig-out/bin/
 
   # Build Python wheels (ABI3 stable ABI, Python 3.11+)
   python-wheels:
@@ -168,9 +162,33 @@ jobs:
           name: wheel-${{ matrix.target.platform }}
           path: python/dist/*.whl
 
-      - name: Upload wheel to GitHub Release
-        if: github.event_name == 'release'
+  # Upload all artifacts to GitHub Release
+  release:
+    name: Upload Release Artifacts
+    if: github.event_name == 'release'
+    needs: [build, python-wheels]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: Package CLI binaries
+        run: |
+          mkdir -p release
+          # Package each CLI target into a tar.gz
+          for dir in artifacts/cli-*; do
+            target=$(basename "$dir" | sed 's/cli-//')
+            tar -czvf "release/ultar-cli-${target}.tar.gz" -C "$dir" .
+          done
+          # Copy wheels directly
+          cp artifacts/wheel-*/*.whl release/
+          ls -la release/
+
+      - name: Upload to GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
-          gh release upload "${{ github.ref_name }}" python/dist/*.whl --clobber
+          gh release upload "${{ github.ref_name }}" release/* --clobber

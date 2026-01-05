@@ -77,6 +77,7 @@ jobs:
       - name: Determine version
         id: version
         run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           if git describe --exact-match --tags HEAD 2>/dev/null; then
             VERSION=$(git describe --exact-match --tags HEAD | sed 's/^v//')
           else

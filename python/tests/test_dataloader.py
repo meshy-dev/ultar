@@ -12,22 +12,26 @@ DATA_DIR = Path("/data/datasets/meshylatv/avocado_20251017/val")
 INDEX_FILE = DATA_DIR / "shard_0000_of_0256.base.tar.utix"
 TAR_FILE = DATA_DIR / "shard_0000_of_0256.base.tar"
 
-# Lua script that loads data from tar files using g_config
-# Config values are passed from Python as strings
+# Lua script that loads data from tar files
+# Config is passed as 3rd argument to init_ctx
 LUA_SCRIPT = """
 return {
-    init_ctx = function(rank, world_size)
-        return {}
+    init_ctx = function(rank, world_size, config)
+        -- Store config values in context for row_generator
+        return {
+            tar_path = config.tar_path,
+            idx_path = config.idx_path,
+            max_rows = tonumber(config.max_rows) or -1,
+        }
     end,
 
     row_generator = function(ctx)
-        local tar = g_loader:open_file(g_config.tar_path)
-        local utix = msgpack_unpacker(g_config.idx_path)
-        local max_rows = tonumber(g_config.max_rows) or -1
+        local tar = g_loader:open_file(ctx.tar_path)
+        local utix = msgpack_unpacker(ctx.idx_path)
 
         local row_count = 0
         for row in utix:iter() do
-            if max_rows > 0 and row_count >= max_rows then
+            if ctx.max_rows > 0 and row_count >= ctx.max_rows then
                 break
             end
 

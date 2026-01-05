@@ -12,16 +12,16 @@ pip install ultar-dataloader
 
 ### Building from source
 
-Requires Zig 0.15+ (or use pixi which manages it).
+Requires Zig 0.15+.
 
 ```bash
-# Using pixi (recommended)
-pixi run build-wheel
-pip install python/dist/*.whl
+# Build native extension
+zig build python-bindings -Doptimize=ReleaseSafe
 
-# Or manually with zig
-zig build python-bindings -Doptimize=ReleaseFast
+# Build wheel
 python -m build --wheel --no-isolation python/
+
+# Install
 pip install python/dist/*.whl
 ```
 
@@ -31,21 +31,24 @@ pip install python/dist/*.whl
 from ultar_dataloader import DataLoader
 
 # Define Lua loading script
-# File paths are passed via the config dict and accessed as g_config in Lua
+# Config dict is passed as the 3rd argument to init_ctx
 LUA_SCRIPT = """
 return {
-    init_ctx = function(rank, world_size)
-        return {}
+    init_ctx = function(rank, world_size, config)
+        -- Store config in context for use in row_generator
+        return {
+            tar_path = config.tar_path,
+            idx_path = config.idx_path,
+            max_rows = tonumber(config.max_rows) or -1,
+        }
     end,
     row_generator = function(ctx)
-        -- Access config values passed from Python
-        local tar = g_loader:open_file(g_config.tar_path)
-        local utix = msgpack_unpacker(g_config.idx_path)
-        local max_rows = tonumber(g_config.max_rows) or -1
+        local tar = g_loader:open_file(ctx.tar_path)
+        local utix = msgpack_unpacker(ctx.idx_path)
 
         local row_count = 0
         for row in utix:iter() do
-            if max_rows > 0 and row_count >= max_rows then break end
+            if ctx.max_rows > 0 and row_count >= ctx.max_rows then break end
 
             for i = 1, #row.keys do
                 if row.sizes[i] > 0 then  -- Skip zero-size directory markers
@@ -83,9 +86,9 @@ for row in loader:
 
 ## Features
 
-- **High performance**: Uses io_uring (via libxev) for async I/O (~2-4 GB/s throughput)
+- **High performance**: Uses io_uring (via libxev) for async I/O (~5 GB/s throughput)
 - **Lua scripting**: Flexible data loading pipelines with full control
-- **Config passing**: Pass Python dicts to Lua via `g_config` global table
+- **Config passing**: Pass Python dicts to Lua via `init_ctx(rank, world_size, config)`
 - **Python native extension**: Proper GC integration, no ctypes issues
 - **ABI3 compatible**: Works with Python 3.11+
 
@@ -96,7 +99,7 @@ for row in loader:
 ```python
 DataLoader(
     src: str,                           # Lua script source code
-    config: Mapping[str, str] | None,   # Config dict, available as g_config in Lua
+    config: Mapping[str, str] | None,   # Config dict, passed to init_ctx as 3rd arg
     rank: int = 0,                      # Process rank for distributed loading
     world_size: int = 1,                # Total processes
     debug: bool = False,                # Enable debug logging
@@ -120,15 +123,12 @@ key in row      # Check if key exists
 ## Development
 
 ```bash
-# Install pixi environment
-pixi install
-
 # Build native extension
-pixi run build-native
+zig build python-bindings -Doptimize=ReleaseSafe
 
 # Development install
-pixi run dev-install
+pip install --no-build-isolation -e python/
 
 # Run tests
-pixi run python python/tests/test_dataloader.py
+python python/tests/test_dataloader.py
 ```

@@ -27,7 +27,7 @@ class LoadedRow:
     A row of data loaded by the DataLoader.
 
     Provides dict-like access to the data entries by key name or index.
-    Each entry contains raw bytes that can be decoded as needed.
+    Each entry is returned as a ``bytes`` object.
     """
 
     __slots__ = ("_row",)
@@ -58,6 +58,7 @@ class LoadedRow:
             return False
 
     def __getitem__(self, key: str | int) -> bytes:
+        """Get entry data as bytes."""
         return self._row[key]
 
     def __iter__(self) -> Iterator[str]:
@@ -75,20 +76,21 @@ class DataLoader:
     coroutines for flexible data loading logic. It avoids the GC-related
     issues of ctypes bindings by using Python's native extension API.
 
-    The optional `config` parameter allows passing a Python dict to Lua
-    as the global `g_config` table, enabling dynamic configuration.
+    The optional `config` parameter allows passing a Python dict to Lua.
+    It is passed as the 3rd argument to `init_ctx(rank, world_size, config)`.
 
     Example:
         >>> lua_script = '''
         ... return {
-        ...     init_ctx = function(rank, world_size)
-        ...         -- Access config passed from Python
-        ...         local tar_path = g_config.tar_path
-        ...         local idx_path = g_config.idx_path
-        ...         return { tar = tar_path, idx = idx_path }
+        ...     init_ctx = function(rank, world_size, config)
+        ...         -- Config passed from Python as 3rd argument
+        ...         return {
+        ...             tar_path = config.tar_path,
+        ...             idx_path = config.idx_path,
+        ...         }
         ...     end,
         ...     row_generator = function(ctx)
-        ...         local f = g_loader:open_file(ctx.tar)
+        ...         local f = g_loader:open_file(ctx.tar_path)
         ...         -- ... load data ...
         ...         g_loader:close_file(f)
         ...     end,

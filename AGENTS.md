@@ -10,12 +10,12 @@ A file for [guiding coding agents](https://agents.md/).
 - **Formatting (Zig)**: `zig fmt .`
 - **Fetching New Dependencies** `zig fetch --save git+https://...`
 
-### Python Package (using pixi)
+### Python Package
 
-- **Build native extension:** `pixi run build-native`
-- **Build wheel:** `pixi run build-wheel`
-- **Dev install:** `pixi run dev-install`
-- **Run tests:** `pixi run python python/tests/test_dataloader.py`
+- **Build native extension:** `zig build python-bindings -Doptimize=ReleaseSafe`
+- **Build wheel:** `python -m build --wheel --no-isolation python/`
+- **Dev install:** `pip install --no-build-isolation -e python/`
+- **Run tests:** `python python/tests/test_dataloader.py`
 
 ## Directory Structure
 

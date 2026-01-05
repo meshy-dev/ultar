@@ -450,6 +450,14 @@ fn loadedRowLen(self_obj: ?*py.PyObject) callconv(.c) py.Py_ssize_t {
     return 0;
 }
 
+/// Get entry data as a Python bytes object (copies data).
+/// Memory-safe: the bytes object owns its data independently of the LoadedRow.
+fn getEntryBytes(row: *LoadedRow, idx: usize) ?*py.PyObject {
+    const data_ptr: [*]const u8 = @ptrCast(row.data[idx]);
+    const size: py.Py_ssize_t = @intCast(row.sizes[idx]);
+    return py.PyBytes_FromStringAndSize(@ptrCast(data_ptr), size);
+}
+
 fn loadedRowSubscript(self_obj: ?*py.PyObject, key: ?*py.PyObject) callconv(.c) ?*py.PyObject {
     const self: *LoadedRowObject = @ptrCast(@alignCast(self_obj));
 
@@ -468,10 +476,7 @@ fn loadedRowSubscript(self_obj: ?*py.PyObject, key: ?*py.PyObject) callconv(.c) 
             py.PyErr_SetString(py.PyExc_IndexError, "index out of range");
             return null;
         }
-        const i: usize = @intCast(idx);
-        const data_ptr: [*]const u8 = @ptrCast(row.data[i]);
-        const size: usize = @intCast(row.sizes[i]);
-        return py.PyBytes_FromStringAndSize(@ptrCast(data_ptr), @intCast(size));
+        return getEntryBytes(row, @intCast(idx));
     }
 
     // String key access
@@ -488,9 +493,7 @@ fn loadedRowSubscript(self_obj: ?*py.PyObject, key: ?*py.PyObject) callconv(.c) 
         const entry_key: [*:0]const u8 = @ptrCast(row.keys[i]);
         const entry_key_slice = std.mem.span(entry_key);
         if (std.mem.eql(u8, entry_key_slice, key_slice)) {
-            const data_ptr: [*]const u8 = @ptrCast(row.data[i]);
-            const size: usize = @intCast(row.sizes[i]);
-            return py.PyBytes_FromStringAndSize(@ptrCast(data_ptr), @intCast(size));
+            return getEntryBytes(row, i);
         }
     }
 

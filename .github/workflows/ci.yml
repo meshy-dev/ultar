@@ -84,10 +84,17 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install Python build dependencies
+      - name: Install Python build dependencies (container)
+        if: matrix.target.container != ''
         run: |
           python3 -m pip install --upgrade pip
           python3 -m pip install build wheel setuptools
+
+      - name: Install Python build dependencies (macOS)
+        if: matrix.target.container == ''
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install build wheel setuptools
 
       - name: Build native extension
         run: |
@@ -96,11 +103,17 @@ jobs:
             -Dcpu=${{ matrix.target.cpu }} \
             --summary all
         env:
-          PYTHON: python3
+          PYTHON: ${{ matrix.target.container != '' && 'python3' || 'python' }}
 
-      - name: Build wheel
+      - name: Build wheel (container)
+        if: matrix.target.container != ''
         run: |
           python3 -m build --wheel --no-isolation python/
+
+      - name: Build wheel (macOS)
+        if: matrix.target.container == ''
+        run: |
+          python -m build --wheel --no-isolation python/
 
       - name: Rename wheel to target platform
         run: |

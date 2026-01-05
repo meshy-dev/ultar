@@ -115,8 +115,10 @@ pub const LuaDataLoader = struct {
     load_rid_to_row: std.AutoArrayHashMapUnmanaged(u64, *Row),
 
     last_instant: std.time.Instant,
+    last_log_instant: std.time.Instant,
     mbps_smoothed: f64 = 0.0,
-    rows_delivered: usize = 0,
+    mbps_period_max: f64 = 0.0,
+    samples_count: u64 = 0,
 
     const max_floating_rows: usize = 16;
 
@@ -394,11 +396,23 @@ pub const LuaDataLoader = struct {
                     const delta = now.since(self.last_instant);
                     self.last_instant = now;
                     const mbps = @as(f64, @floatFromInt(bytes)) * 1e-6 / (@as(f64, @floatFromInt(delta)) * 1e-9);
-                    self.mbps_smoothed = mbps * 0.9 + self.mbps_smoothed * 0.1;
-                    if (self.rows_delivered % 100 == 99) {
-                        logger.info("{d:.1} MBytes/s (Instant: {d:.1})", .{ self.mbps_smoothed, mbps });
+
+                    // Adaptive smoothing: alpha = 1/min(samples, 100)
+                    self.samples_count += 1;
+                    const smoothing_samples = @min(self.samples_count, 100);
+                    const alpha = 1.0 / @as(f64, @floatFromInt(smoothing_samples));
+                    self.mbps_smoothed = alpha * mbps + (1.0 - alpha) * self.mbps_smoothed;
+
+                    // Track max throughput during this logging period
+                    self.mbps_period_max = @max(self.mbps_period_max, mbps);
+
+                    // Log throughput every 60 seconds
+                    const since_last_log = now.since(self.last_log_instant);
+                    if (since_last_log >= 60 * std.time.ns_per_s) {
+                        logger.info("{d:.1} MBytes/s (Period max: {d:.1})", .{ self.mbps_smoothed, self.mbps_period_max });
+                        self.last_log_instant = now;
+                        self.mbps_period_max = 0.0; // Reset for next period
                     }
-                    self.rows_delivered += 1;
 
                     logger.debug("Returning row @ {}", .{&row.ext_row});
                     return &row.ext_row;
@@ -437,18 +451,6 @@ pub const LuaDataLoader = struct {
         self.lua.setField(-2, "finish_row"); // pop the function
         self.lua.setGlobal("g_loader"); // pop 1 & move to global
 
-        // Create g_config table from config key-value pairs
-        self.lua.createTable(@intCast(spec.config_count), 0); // [+p]
-        if (spec.config_keys != null and spec.config_values != null) {
-            for (0..spec.config_count) |i| {
-                const key: [*:0]const u8 = @ptrCast(spec.config_keys[i]);
-                const value: [*:0]const u8 = @ptrCast(spec.config_values[i]);
-                _ = self.lua.pushString(std.mem.span(value)); // [+p]
-                self.lua.setField(-2, std.mem.span(key)); // pop value
-            }
-        }
-        self.lua.setGlobal("g_config"); // pop 1 & move to global
-
         // Compile src to bytecode & load into VM
         if (zlua.lang == .luau) {
             const alloc = self.lua.allocator();
@@ -482,10 +484,23 @@ pub const LuaDataLoader = struct {
         self.lua.pop(1); // Get rid of the table
 
         // Initialize the user provided context
+        // Call init_ctx(rank, world_size, config)
         _ = self.lua.rawGetIndex(zlua.registry_index, self.u_loader_fn.init_ctx);
         lua_rt.pushUnsigned(self.lua, @intCast(spec.rank));
         lua_rt.pushUnsigned(self.lua, @intCast(spec.world_size));
-        self.lua.protectedCall(.{ .args = 2, .results = 1 }) catch |err| return self.printLuaErr(err);
+
+        // Push config table as 3rd argument
+        self.lua.createTable(@intCast(spec.config_count), 0); // [+p]
+        if (spec.config_keys != null and spec.config_values != null) {
+            for (0..spec.config_count) |i| {
+                const key: [*:0]const u8 = @ptrCast(spec.config_keys[i]);
+                const value: [*:0]const u8 = @ptrCast(spec.config_values[i]);
+                _ = self.lua.pushString(std.mem.span(value)); // [+p]
+                self.lua.setField(-2, std.mem.span(key)); // pop value
+            }
+        }
+
+        self.lua.protectedCall(.{ .args = 3, .results = 1 }) catch |err| return self.printLuaErr(err);
         self.u_ctx = self.luaPopAndRef() catch |err| return self.printLuaErr(err); // pop & store ref of ret value (user context)
 
         // Setup the generator as a coroutine
@@ -497,7 +512,8 @@ pub const LuaDataLoader = struct {
 
     pub fn init(spec: LuaLoaderSpec, alloc: std.mem.Allocator) !*Self {
         var self = try alloc.create(Self);
-        self.* = .{ .alloc = alloc, .load_rid_to_row = try std.AutoArrayHashMapUnmanaged(u64, *Row).init(alloc, &.{}, &.{}), .last_instant = try std.time.Instant.now() };
+        const now = try std.time.Instant.now();
+        self.* = .{ .alloc = alloc, .load_rid_to_row = try std.AutoArrayHashMapUnmanaged(u64, *Row).init(alloc, &.{}, &.{}), .last_instant = now, .last_log_instant = now };
         errdefer alloc.destroy(self);
 
         try self.newInprogressRow();

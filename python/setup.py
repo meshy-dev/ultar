@@ -44,7 +44,7 @@ class CopyPrebuiltExtension(build_ext):
         )
 
 
-# Declare extension with py_limited_api=True for ABI3 wheel tag
+# Declare extension with py_limited_api for ABI3 wheel tag (Python 3.11+)
 _native = Extension(
     "ultar_dataloader._native",
     sources=[],  # No sources - we copy pre-built
@@ -54,4 +54,9 @@ _native = Extension(
 setup(
     ext_modules=[_native],
     cmdclass={"build_ext": CopyPrebuiltExtension},
+    options={
+        "bdist_wheel": {
+            "py_limited_api": "cp311",
+        },
+    },
 )

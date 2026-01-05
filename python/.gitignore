@@ -1,0 +1,29 @@
+# Build artifacts
+*.so
+*.pyd
+*.dll
+build/
+dist/
+*.egg-info/
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Type checker cache
+.mypy_cache/
+.pytype/
+*.typed
+
+# Test/coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# IDE
+.idea/
+*.swp
+*.swo
+*~
+

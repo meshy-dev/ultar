@@ -14,6 +14,11 @@ pub const LuaLoaderSpec = extern struct {
     rank: c_uint,
     world_size: c_uint,
     debug: bool,
+    // Key-value config passed from Python as parallel arrays
+    // All values are strings; Lua script can convert as needed
+    config_keys: [*c]const [*c]const u8 = null,
+    config_values: [*c]const [*c]const u8 = null,
+    config_count: c_uint = 0,
 };
 
 const c_u8ptr = [*c]const u8;
@@ -432,6 +437,18 @@ pub const LuaDataLoader = struct {
         self.lua.setField(-2, "finish_row"); // pop the function
         self.lua.setGlobal("g_loader"); // pop 1 & move to global
 
+        // Create g_config table from config key-value pairs
+        self.lua.createTable(@intCast(spec.config_count), 0); // [+p]
+        if (spec.config_keys != null and spec.config_values != null) {
+            for (0..spec.config_count) |i| {
+                const key: [*:0]const u8 = @ptrCast(spec.config_keys[i]);
+                const value: [*:0]const u8 = @ptrCast(spec.config_values[i]);
+                _ = self.lua.pushString(std.mem.span(value)); // [+p]
+                self.lua.setField(-2, std.mem.span(key)); // pop value
+            }
+        }
+        self.lua.setGlobal("g_config"); // pop 1 & move to global
+
         // Compile src to bytecode & load into VM
         if (zlua.lang == .luau) {
             const alloc = self.lua.allocator();
@@ -521,7 +538,7 @@ pub const LuaDataLoader = struct {
     }
 };
 
-const LuaLoaderCCtx = struct {
+pub const LuaLoaderCCtx = struct {
     alloc_ctx: union(enum) {
         rel: struct {},
         debug: std.heap.DebugAllocator(.{}),
@@ -551,14 +568,14 @@ fn createLuaLoader(spec: LuaLoaderSpec) !*LuaLoaderCCtx {
     }
 }
 
-export fn ultarCreateLuaLoader(spec: LuaLoaderSpec) ?*LuaLoaderCCtx {
+pub export fn ultarCreateLuaLoader(spec: LuaLoaderSpec) ?*LuaLoaderCCtx {
     return createLuaLoader(spec) catch {
         std.debug.dumpCurrentStackTrace(null);
         return @ptrFromInt(0);
     };
 }
 
-export fn ultarDestroyLuaLoader(c: *LuaLoaderCCtx) void {
+pub export fn ultarDestroyLuaLoader(c: *LuaLoaderCCtx) void {
     c.loader.deinit();
     c.alloc.destroy(c.loader);
     const alloc = c.alloc_ctx;
@@ -571,7 +588,7 @@ export fn ultarDestroyLuaLoader(c: *LuaLoaderCCtx) void {
     std.heap.c_allocator.destroy(c);
 }
 
-export fn ultarNextRow(c: *LuaLoaderCCtx) ?*LoadedRow {
+pub export fn ultarNextRow(c: *LuaLoaderCCtx) ?*LoadedRow {
     const row = c.loader.nextRow() catch |err| {
         logger.err("Error getting next row: {}", .{err});
         return @ptrFromInt(0);
@@ -582,6 +599,6 @@ export fn ultarNextRow(c: *LuaLoaderCCtx) ?*LoadedRow {
     return row;
 }
 
-export fn ultarReclaimRow(c: *LuaLoaderCCtx, c_row: *LoadedRow) void {
+pub export fn ultarReclaimRow(c: *LuaLoaderCCtx, c_row: *LoadedRow) void {
     c.loader.reclaimRow(c_row);
 }

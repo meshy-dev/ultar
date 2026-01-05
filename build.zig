@@ -6,6 +6,11 @@ pub fn build(b: *std.Build) void {
 
     const engine = b.option([]const u8, "lua", "Use specified lua engine (default to luajit). Available: luajit, luau, lua54") orelse "luajit";
 
+    // Python bindings options
+    const build_python = b.option(bool, "python-bindings", "Build Python ABI3 extension module") orelse false;
+    const python_exe = b.option([]const u8, "python", "Python interpreter path for bindings") orelse
+        std.process.getEnvVarOwned(b.allocator, "PYTHON") catch null;
+
     const clap = b.dependency("clap", .{ .target = target, .optimize = optimize });
     const xev = b.dependency("libxev", .{ .target = target, .optimize = optimize });
 
@@ -63,6 +68,28 @@ pub fn build(b: *std.Build) void {
     lib_dataloader.root_module.addImport("zlua", zlua.module("zlua"));
     b.installArtifact(lib_dataloader);
 
+    // Create lua_dataloader module for sharing with Python bindings
+    const lua_dataloader_mod = b.createModule(.{
+        .root_source_file = b.path("lua_dataloader.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .pic = true,
+    });
+    lua_dataloader_mod.addImport("xev", xev.module("xev"));
+    lua_dataloader_mod.addImport("zlua", zlua.module("zlua"));
+
+    // Python bindings (optional, enabled with -Dpython-bindings=true)
+    if (build_python) {
+        buildPythonBindings(b, target, optimize, lua_dataloader_mod, python_exe);
+    }
+
+    // Named step for building Python bindings
+    const python_step = b.step("python-bindings", "Build Python ABI3 extension module");
+    const python_lib = buildPythonBindingsStep(b, target, optimize, lua_dataloader_mod, python_exe);
+    const install_python = b.addInstallArtifact(python_lib, .{});
+    python_step.dependOn(&install_python.step);
+
     // Add Zap dependency
     const zap = b.dependency("zap", .{
         .target = target,
@@ -116,4 +143,105 @@ pub fn build(b: *std.Build) void {
 
     const run_unit_tests = b.addRunArtifact(unit_tests);
     test_step.dependOn(&run_unit_tests.step);
+}
+
+/// Build Python ABI3 extension and install it
+fn buildPythonBindings(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    lua_dataloader_mod: *std.Build.Module,
+    python_exe: ?[]const u8,
+) void {
+    const lib = buildPythonBindingsStep(b, target, optimize, lua_dataloader_mod, python_exe);
+    b.installArtifact(lib);
+}
+
+/// Create the Python bindings library artifact
+fn buildPythonBindingsStep(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    lua_dataloader_mod: *std.Build.Module,
+    python_exe: ?[]const u8,
+) *std.Build.Step.Compile {
+    // Get Python include path
+    const python_include = getPythonIncludePath(b.allocator, python_exe) orelse {
+        std.log.err(
+            \\Failed to get Python include path.
+            \\
+            \\Make sure Python is installed and try one of:
+            \\  - zig build -Dpython=/path/to/python3 -Dpython-bindings=true
+            \\  - PYTHON=/path/to/python3 zig build -Dpython-bindings=true
+            \\  - Add python3 to your PATH
+        , .{});
+        @panic("Python include path not found");
+    };
+
+    const python_mod = b.createModule(.{
+        .root_source_file = b.path("python/python.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .pic = true,
+    });
+
+    // Add Python include path
+    python_mod.addSystemIncludePath(.{ .cwd_relative = python_include });
+
+    // Import lua_dataloader module
+    python_mod.addImport("lua_dataloader", lua_dataloader_mod);
+
+    const lib = b.addLibrary(.{
+        .linkage = .dynamic,
+        .name = "_native.abi3",
+        .root_module = python_mod,
+    });
+
+    // Allow undefined symbols - Python symbols are resolved at runtime
+    lib.root_module.addRPathSpecial("$ORIGIN");
+    lib.linker_allow_shlib_undefined = true;
+
+    return lib;
+}
+
+/// Get Python include path by running the interpreter
+fn getPythonIncludePath(allocator: std.mem.Allocator, python_exe: ?[]const u8) ?[]const u8 {
+    const get_include_cmd = "import sysconfig; print(sysconfig.get_path('include'), end='')";
+
+    if (python_exe) |py| {
+        return runPythonCommand(allocator, py, get_include_cmd);
+    }
+
+    // Fallback: try common Python interpreters
+    const interpreters = [_][]const u8{ "python3", "python" };
+    for (interpreters) |python| {
+        if (runPythonCommand(allocator, python, get_include_cmd)) |result| {
+            return result;
+        }
+    }
+    return null;
+}
+
+/// Run a Python command and return stdout if successful
+fn runPythonCommand(allocator: std.mem.Allocator, python: []const u8, cmd: []const u8) ?[]const u8 {
+    const result = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &.{ python, "-c", cmd },
+    }) catch return null;
+
+    defer allocator.free(result.stderr);
+
+    // Check if process exited successfully
+    switch (result.term) {
+        .Exited => |code| {
+            if (code == 0 and result.stdout.len > 0) {
+                return result.stdout;
+            }
+        },
+        else => {},
+    }
+
+    allocator.free(result.stdout);
+    return null;
 }

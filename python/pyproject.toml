@@ -1,0 +1,29 @@
+[project]
+name = "ultar-dataloader"
+version = "0.0.1"
+description = "Fast async dataloader implemented in Zig with Lua scripting"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+dependencies = []
+
+[project.optional-dependencies]
+torch = ["torch>=2.0"]
+dev = ["torch>=2.0", "pytest>=7.0"]
+
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["ultar_dataloader"]
+package-dir = {"" = "src"}
+
+[tool.setuptools.package-data]
+ultar_dataloader = ["*.so", "*.pyd", "*.dll", "*.pyi", "py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]

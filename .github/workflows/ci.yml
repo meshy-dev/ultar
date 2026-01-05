@@ -17,24 +17,25 @@ jobs:
     strategy:
       matrix:
         target:
-          - { triplet: x86_64-linux-gnu.2.28, runner: ubuntu-22.04, lua: luajit }
-          - { triplet: aarch64-linux-gnu.2.28, runner: ubuntu-24.04-arm, lua: luajit }
-          - { triplet: aarch64-macos, runner: macos-latest, lua: lua54 }
+          - { triplet: x86_64-linux-gnu.2.28, runner: ubuntu-22.04, lua: luajit, cpu: x86_64_v3 }
+          - { triplet: aarch64-linux-gnu.2.28, runner: ubuntu-24.04-arm, lua: luajit, cpu: neoverse_v2 }
+          - { triplet: aarch64-macos, runner: macos-latest, lua: lua54, cpu: apple_m1 }
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
-      - name: Setup Zig
-        uses: mlugg/setup-zig@v2
+      - name: Setup Pixi
+        uses: prefix-dev/setup-pixi@v0.8.1
         with:
-          version: 0.15.1
+          pixi-version: v0.42.0
 
       - name: Build (ReleaseSafe, ${{ matrix.target.triplet }})
         run: |
-          zig build \
+          pixi run zig build \
             -Doptimize=ReleaseSafe \
             -Dtarget=${{ matrix.target.triplet }} \
+            -Dcpu=${{ matrix.target.cpu }} \
             -Dlua=${{ matrix.target.lua }} \
             --summary all
           mv ./zig-out/bin/indexer ./indexer-${{ matrix.target.triplet }}
@@ -45,13 +46,68 @@ jobs:
 
       - name: Test
         run: |
-          zig build test --summary all
+          pixi run zig build test --summary all
 
-      - name: Upload binaries to Release
+      - name: Upload binaries to GitHub Release
+        if: github.event_name == 'release'
         uses: softprops/action-gh-release@v2
-        if: github.ref_type == 'tag'
         with:
           files: |
             ./libdataloader-${{ matrix.target.triplet }}.so
             ./indexer-${{ matrix.target.triplet }}
             ./ultar_httpd-${{ matrix.target.triplet }}
+
+  # Build Python wheels (ABI3 stable ABI, Python 3.11+)
+  python-wheels:
+    name: Python wheel ${{ matrix.target.platform }}
+    runs-on: ${{ matrix.target.runner }}
+    strategy:
+      matrix:
+        target:
+          - { platform: manylinux_2_28_x86_64, runner: ubuntu-22.04, cpu: x86_64_v3 }
+          - { platform: manylinux_2_28_aarch64, runner: ubuntu-24.04-arm, cpu: neoverse_v2 }
+          - { platform: macosx_11_0_arm64, runner: macos-latest, cpu: apple_m1 }
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Pixi
+        uses: prefix-dev/setup-pixi@v0.8.1
+        with:
+          pixi-version: v0.42.0
+
+      - name: Build native extension
+        run: |
+          pixi run zig build python-bindings \
+            -Doptimize=ReleaseSafe \
+            -Dcpu=${{ matrix.target.cpu }} \
+            --summary all
+
+      - name: Build wheel
+        run: |
+          pixi run python -m build --wheel --no-isolation python/
+
+      - name: Rename wheel to target platform
+        run: |
+          cd python/dist
+          for whl in *.whl; do
+            # Replace the platform tag with the target platform
+            newname=$(echo "$whl" | sed -E "s/-(cp[0-9]+|py3)-abi3-[^.]+\.whl/-cp311-abi3-${{ matrix.target.platform }}.whl/")
+            if [ "$whl" != "$newname" ]; then
+              mv "$whl" "$newname"
+            fi
+          done
+          ls -la
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.target.platform }}
+          path: python/dist/*.whl
+
+      - name: Upload wheel to GitHub Release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: python/dist/*.whl

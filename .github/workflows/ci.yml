@@ -11,15 +11,17 @@ permissions:
   contents: write
 
 jobs:
+  # Build static binaries (indexer, ultar_httpd)
   build:
-    name: Build ${{ matrix.target.triplet }}
+    name: Build ${{ matrix.target.name }}
     runs-on: ${{ matrix.target.runner }}
     strategy:
       matrix:
         target:
-          - { triplet: x86_64-linux-gnu.2.28, runner: ubuntu-22.04, lua: luajit, cpu: x86_64_v3 }
-          - { triplet: aarch64-linux-gnu.2.28, runner: ubuntu-24.04-arm, lua: luajit, cpu: neoverse_v2 }
-          - { triplet: aarch64-macos, runner: macos-latest, lua: lua54, cpu: apple_m1 }
+          # Linux uses musl for fully static binaries
+          - { name: x86_64-linux, triplet: x86_64-linux-musl, runner: ubuntu-22.04, cpu: x86_64_v3 }
+          - { name: aarch64-linux, triplet: aarch64-linux-musl, runner: ubuntu-24.04-arm, cpu: neoverse_v2 }
+          - { name: aarch64-macos, triplet: aarch64-macos, runner: macos-latest, cpu: apple_m1 }
 
     steps:
       - name: Checkout code
@@ -36,13 +38,9 @@ jobs:
             -Doptimize=ReleaseSafe \
             -Dtarget=${{ matrix.target.triplet }} \
             -Dcpu=${{ matrix.target.cpu }} \
-            -Dlua=${{ matrix.target.lua }} \
             --summary all
-          mv ./zig-out/bin/indexer ./indexer-${{ matrix.target.triplet }}
-          mv ./zig-out/bin/ultar_httpd ./ultar_httpd-${{ matrix.target.triplet }}
-          if [[ "${{ matrix.target.triplet }}" =~ linux ]]; then
-            mv ./zig-out/lib/libdataloader.so ./libdataloader-${{ matrix.target.triplet }}.so
-          fi
+          mv ./zig-out/bin/indexer ./indexer-${{ matrix.target.name }}
+          mv ./zig-out/bin/ultar_httpd ./ultar_httpd-${{ matrix.target.name }}
 
       - name: Test
         run: |
@@ -53,9 +51,8 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            ./libdataloader-${{ matrix.target.triplet }}.so
-            ./indexer-${{ matrix.target.triplet }}
-            ./ultar_httpd-${{ matrix.target.triplet }}
+            ./indexer-${{ matrix.target.name }}
+            ./ultar_httpd-${{ matrix.target.name }}
 
   # Build Python wheels (ABI3 stable ABI, Python 3.11+)
   python-wheels:
@@ -118,6 +115,7 @@ jobs:
           zig build python-bindings \
             -Doptimize=ReleaseSafe \
             -Dcpu=${{ matrix.target.cpu }} \
+            -Dlua=lua54 \
             --summary all
         env:
           PYTHON: python

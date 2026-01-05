@@ -71,7 +71,8 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          fetch-tags: true  # For version detection in build.zig
+          fetch-depth: 0  # Full history needed for git describe --exact-match
+          fetch-tags: true
 
       - name: Setup Zig
         uses: mlugg/setup-zig@v2

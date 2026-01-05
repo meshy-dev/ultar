@@ -1,6 +1,6 @@
 .{
     .name = .ultar,
-    .version = "0.0.7",
+    .version = "0.1.0",
     .minimum_zig_version = "0.15.1",
     .fingerprint = 0x17f55a637e2667a4,
     .dependencies = .{

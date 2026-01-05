@@ -1,6 +1,6 @@
 [project]
 name = "ultar-dataloader"
-version = "0.0.1"
+dynamic = ["version"]
 description = "Fast async dataloader implemented in Zig with Lua scripting"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -15,8 +15,13 @@ dev = ["torch>=2.0", "pytest>=7.0"]
 ultar-dataloader = "ultar_dataloader.cli:main"
 
 [build-system]
-requires = ["setuptools>=61", "wheel"]
+requires = ["setuptools>=61", "wheel", "setuptools-scm>=8"]
 build-backend = "setuptools.build_meta"
+
+[tool.setuptools_scm]
+# Use git tags for versioning (e.g., v0.1.0 -> 0.1.0)
+version_scheme = "guess-next-dev"
+local_scheme = "no-local-version"
 
 [tool.setuptools]
 packages = ["ultar_dataloader"]

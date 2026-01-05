@@ -84,11 +84,16 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install Python build dependencies (container)
+      - name: Install Python build dependencies (manylinux)
         if: matrix.target.container != ''
         run: |
+          # Use Python 3.11 from manylinux's /opt/python
+          export PATH="/opt/python/cp311-cp311/bin:$PATH"
           python3 -m pip install --upgrade pip
           python3 -m pip install build wheel setuptools
+          # Verify Python is working
+          python3 --version
+          which python3
 
       - name: Install Python build dependencies (macOS)
         if: matrix.target.container == ''
@@ -96,18 +101,31 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install build wheel setuptools
 
-      - name: Build native extension
+      - name: Build native extension (manylinux)
+        if: matrix.target.container != ''
+        run: |
+          export PATH="/opt/python/cp311-cp311/bin:$PATH"
+          zig build python-bindings \
+            -Doptimize=ReleaseSafe \
+            -Dcpu=${{ matrix.target.cpu }} \
+            --summary all
+        env:
+          PYTHON: /opt/python/cp311-cp311/bin/python3
+
+      - name: Build native extension (macOS)
+        if: matrix.target.container == ''
         run: |
           zig build python-bindings \
             -Doptimize=ReleaseSafe \
             -Dcpu=${{ matrix.target.cpu }} \
             --summary all
         env:
-          PYTHON: ${{ matrix.target.container != '' && 'python3' || 'python' }}
+          PYTHON: python
 
-      - name: Build wheel (container)
+      - name: Build wheel (manylinux)
         if: matrix.target.container != ''
         run: |
+          export PATH="/opt/python/cp311-cp311/bin:$PATH"
           python3 -m build --wheel --no-isolation python/
 
       - name: Build wheel (macOS)

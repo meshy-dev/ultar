@@ -10,6 +10,8 @@ garbage collector, avoiding the GC-related issues with ctypes bindings.
 
 from __future__ import annotations
 
+from ultar_dataloader._version import __version__
+
 from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterator

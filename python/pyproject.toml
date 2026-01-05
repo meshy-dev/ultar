@@ -23,7 +23,7 @@ packages = ["ultar_dataloader"]
 package-dir = {"" = "src"}
 
 [tool.setuptools.package-data]
-ultar_dataloader = ["*.so", "*.pyd", "*.dll", "*.pyi", "py.typed", "lua-types/**/*.lua"]
+ultar_dataloader = ["*.so", "*.dylib", "*.pyd", "*.dll", "*.pyi", "py.typed", "lua-types/**/*.lua"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

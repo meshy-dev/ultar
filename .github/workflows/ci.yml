@@ -71,8 +71,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0  # Full history for setuptools-scm version detection
-          fetch-tags: true
+          fetch-tags: true  # For version detection in build.zig
 
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
@@ -91,7 +90,7 @@ jobs:
           # Use Python 3.11 from manylinux's /opt/python
           export PATH="/opt/python/cp311-cp311/bin:$PATH"
           python3 -m pip install --upgrade pip
-          python3 -m pip install build wheel setuptools setuptools-scm
+          python3 -m pip install build wheel setuptools
           # Verify Python is working
           python3 --version
           which python3
@@ -100,7 +99,7 @@ jobs:
         if: matrix.target.container == ''
         run: |
           python -m pip install --upgrade pip
-          python -m pip install build wheel setuptools setuptools-scm
+          python -m pip install build wheel setuptools
 
       - name: Build native extension (manylinux)
         if: matrix.target.container != ''

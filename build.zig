@@ -107,6 +107,25 @@ pub fn build(b: *std.Build) void {
     });
     python_step.dependOn(&copy_lua_types.step);
 
+    // Generate _version.py from build.zig.zon version + git info
+    // Version format: X.Y.Z or X.Y.Z+gSHORTSHA (if not on exact tag)
+    const base_version = @import("build.zig.zon").version;
+    const gen_version = b.addSystemCommand(&.{
+        "sh", "-c",
+        \\if git describe --exact-match --tags HEAD >/dev/null 2>&1; then
+        \\  echo '__version__ = "
+        ++ base_version ++
+            \\"' > python/src/ultar_dataloader/_version.py
+            \\else
+            \\  sha=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+            \\  echo "__version__ = \"
+        ++ base_version ++
+            \\+g${sha}\"" > python/src/ultar_dataloader/_version.py
+            \\fi
+        ,
+    });
+    python_step.dependOn(&gen_version.step);
+
     // Add Zap dependency
     const zap = b.dependency("zap", .{
         .target = target,

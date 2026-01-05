@@ -109,10 +109,13 @@ pub fn build(b: *std.Build) void {
 
     // Generate _version.py from build.zig.zon version + git info
     // Version format: X.Y.Z or X.Y.Z+gSHORTSHA (if not on exact tag)
+    // If ULTAR_VERSION env var is set, use that directly (for CI)
     const base_version = @import("build.zig.zon").version;
     const gen_version = b.addSystemCommand(&.{
         "sh", "-c",
-        \\if git describe --exact-match --tags HEAD >/dev/null 2>&1; then
+        \\if [ -n "$ULTAR_VERSION" ]; then
+        \\  echo "__version__ = \"$ULTAR_VERSION\"" > python/src/ultar_dataloader/_version.py
+        \\elif git describe --exact-match --tags HEAD >/dev/null 2>&1; then
         \\  echo '__version__ = "
         ++ base_version ++
             \\"' > python/src/ultar_dataloader/_version.py

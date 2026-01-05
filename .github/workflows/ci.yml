@@ -71,8 +71,20 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0  # Full history needed for git describe --exact-match
+          fetch-depth: 0
           fetch-tags: true
+
+      - name: Determine version
+        id: version
+        run: |
+          if git describe --exact-match --tags HEAD 2>/dev/null; then
+            VERSION=$(git describe --exact-match --tags HEAD | sed 's/^v//')
+          else
+            VERSION="${{ vars.BASE_VERSION || '0.1.0' }}+g$(git rev-parse --short HEAD)"
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "ULTAR_VERSION=$VERSION" >> $GITHUB_ENV
+          echo "Determined version: $VERSION"
 
       - name: Setup Zig
         uses: mlugg/setup-zig@v2

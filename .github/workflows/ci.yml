@@ -25,14 +25,14 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Setup Pixi
-        uses: prefix-dev/setup-pixi@v0.9.3
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
         with:
-          pixi-version: v0.62.2
+          version: 0.15.1
 
       - name: Build (ReleaseSafe, ${{ matrix.target.triplet }})
         run: |
-          pixi run zig build \
+          zig build \
             -Doptimize=ReleaseSafe \
             -Dtarget=${{ matrix.target.triplet }} \
             -Dcpu=${{ matrix.target.cpu }} \
@@ -46,7 +46,7 @@ jobs:
 
       - name: Test
         run: |
-          pixi run zig build test --summary all
+          zig build test --summary all
 
       - name: Upload binaries to GitHub Release
         if: github.event_name == 'release'
@@ -61,32 +61,46 @@ jobs:
   python-wheels:
     name: Python wheel ${{ matrix.target.platform }}
     runs-on: ${{ matrix.target.runner }}
+    container: ${{ matrix.target.container }}
     strategy:
       matrix:
         target:
-          - { platform: manylinux_2_28_x86_64, runner: ubuntu-22.04, cpu: x86_64_v3 }
-          - { platform: manylinux_2_28_aarch64, runner: ubuntu-24.04-arm, cpu: neoverse_v2 }
-          - { platform: macosx_11_0_arm64, runner: macos-latest, cpu: apple_m1 }
+          - { platform: manylinux_2_28_x86_64, runner: ubuntu-22.04, container: "quay.io/pypa/manylinux_2_28_x86_64", cpu: x86_64_v3 }
+          - { platform: manylinux_2_34_aarch64, runner: ubuntu-24.04-arm, container: "quay.io/pypa/manylinux_2_34_aarch64", cpu: neoverse_v2 }
+          - { platform: macosx_11_0_arm64, runner: macos-latest, container: "", cpu: apple_m1 }
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Setup Pixi
-        uses: prefix-dev/setup-pixi@v0.9.3
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
         with:
-          pixi-version: v0.62.2
+          version: 0.15.1
+
+      - name: Setup Python (macOS)
+        if: matrix.target.container == ''
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python build dependencies
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install build wheel setuptools
 
       - name: Build native extension
         run: |
-          pixi run zig build python-bindings \
+          zig build python-bindings \
             -Doptimize=ReleaseSafe \
             -Dcpu=${{ matrix.target.cpu }} \
             --summary all
+        env:
+          PYTHON: python3
 
       - name: Build wheel
         run: |
-          pixi run python -m build --wheel --no-isolation python/
+          python3 -m build --wheel --no-isolation python/
 
       - name: Rename wheel to target platform
         run: |

@@ -109,6 +109,11 @@ pub const LuaDataLoader = struct {
     in_progress_row: ?*Row = null,
     queue: std.DoublyLinkedList = .{},
     queue_len: usize = 0,
+
+    // Row buffer pool - protected by row_buf_mutex for thread safety
+    // Accessed by: internal loader thread (newInprogressRow, nextRow)
+    //              Python thread (reclaimRow via ultarReclaimRow)
+    row_buf_mutex: std.Thread.Mutex = .{},
     free_list: std.DoublyLinkedList = .{},
     num_floating_rows: usize = 0,
 
@@ -204,7 +209,10 @@ pub const LuaDataLoader = struct {
             self.queue_len += 1;
         }
 
+        self.row_buf_mutex.lock();
         const free_node_opt = self.free_list.popFirst();
+        self.row_buf_mutex.unlock();
+
         if (free_node_opt) |free_node| {
             var row: *Row = @fieldParentPtr("node", free_node);
             try row.reset();
@@ -371,9 +379,14 @@ pub const LuaDataLoader = struct {
                 if (first.num_fullfilled == first.entries.items.len) {
                     const node = self.queue.popFirst() orelse unreachable;
                     self.queue_len -= 1;
-                    self.num_floating_rows += 1;
-                    if (self.num_floating_rows > Self.max_floating_rows) {
-                        std.debug.panic("Too many floating (owned by client) rows > max: {}", .{Self.max_floating_rows});
+
+                    {
+                        self.row_buf_mutex.lock();
+                        defer self.row_buf_mutex.unlock();
+                        self.num_floating_rows += 1;
+                        if (self.num_floating_rows > Self.max_floating_rows) {
+                            std.debug.panic("Too many floating (owned by client) rows > max: {}", .{Self.max_floating_rows});
+                        }
                     }
                     const row: *Row = @fieldParentPtr("node", node);
                     const alloc = row.arena.allocator();
@@ -430,6 +443,10 @@ pub const LuaDataLoader = struct {
 
     pub fn reclaimRow(self: *Self, c_row: *LoadedRow) void {
         const row: *Row = @fieldParentPtr("ext_row", c_row);
+
+        self.row_buf_mutex.lock();
+        defer self.row_buf_mutex.unlock();
+
         self.free_list.append(&row.node);
         self.num_floating_rows -= 1;
     }

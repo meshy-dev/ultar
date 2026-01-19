@@ -1,3 +1,40 @@
+//! Python ABI3 bindings for ultar DataLoader.
+//!
+//! ## Object Hierarchy
+//!
+//! ```
+//! DataLoaderObject
+//! ├── ob_base: PyObject      (refcount managed by Python)
+//! └── loader: *LuaLoaderCCtx (native, destroyed in dealloc)
+//!
+//! LoadedRowObject
+//! ├── ob_base: PyObject          (refcount managed by Python)
+//! ├── parent: ?*DataLoaderObject (incref'd reference to parent)
+//! └── row: ?*LoadedRow           (native ptr, reclaimed to parent's loader)
+//! ```
+//!
+//! ## Reference Ownership
+//!
+//! - `DataLoaderObject`: Created by `tp_new`, returned to Python with refcount=1.
+//!   Caller owns it. On dealloc, destroys the native loader.
+//!
+//! - `LoadedRowObject`: Created by `dataLoaderNext`, returned with refcount=1.
+//!   Holds an incref'd reference to its parent `DataLoaderObject` to keep it alive.
+//!   On dealloc, reclaims the native row to the parent's loader, then decrefs parent.
+//!
+//! - No reference cycles: LoadedRow → DataLoader (one-way ownership).
+//!
+//! ## Error Handling Pattern
+//!
+//! Internal functions use Zig error semantics (`PyError!T`) with `errdefer` for cleanup.
+//! C ABI wrappers catch errors and set Python exceptions.
+//!
+//! ## Thread Safety
+//!
+//! - `ultarNextRow` releases the GIL during blocking I/O.
+//! - `ultarReclaimRow` is called with GIL held (from `tp_dealloc`).
+//! - Native row buffer pool is protected by `row_buf_mutex` in `LuaDataLoader`.
+
 const std = @import("std");
 const lua_dataloader = @import("lua_dataloader");
 
@@ -5,23 +42,6 @@ const lua_dataloader = @import("lua_dataloader");
 const LuaLoaderSpec = lua_dataloader.LuaLoaderSpec;
 const LuaLoaderCCtx = lua_dataloader.LuaLoaderCCtx;
 const LoadedRow = lua_dataloader.LoadedRow;
-
-// Wrapper functions for the C API
-fn createLoader(spec: LuaLoaderSpec) ?*LuaLoaderCCtx {
-    return lua_dataloader.ultarCreateLuaLoader(spec);
-}
-
-fn destroyLoader(ctx: *LuaLoaderCCtx) void {
-    lua_dataloader.ultarDestroyLuaLoader(ctx);
-}
-
-fn nextRow(ctx: *LuaLoaderCCtx) ?*LoadedRow {
-    return lua_dataloader.ultarNextRow(ctx);
-}
-
-fn reclaimRow(ctx: *LuaLoaderCCtx, row: *LoadedRow) void {
-    lua_dataloader.ultarReclaimRow(ctx, row);
-}
 
 // Import Python C API using official headers
 // We use Py_LIMITED_API 0x030b0000 (Python 3.11+) which includes Py_buffer in stable ABI
@@ -272,7 +292,7 @@ fn dataLoaderNewImpl(
 
     // Release GIL during heavy initialization
     const gil_state = py.PyEval_SaveThread();
-    const loader = createLoader(spec);
+    const loader = lua_dataloader.ultarCreateLuaLoader(spec);
     py.PyEval_RestoreThread(gil_state);
 
     if (loader == null) return error.RuntimeError;
@@ -337,7 +357,7 @@ fn dataLoaderDealloc(self_obj: ?*py.PyObject) callconv(.c) void {
     const self: *DataLoaderObject = @ptrCast(@alignCast(self_obj));
 
     if (self.loader) |loader| {
-        destroyLoader(loader);
+        lua_dataloader.ultarDestroyLuaLoader(loader);
         self.loader = null;
     }
 
@@ -369,7 +389,7 @@ fn dataLoaderNext(self_obj: ?*py.PyObject) callconv(.c) ?*py.PyObject {
 
     // Release GIL during blocking I/O
     const gil_state = py.PyEval_SaveThread();
-    const row = nextRow(loader);
+    const row = lua_dataloader.ultarNextRow(loader);
     py.PyEval_RestoreThread(gil_state);
 
     // Create a LoadedRow object, or signal StopIteration if done
@@ -378,23 +398,28 @@ fn dataLoaderNext(self_obj: ?*py.PyObject) callconv(.c) ?*py.PyObject {
         return null;
     };
 
-    return createLoadedRowObject(self, valid_row);
-}
-
-fn createLoadedRowObject(parent: *DataLoaderObject, row: *LoadedRow) ?*py.PyObject {
-    const typ = LoadedRowType orelse {
-        py.PyErr_SetString(py.PyExc_RuntimeError, "LoadedRow type not initialized");
+    return wrapOwnedRow(self, valid_row) catch |err| {
+        lua_dataloader.ultarReclaimRow(loader, valid_row);
+        switch (err) {
+            error.PythonException => {},
+            error.RuntimeError => py.PyErr_SetString(py.PyExc_RuntimeError, "Failed to create LoadedRow"),
+            error.TypeError => py.PyErr_SetString(py.PyExc_TypeError, "Type error creating LoadedRow"),
+            error.OutOfMemory => py.PyErr_SetString(py.PyExc_MemoryError, "Out of memory"),
+        }
         return null;
     };
+}
 
-    // Allocate using tp_alloc
-    const alloc_fn = py.PyType_GetSlot(typ, py.Py_tp_alloc);
-    if (alloc_fn == null) {
-        py.PyErr_SetString(py.PyExc_RuntimeError, "Failed to get tp_alloc");
-        return null;
-    }
+/// Wrap a native LoadedRow in a Python object. **Takes ownership of `row`.**
+///
+/// On success: The returned Python object owns `row` and will reclaim it on dealloc.
+/// On failure: `row` is returned, caller must handle reclaim.
+fn wrapOwnedRow(parent: *DataLoaderObject, row: *LoadedRow) PyError!*py.PyObject {
+    const typ = LoadedRowType orelse return error.RuntimeError;
+
+    const alloc_fn = py.PyType_GetSlot(typ, py.Py_tp_alloc) orelse return error.RuntimeError;
     const alloc: *const fn (?*py.PyTypeObject, py.Py_ssize_t) callconv(.c) ?*py.PyObject = @ptrCast(@alignCast(alloc_fn));
-    const self_obj = alloc(typ, 0) orelse return null;
+    const self_obj = alloc(typ, 0) orelse return error.PythonException;
 
     const row_obj: *LoadedRowObject = @ptrCast(@alignCast(self_obj));
     row_obj.parent = parent;
@@ -402,7 +427,6 @@ fn createLoadedRowObject(parent: *DataLoaderObject, row: *LoadedRow) ?*py.PyObje
 
     // Keep parent alive
     py.Py_IncRef(@ptrCast(parent));
-
     return self_obj;
 }
 
@@ -410,14 +434,25 @@ fn loadedRowDealloc(self_obj: ?*py.PyObject) callconv(.c) void {
     const self: *LoadedRowObject = @ptrCast(@alignCast(self_obj));
 
     // Reclaim the row before releasing parent
+    // Null out row immediately to prevent double-free on any error path
+    const row_to_reclaim = self.row;
+    self.row = null;
+
     if (self.parent) |parent| {
-        if (parent.loader) |loader| {
-            if (self.row) |row| {
-                reclaimRow(loader, row);
+        if (row_to_reclaim) |row| {
+            if (parent.loader) |loader| {
+                lua_dataloader.ultarReclaimRow(loader, row);
             }
+            // Note: if parent.loader is null, the loader was already destroyed.
+            // This shouldn't happen with correct refcounting (we hold a ref to parent),
+            // but if it does, the row memory is already freed by ultarDestroyLuaLoader.
         }
+        self.parent = null;
         py.Py_DecRef(@ptrCast(parent));
     }
+    // Note: if self.parent is null but row_to_reclaim was set, we have a bug
+    // in createLoadedRowObject. The row is leaked but we can't reclaim it
+    // without knowing which loader it belongs to.
 
     // Get the type and call tp_free
     const typ = pyType(self_obj);

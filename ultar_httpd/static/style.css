@@ -85,12 +85,14 @@ thead th.sticky-left { background: rgba(49, 50, 68, 0.95); backdrop-filter: blur
 tbody td.sticky-left { background: var(--panel); }
 
 /* Image preview (inline thumbnail) */
-.image-preview { display: inline-block; width: 100%; background: #000; border: 1px solid var(--border); border-radius: 4px; overflow: hidden; cursor: pointer; transition: border-color 0.15s ease, box-shadow 0.15s ease; }
+.image-preview { display: inline-block; width: 100%; background: #000; border: 1px solid var(--border); border-radius: 4px; overflow: hidden; cursor: pointer; transition: border-color 0.15s ease, box-shadow 0.15s ease; min-height: 3rem; }
 .image-preview:hover { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); text-decoration: none; }
-.image-preview img { display: block; width: 100%; height: auto; }
+.image-preview img { display: block; width: 100%; height: auto; opacity: 0; transition: opacity 0.15s ease; }
+.image-preview img.loaded { opacity: 1; }
 
 /* Floating windows */
-.float-window { position: fixed; z-index: 100; background: var(--panel); border: 1px solid var(--border); border-radius: 6px; box-shadow: 0 8px 32px rgba(0,0,0,0.5); resize: both; overflow: hidden; min-width: 12rem; min-height: 6rem; }
+.float-window { position: fixed; z-index: 100; background: var(--panel); border: 1px solid var(--border); border-radius: 6px; box-shadow: 0 8px 32px rgba(0,0,0,0.5); resize: both; overflow: hidden; min-width: 12rem; min-height: 6rem; animation: float-zoom-in 0.15s ease-out; }
+@keyframes float-zoom-in { 0% { opacity: 0; transform: scale(0.85); } 100% { opacity: 1; transform: scale(1); } }
 .float-image { min-width: 16rem; max-width: 40rem; }
 .float-titlebar { display: flex; align-items: center; gap: 8px; padding: 6px 10px; border-bottom: 1px solid var(--border); background: var(--ctp-surface0); cursor: grab; user-select: none; }
 .float-titlebar:active { cursor: grabbing; }

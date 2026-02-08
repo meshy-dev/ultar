@@ -52,7 +52,9 @@ document.body.addEventListener('click', function(e) {
     var f = openFloat('tpl-float-image', url, title);
     var body = f.win.querySelector('.float-body');
     body.querySelector('a').href = url;
-    body.querySelector('img').src = url;
+    var fimg = body.querySelector('img');
+    fimg.onload = function() { this.classList.add('loaded'); };
+    fimg.src = url;
     positionWindow(f.win);
     document.getElementById('windows').appendChild(f.clone);
     return;
@@ -82,7 +84,9 @@ document.body.addEventListener('click', function(e) {
     var tpl = document.getElementById('tpl-thumb');
     var clone = tpl.content.cloneNode(true);
     var preview = clone.querySelector('.image-preview');
-    preview.querySelector('img').src = url;
+    var img = preview.querySelector('img');
+    img.onload = function() { this.classList.add('loaded'); };
+    img.src = url;
     preview.dataset.url = url;
     preview.dataset.title = title;
     a.replaceWith(clone);

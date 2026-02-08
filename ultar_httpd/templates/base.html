@@ -47,12 +47,12 @@
     html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text); font-family: system-ui, -apple-system, "Segoe UI", Roboto, Ubuntu, Cantarell, "Noto Sans", sans-serif; }
     a { color: var(--accent); text-decoration: none; }
     a:hover { color: var(--ctp-sky); text-decoration: underline; }
-    .suse { font-family: system-ui, -apple-system, "Segoe UI", Roboto, Ubuntu, Cantarell, "Noto Sans", sans-serif; }
     .mono { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace; }
     .title { font-weight: 700; }
     .app { display: flex; gap: 12px; padding: 12px; box-sizing: border-box; height: 100vh; }
     .pane { background: var(--panel); border: 1px solid var(--border); border-radius: 4px; display: flex; flex-direction: column; padding: 0; overflow: hidden; }
-    .status-bar { background: var(--ctp-mantle); }
+    .status-bar { background: var(--ctp-mantle); order: 1; }
+    .pane-body { order: 0; }
     #file-tree.pane { flex: 0 0 20rem; max-width: 20rem; }
     #table-container.pane { flex: 1 1 auto; }
     #file-tree-list.htmx-request, #table-container.htmx-request { opacity: 0.6; transition: opacity 200ms linear; }
@@ -73,7 +73,7 @@
     .table thead th { position: sticky; top: 0; background: var(--ctp-surface0); text-align: left; padding: 8px; border-bottom: 1px solid var(--border); color: var(--ctp-subtext1); }
     .table tbody td { padding: 6px 8px; border-bottom: 1px solid var(--border); vertical-align: top; }
     .table tr:hover td { background: var(--ctp-surface0); }
-    a.mono { color: var(--accent-2); }
+    .table tbody td a { color: var(--accent-2); font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace; cursor: pointer; }
     :root { --right-col-width: 7ch; --right-col-2-width: 16ch; }
     .table { position: relative; }
     .sticky-right-2 { position: sticky; right: var(--right-col-width); background: var(--ctp-surface0); z-index: 8; min-width: var(--right-col-2-width); max-width: var(--right-col-2-width); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -83,69 +83,127 @@
     .image-preview img { max-width: 20rem; max-height: 20rem; }
     div .json-preview { display: block; overflow: auto; max-width: 30rem; max-height: 20rem; padding: 8px; border: 1px solid var(--border); background: var(--ctp-crust); border-radius: 4px; }
     .json-preview pre { margin: 0; }
+    /* Top progress bar */
+    #progress-bar { position: fixed; top: 0; left: 0; width: 100%; height: 2px; z-index: 9999; pointer-events: none; overflow: hidden; opacity: 0; transition: opacity 0.4s ease; }
+    #progress-bar.active { opacity: 1; }
+    #progress-bar::before { content: ''; position: absolute; inset: 0; background: var(--accent); opacity: 0.15; animation: pb-pulse 2s ease-in-out infinite; }
+    #progress-bar::after { content: ''; position: absolute; top: 0; left: 0; height: 100%; width: 40%; background: linear-gradient(90deg, transparent, var(--accent), var(--accent-2), transparent); animation: pb-slide 1.2s ease-in-out infinite; }
+    @keyframes pb-slide { 0% { transform: translateX(-100%); } 100% { transform: translateX(350%); } }
+    @keyframes pb-pulse { 0%, 100% { opacity: 0.15; } 50% { opacity: 0.4; } }
   </style>
 </head>
 
 <body>
+  <div id="progress-bar" class="active"></div>
   <div class="app">
     <aside id="file-tree" class="pane">
+      <div class="status-bar"><span class="title">Ultar Index Viewer</span></div>
       <div class="pane-body">
-        <div id="file-tree-list" class="suse">
+        <div id="file-tree-list">
           {{{body}}}
         </div>
       </div>
-      <div class="status-bar"><span class="suse title">Ultar Index Viewer</span></div>
     </aside>
 
     <main id="table-container" class="pane">
       {{{table_body}}}
     </main>
   </div>
-  <script type="module">
-    import htmx from 'https://cdn.jsdelivr.net/npm/htmx.org@4.0.0-alpha6/dist/htmx.esm.min.js';
+  <!-- htmx: defer = non-blocking download, executes after DOM parse -->
+  <script src="https://cdn.jsdelivr.net/npm/htmx.org@4.0.0-alpha6/dist/htmx.min.js" defer></script>
+  <!-- Progress bar: intercept fetch() to track all in-flight requests (htmx 4.0 uses fetch internally) -->
+  <script>
+    var _pb = document.getElementById('progress-bar'), _fc = 1;
+    function _fdec() { if (--_fc <= 0) { _fc = 0; _pb.classList.remove('active'); } }
+    window.addEventListener('load', _fdec);
+    var _origFetch = window.fetch;
+    window.fetch = function() {
+      _fc++; _pb.classList.add('active');
+      return _origFetch.apply(this, arguments).finally(_fdec);
+    };
   </script>
-  <style id="hljs-css">
-    /* Catppuccin Mocha for highlight.js (inline, no CDN) */
-    .hljs { color: var(--ctp-text); background: var(--ctp-crust); font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace; }
-    .hljs-keyword, .hljs-literal { color: var(--ctp-mauve); font-weight: 600; }
-    .hljs-string { color: var(--ctp-green); }
-    .hljs-number { color: var(--ctp-peach); }
-    .hljs-attr, .hljs-attribute, .hljs-property, .hljs-attr-name { color: var(--ctp-blue); }
-    .hljs-punctuation { color: var(--ctp-overlay2); }
-    .hljs-comment, .hljs-quote { color: var(--ctp-overlay1); font-style: italic; }
-    .hljs-title, .hljs-section, .hljs-name { color: var(--ctp-sapphire); }
-    .hljs-built_in, .hljs-type, .hljs-class { color: var(--ctp-yellow); }
-    .hljs-variable, .hljs-template-variable { color: var(--ctp-red); }
-    .hljs-symbol, .hljs-bullet { color: var(--ctp-teal); }
-    .hljs-addition { color: var(--ctp-green); background: rgba(166, 227, 161, 0.10); }
-    .hljs-deletion { color: var(--ctp-red); background: rgba(243, 139, 168, 0.10); }
-    .hljs-strong { font-weight: 700; }
-    .hljs-emphasis { font-style: italic; }
-  </style>
-  <script id="hljs-js" src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.11.1/highlight.min.js" defer></script>
-  <script id="ultar-json-rt" defer>(function(){
-    async function ensure(){
-      if(!window.hljs){
-        await new Promise(r=>{ var s=document.getElementById('hljs-js'); if(s && !s.dataset._loaded){ s.addEventListener('load', ()=>{s.dataset._loaded='1'; r();}, {once:true}); } else { r(); } });
-      }
+  <!-- Delegated click handler: computes /boxed_file params from table DOM (data-file, data-k, data-id) -->
+  <script>
+    document.body.addEventListener('click', function(e) {
+      var a = e.target.closest('table.table td a');
+      if (!a) return;
+      e.preventDefault();
+      var td = a.closest('td');
+      var tr = td.parentElement;
+      var tbl = td.closest('table');
+      var th = tbl.querySelector('thead tr').children[td.cellIndex];
+      var url = '/boxed_file?file=' + tbl.dataset.file
+        + '&id=' + encodeURIComponent(tr.dataset.id)
+        + '&k=' + th.dataset.k
+        + '&range_str=' + encodeURIComponent(a.textContent.trim());
+      htmx.ajax('GET', url, {target: a, swap: 'outerHTML'});
+    });
+  </script>
+  <!-- highlight.js: ESM dynamic import(), loads core + JSON language on first use -->
+  <script type="module">
+    let hljsPromise = null;
+    function loadHljs() {
+      if (hljsPromise) return hljsPromise;
+      hljsPromise = (async () => {
+        try {
+          const [{ default: hljs }, { default: json }] = await Promise.all([
+            import('https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.11.1/es/core.min.js'),
+            import('https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.11.1/es/languages/json.min.js')
+          ]);
+          hljs.registerLanguage('json', json);
+          const css = document.createElement('style');
+          css.textContent =
+            '.hljs{color:var(--ctp-text);background:var(--ctp-crust);font-family:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace}' +
+            '.hljs-keyword,.hljs-literal{color:var(--ctp-mauve);font-weight:600}' +
+            '.hljs-string{color:var(--ctp-green)}' +
+            '.hljs-number{color:var(--ctp-peach)}' +
+            '.hljs-attr,.hljs-attribute,.hljs-property,.hljs-attr-name{color:var(--ctp-blue)}' +
+            '.hljs-punctuation{color:var(--ctp-overlay2)}' +
+            '.hljs-comment,.hljs-quote{color:var(--ctp-overlay1);font-style:italic}' +
+            '.hljs-title,.hljs-section,.hljs-name{color:var(--ctp-sapphire)}' +
+            '.hljs-built_in,.hljs-type,.hljs-class{color:var(--ctp-yellow)}' +
+            '.hljs-variable,.hljs-template-variable{color:var(--ctp-red)}' +
+            '.hljs-symbol,.hljs-bullet{color:var(--ctp-teal)}' +
+            '.hljs-addition{color:var(--ctp-green);background:rgba(166,227,161,.10)}' +
+            '.hljs-deletion{color:var(--ctp-red);background:rgba(243,139,168,.10)}' +
+            '.hljs-strong{font-weight:700}' +
+            '.hljs-emphasis{font-style:italic}';
+          document.head.appendChild(css);
+          return hljs;
+        } catch (e) {
+          console.warn('hljs load failed', e);
+          return null;
+        }
+      })();
+      return hljsPromise;
     }
-    async function init(el){
+    async function init(el) {
       const url = el.getAttribute('data-src');
-      if(!url) return;
+      if (!url) return;
       const res = await fetch(url);
       const txt = await res.text();
       let out = txt;
-      try { out = JSON.stringify(JSON.parse(txt), null, 2); } catch(e){}
-      await ensure();
-      if(window.hljs) {
-        el.innerHTML = window.hljs.highlight(out, {language: 'json'}).value;
+      try { out = JSON.stringify(JSON.parse(txt), null, 2); } catch (e) {}
+      const hljs = await loadHljs();
+      if (hljs) {
+        el.innerHTML = hljs.highlight(out, { language: 'json' }).value;
       } else {
         el.textContent = out;
       }
     }
-    function scan(){ document.querySelectorAll('.json-code:not([data-initialized])').forEach(function(el){ el.setAttribute('data-initialized','1'); init(el); }); }
-    document.body.addEventListener('htmx:after:swap', scan);
-    scan();
-  })();</script>
+    function scanRoot(root) {
+      const els = root.matches?.('.json-code') ? [root] : root.querySelectorAll('.json-code');
+      for (const el of els) {
+        if (!el.hasAttribute('data-initialized')) {
+          el.setAttribute('data-initialized', '1');
+          init(el);
+        }
+      }
+    }
+    // htmx.onLoad fires only on newly loaded content, with the loaded element as arg
+    htmx.onLoad(scanRoot);
+    // initial scan for server-side pre-rendered content
+    scanRoot(document.body);
+  </script>
 </body>
 </html>

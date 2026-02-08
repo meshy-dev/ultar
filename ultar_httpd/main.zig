@@ -432,13 +432,13 @@ fn renderLoadHtml(arena: std.mem.Allocator, path_param: []const u8) ![]const u8 
         }
     }.lessThan);
 
-    const Header = struct { name: []const u8 };
-    const Cell = struct { has: bool, k: []const u8, range_str: []const u8 };
+    const Header = struct { name: []const u8, enc_name: []const u8 };
+    const Cell = struct { has: bool, range_str: []const u8 };
     const Row = struct { cells: []const Cell, id_value: []const u8, row_idx: i64 };
 
     var headers = try std.ArrayList(Header).initCapacity(arena, all_keys_list.items.len);
     for (all_keys_list.items) |k| {
-        try headers.append(arena, .{ .name = k });
+        try headers.append(arena, .{ .name = k, .enc_name = try urlEncodeAlloc(arena, k) });
     }
 
     const enc_file = try urlEncodeAlloc(arena, tar_path);
@@ -458,13 +458,12 @@ fn renderLoadHtml(arena: std.mem.Allocator, path_param: []const u8) ![]const u8 
                     const offset = entry.offset + entry.offsets[kidx];
                     const size = entry.sizes[kidx];
                     const range_str = try std.fmt.allocPrint(arena, "{X:0>8}..{X:0>8}", .{ offset, offset + size });
-                    const enc_k = try urlEncodeAlloc(arena, k);
-                    try cells.append(arena, .{ .has = true, .k = enc_k, .range_str = range_str });
+                    try cells.append(arena, .{ .has = true, .range_str = range_str });
                 } else {
-                    try cells.append(arena, .{ .has = false, .k = "", .range_str = "" });
+                    try cells.append(arena, .{ .has = false, .range_str = "" });
                 }
             } else {
-                try cells.append(arena, .{ .has = false, .k = "", .range_str = "" });
+                try cells.append(arena, .{ .has = false, .range_str = "" });
             }
         }
 

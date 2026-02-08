@@ -1,22 +1,23 @@
+<div class="status-bar"><span>{{tar_path}}</span></div>
 <div class="pane-body">
   <div class="table-wrap">
-    <table class="table" hx-vals:inherited='{"file":"{{enc_file}}"}'>
+    <table class="table" data-file="{{enc_file}}">
       <thead>
         <tr>
           {{#headers}}
-          <th class="suse">{{name}}</th>
+          <th data-k="{{enc_name}}">{{name}}</th>
           {{/headers}}
-          <th class="sticky-right-2 suse">id</th>
-          <th class="sticky-right suse">row</th>
+          <th class="sticky-right-2">id</th>
+          <th class="sticky-right">row</th>
         </tr>
       </thead>
       <tbody>
         {{#rows}}
-        <tr hx-vals:inherited='{"id":"{{id_value}}"}'>
+        <tr data-id="{{id_value}}">
           {{#cells}}
-          <td hx-vals='{"k":"{{k}}", "range_str":"{{range_str}}"}'>
+          <td>
             {{#has}}
-            <a class="mono" hx-get="/boxed_file" hx-swap="outerHTML">{{range_str}}</a>
+            <a>{{range_str}}</a>
             {{/has}}
           </td>
           {{/cells}}
@@ -28,6 +29,5 @@
     </table>
   </div>
 </div>
-<div class="status-bar"><span class="suse">{{tar_path}}</span></div>
 
 

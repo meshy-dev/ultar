@@ -6,6 +6,7 @@ const msgpack = @import("msgpack");
 // preview templates handled via mustache; htmx 4 loaded via CDN ESM
 
 const TemplateCache = @import("TemplateCache.zig");
+const IndexerWorker = @import("IndexerWorker.zig");
 
 const urlDecodeBuf = @import("encodings.zig").urlDecodeBuf;
 const urlEncodeAlloc = @import("encodings.zig").urlEncodeAlloc;
@@ -19,6 +20,7 @@ var base_dir_buf: [std.fs.MAX_PATH_BYTES]u8 = undefined;
 var base_dir: []const u8 = undefined;
 
 var template_cache: TemplateCache = undefined;
+var indexer_worker: IndexerWorker = undefined;
 
 // Join and normalize a path under base_dir; reject traversal outside base_dir
 fn buildSafePathAlloc(alloc: std.mem.Allocator, rel: []const u8) ![]u8 {
@@ -47,7 +49,7 @@ fn findMimeTypeAlloc(alloc: std.mem.Allocator, file_name: []const u8) ![]const u
 
 // Directory entry structure
 const DirEntry = struct {
-    typ: enum { dir, file },
+    typ: enum { dir, file, unindexed_tar },
     name: []const u8,
     rel_path: []const u8,
 
@@ -243,31 +245,60 @@ fn listDirectory(alloc: std.mem.Allocator, path: []const u8) ![]DirEntry {
 
     var entries = try std.ArrayList(DirEntry).initCapacity(alloc, 0);
 
-    // Iterate through directory entries
+    // Collect all names first so we can check for .utix counterparts
+    var name_list = try std.ArrayList([]const u8).initCapacity(alloc, 0);
+    var kind_list = try std.ArrayList(std.fs.File.Kind).initCapacity(alloc, 0);
     var iter = dir.iterate();
     while (try iter.next()) |entry| {
-        if (entry.kind == .directory) {
+        try name_list.append(alloc, try alloc.dupe(u8, entry.name));
+        try kind_list.append(alloc, entry.kind);
+    }
+
+    // Build a set of filenames for quick lookup
+    var name_set = std.StringHashMap(void).init(alloc);
+    for (name_list.items) |n| {
+        try name_set.put(n, {});
+    }
+
+    // Iterate through directory entries
+    for (name_list.items, kind_list.items) |name, kind| {
+        if (kind == .directory) {
             const rel_path = if (std.mem.eql(u8, path, ""))
-                try alloc.dupe(u8, entry.name)
+                try alloc.dupe(u8, name)
             else
-                try std.fs.path.join(alloc, &[_][]const u8{ path, entry.name });
+                try std.fs.path.join(alloc, &[_][]const u8{ path, name });
 
             try entries.append(alloc, .{
                 .typ = .dir,
-                .name = try alloc.dupe(u8, entry.name),
+                .name = try alloc.dupe(u8, name),
                 .rel_path = rel_path,
             });
-        } else if (std.mem.endsWith(u8, entry.name, ".utix")) {
+        } else if (std.mem.endsWith(u8, name, ".utix")) {
             const rel_path = if (std.mem.eql(u8, path, ""))
-                try alloc.dupe(u8, entry.name)
+                try alloc.dupe(u8, name)
             else
-                try std.fs.path.join(alloc, &[_][]const u8{ path, entry.name });
+                try std.fs.path.join(alloc, &[_][]const u8{ path, name });
 
             try entries.append(alloc, .{
                 .typ = .file,
-                .name = try alloc.dupe(u8, entry.name),
+                .name = try alloc.dupe(u8, name),
                 .rel_path = rel_path,
             });
+        } else if (std.mem.endsWith(u8, name, ".tar")) {
+            // Check if a corresponding .utix file exists
+            const utix_name = try std.mem.concat(alloc, u8, &[_][]const u8{ name, ".utix" });
+            if (!name_set.contains(utix_name)) {
+                const rel_path = if (std.mem.eql(u8, path, ""))
+                    try alloc.dupe(u8, name)
+                else
+                    try std.fs.path.join(alloc, &[_][]const u8{ path, name });
+
+                try entries.append(alloc, .{
+                    .typ = .unindexed_tar,
+                    .name = try alloc.dupe(u8, name),
+                    .rel_path = rel_path,
+                });
+            }
         }
     }
 
@@ -319,6 +350,16 @@ pub fn onRequest(r: zap.Request) anyerror!void {
                 r.setStatus(.not_found);
                 r.sendBody("Not Found") catch {};
             };
+        } else if (std.mem.startsWith(u8, path, "/index/status")) {
+            handleIndexStatus(alloc, r) catch {
+                dumpError(r, @errorReturnTrace());
+                r.sendBody("Internal Server Error") catch {};
+            };
+        } else if (std.mem.eql(u8, path, "/index")) {
+            handleIndexRequest(alloc, r) catch {
+                dumpError(r, @errorReturnTrace());
+                r.sendBody("Internal Server Error") catch {};
+            };
         } else if (std.mem.startsWith(u8, path, "/map_file")) {
             handleMapFile(alloc, r) catch |err| {
                 dumpError(r, @errorReturnTrace());
@@ -362,12 +403,18 @@ fn renderBrowseHtml(arena: std.mem.Allocator, dir_param: []const u8) ![]const u8
         .parent = if (dir_param.len > 0) (std.fs.path.dirname(dir_param) orelse "") else "",
     };
 
-    const Item = struct { is_dir: bool, name: []const u8, rel_path_enc: []const u8, dir_enc: []const u8 };
+    const Item = struct { is_dir: bool, is_unindexed_tar: bool, name: []const u8, rel_path_enc: []const u8, dir_enc: []const u8 };
     var items = try std.ArrayList(Item).initCapacity(arena, entries.len);
     const enc_dir_param = try urlEncodeAlloc(arena, dir_param);
     for (entries) |entry| {
         const enc_rel = try urlEncodeAlloc(arena, entry.rel_path);
-        try items.append(arena, .{ .is_dir = entry.typ == .dir, .name = entry.name, .rel_path_enc = enc_rel, .dir_enc = enc_dir_param });
+        try items.append(arena, .{
+            .is_dir = entry.typ == .dir,
+            .is_unindexed_tar = entry.typ == .unindexed_tar,
+            .name = entry.name,
+            .rel_path_enc = enc_rel,
+            .dir_enc = enc_dir_param,
+        });
     }
 
     const list_tpl = try template_cache.get("ultar_httpd/templates/file_list.html");
@@ -700,6 +747,142 @@ fn handleMapFile(arena: std.mem.Allocator, r: zap.Request) !void {
     try r.sendBody(data);
 }
 
+fn handleIndexRequest(arena: std.mem.Allocator, r: zap.Request) !void {
+    const file_raw = r.getParamSlice("file") orelse "";
+    const file_param = try urlDecodeBuf(file_raw, try arena.alloc(u8, file_raw.len));
+
+    if (file_param.len == 0) {
+        r.setStatus(.bad_request);
+        try r.sendBody("missing file parameter");
+        return;
+    }
+
+    const abs_path = try buildSafePathAlloc(arena, file_param);
+
+    if (!std.mem.endsWith(u8, file_param, ".tar")) {
+        r.setStatus(.bad_request);
+        try r.sendBody("not a tar file");
+        return;
+    }
+
+    std.fs.accessAbsolute(abs_path, .{}) catch {
+        r.setStatus(.not_found);
+        try r.sendBody("file not found");
+        return;
+    };
+
+    indexer_worker.enqueue(abs_path, file_param) catch {
+        r.setStatus(.internal_server_error);
+        try r.sendBody("failed to enqueue");
+        return;
+    };
+
+    // Return the indexing panel HTML with HTMX polling enabled
+    const jobs = try indexer_worker.getStatus(arena);
+    const html = try renderIndexingPanel(arena, jobs);
+    try r.sendBody(html);
+}
+
+fn handleIndexStatus(arena: std.mem.Allocator, r: zap.Request) !void {
+    const jobs = try indexer_worker.getStatus(arena);
+    const html = try renderIndexingPanel(arena, jobs);
+
+    // When all jobs are finished, fire an event so the file tree refreshes
+    var has_active = false;
+    var has_done = false;
+    for (jobs) |job| {
+        if (job.status == .queued or job.status == .running) has_active = true;
+        if (job.status == .done) has_done = true;
+    }
+    if (!has_active and has_done) {
+        r.setHeader("HX-Trigger", "indexingDone") catch {};
+    }
+
+    try r.sendBody(html);
+}
+
+/// Render the #indexing-panel div as an HTML fragment. When active jobs exist,
+/// includes hx-get/hx-trigger so HTMX continues polling; when idle, the
+/// attributes are omitted and polling stops. Completed entries are cleared
+/// client-side via the indexingDone event handler.
+fn renderIndexingPanel(arena: std.mem.Allocator, jobs: []const IndexerWorker.JobSnapshot) ![]const u8 {
+    var has_active = false;
+    for (jobs) |job| {
+        if (job.status == .queued or job.status == .running) {
+            has_active = true;
+            break;
+        }
+    }
+
+    var html = try std.ArrayList(u8).initCapacity(arena, 512);
+
+    if (has_active) {
+        try html.appendSlice(arena,
+            "<div id=\"indexing-panel\" hx-get=\"/index/status\" hx-trigger=\"every 2s\" hx-swap=\"outerHTML\">");
+    } else {
+        try html.appendSlice(arena, "<div id=\"indexing-panel\">");
+    }
+
+    for (jobs) |job| {
+        // Extract filename (last path component)
+        const fname = if (std.mem.lastIndexOfScalar(u8, job.rel_path, '/')) |idx|
+            job.rel_path[idx + 1 ..]
+        else
+            job.rel_path;
+
+        const pct: u64 = switch (job.status) {
+            .done => 100,
+            .running => if (job.bytes_total > 0) job.bytes_scanned * 100 / job.bytes_total else 0,
+            .@"error" => if (job.bytes_total > 0) job.bytes_scanned * 100 / job.bytes_total else 0,
+            .queued => 0,
+        };
+
+        const cls: []const u8 = switch (job.status) {
+            .done => " done",
+            .@"error" => " error",
+            else => "",
+        };
+
+        const pct_str = try std.fmt.allocPrint(arena, "{d}", .{pct});
+
+        try html.appendSlice(arena, "<div class=\"idx-bar");
+        try html.appendSlice(arena, cls);
+        try html.appendSlice(arena, "\"><div class=\"idx-fill\" style=\"width:");
+        try html.appendSlice(arena, pct_str);
+        try html.appendSlice(arena, "%\"></div><span class=\"idx-label\">");
+
+        switch (job.status) {
+            .queued => {
+                try html.appendSlice(arena, fname);
+                try html.appendSlice(arena, " (queued)");
+            },
+            .running => {
+                try html.appendSlice(arena, fname);
+                try html.appendSlice(arena, " ");
+                try html.appendSlice(arena, pct_str);
+                try html.appendSlice(arena, "%");
+            },
+            .done => {
+                try html.appendSlice(arena, "\xe2\x9c\x93 "); // ✓
+                try html.appendSlice(arena, fname);
+            },
+            .@"error" => {
+                try html.appendSlice(arena, "\xe2\x9c\x97 "); // ✗
+                try html.appendSlice(arena, fname);
+                if (job.error_msg) |msg| {
+                    try html.appendSlice(arena, ": ");
+                    try html.appendSlice(arena, msg);
+                }
+            },
+        }
+
+        try html.appendSlice(arena, "</span></div>");
+    }
+
+    try html.appendSlice(arena, "</div>");
+    return html.items;
+}
+
 pub fn main() !void {
     defer _ = gpa_instance.deinit();
     var arena = std.heap.ArenaAllocator.init(gpa);
@@ -762,6 +945,11 @@ pub fn main() !void {
     template_cache = TemplateCache.init(gpa);
     defer template_cache.deinit();
     template_cache.setupWatcher();
+
+    // Initialize indexer worker
+    indexer_worker = IndexerWorker.init(gpa);
+    defer indexer_worker.deinit();
+    try indexer_worker.start();
 
     var addr_buf: [1024]u8 = undefined;
     std.mem.copyForwards(u8, addr_buf[0..addr.len], addr);

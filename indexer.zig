@@ -4,7 +4,7 @@ const xev = @import("xev");
 
 const tardefs = @import("tardefs.zig");
 const scanners = @import("scanners.zig");
-const M = @import("msgpack.zig");
+const M = @import("msgpack");
 const OStream = @import("XevOstream.zig");
 
 const index_ext = "utix";
@@ -92,7 +92,7 @@ pub const IndexMetadataError = error{
 
 pub const Indexer = scanners.TarFileScanner(WdsIndexingState, WdsIndexingState.scannedEntryCb, WdsIndexingState.errorCb);
 
-const WdsIndexingState = struct {
+pub const WdsIndexingState = struct {
     const Self = @This();
 
     const Entry = struct {
@@ -129,6 +129,20 @@ const WdsIndexingState = struct {
     current_row_base: usize = 0,
 
     fmt: SerializationFormat,
+
+    /// Optional pointer to a `usize` that receives the current byte offset
+    /// into the tar file as scanning progresses. Written with `@atomicStore`
+    /// (.monotonic) from the xev callback on the worker thread; read with
+    /// `@atomicLoad` (.monotonic) from HTTP threads (via `IndexerWorker.getStatus`).
+    ///
+    /// Lifetime: the pointee (`IndexerWorker.current_scanned`) is a field on
+    /// the long-lived global `IndexerWorker` and therefore outlives every
+    /// `WdsIndexingState` instance, which is stack-local to `processJob`.
+    /// The pointer is only dereferenced inside `scannedEntryCb`, which runs
+    /// synchronously within `loop.run()` on the worker thread -- never after
+    /// the `WdsIndexingState` is deinited. Safe to leave `null` (standalone
+    /// indexer binary) -- the store is simply skipped.
+    progress_ptr: ?*usize = null,
 
     row_buf: std.ArrayListUnmanaged(Entry),
     row_arena: std.heap.ArenaAllocator,
@@ -300,7 +314,9 @@ const WdsIndexingState = struct {
                         @panic("Unhandlable indexing error");
                     },
                 };
+            if (state.progress_ptr) |p| @atomicStore(usize, p, offset + size, .monotonic);
         } else {
+            if (state.progress_ptr) |p| @atomicStore(usize, p, offset, .monotonic);
             state.finalize();
             logger.info("End of tar file, {} rows", .{state.rows});
         }

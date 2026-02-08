@@ -40,6 +40,9 @@ pub fn build(b: *std.Build) void {
         std.debug.panic("Unknown lua engine: {s}", .{engine});
     }
 
+    // Shared msgpack module (used by both indexer and webapp)
+    const msgpack_module = b.createModule(.{ .root_source_file = b.path("msgpack.zig") });
+
     const indexer = b.addExecutable(.{
         .name = "indexer",
         .root_module = b.createModule(.{
@@ -50,6 +53,7 @@ pub fn build(b: *std.Build) void {
     });
     indexer.root_module.addImport("clap", clap.module("clap"));
     indexer.root_module.addImport("xev", xev.module("xev"));
+    indexer.root_module.addImport("msgpack", msgpack_module);
     b.installArtifact(indexer);
 
     const lib_dataloader = b.addLibrary(.{
@@ -148,9 +152,13 @@ pub fn build(b: *std.Build) void {
 
     webapp.root_module.addImport("zap", zap.module("zap"));
     webapp.root_module.addImport("clap", clap.module("clap"));
-    // Expose root-level msgpack implementation to nested main.zig
-    const msgpack_module = b.createModule(.{ .root_source_file = b.path("msgpack.zig") });
+    webapp.root_module.addImport("xev", xev.module("xev"));
     webapp.root_module.addImport("msgpack", msgpack_module);
+    // Expose indexer module so the webapp can run indexing in-process
+    const indexer_module = b.createModule(.{ .root_source_file = b.path("indexer.zig") });
+    indexer_module.addImport("xev", xev.module("xev"));
+    indexer_module.addImport("msgpack", msgpack_module);
+    webapp.root_module.addImport("indexer", indexer_module);
     webapp.linkLibC();
     b.installArtifact(webapp);
 

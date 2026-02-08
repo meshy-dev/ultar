@@ -59,6 +59,28 @@ a:hover { color: var(--ctp-sky); text-decoration: underline; }
 .nav-item a { display: block; padding: 6px 8px; color: var(--text); }
 .nav-item a:hover { background: var(--ctp-surface0); color: var(--accent); }
 
+/* Unindexed tar entries */
+.nav-item.unindexed { display: flex; align-items: center; }
+.nav-item.unindexed a { color: var(--ctp-overlay1); cursor: default; flex: 1; }
+.nav-item.unindexed a:hover { background: none; color: var(--ctp-overlay1); text-decoration: none; }
+.nav-item.unindexed .index-btn { opacity: 0; transition: opacity 0.15s ease; border: none; background: var(--ctp-surface1); color: var(--accent); font-size: 11px; padding: 2px 8px; border-radius: 8px; cursor: pointer; margin-right: 8px; white-space: nowrap; }
+.nav-item.unindexed:hover .index-btn { opacity: 1; }
+.nav-item.unindexed .index-btn:hover { background: var(--ctp-surface2); }
+
+/* Indexing panel — grows upward from bottom, minimum height when visible */
+#indexing-panel:empty { display: none; }
+#indexing-panel { flex: 0 0 auto; border-top: 1px solid var(--border); padding: 0; display: flex; flex-direction: column; justify-content: flex-end; }
+#indexing-panel .idx-bar { position: relative; height: 24px; background: var(--ctp-surface0); overflow: hidden; }
+#indexing-panel .idx-bar + .idx-bar { border-top: 1px solid var(--border); }
+#indexing-panel .idx-fill { position: absolute; inset: 0; right: auto; background: var(--accent); opacity: 0.25; transition: width 0.3s ease; }
+#indexing-panel .idx-bar.done .idx-fill { background: var(--ctp-green); opacity: 0.25; width: 100% !important; }
+#indexing-panel .idx-bar.error .idx-fill { background: var(--ctp-red); opacity: 0.25; }
+#indexing-panel .idx-label { position: absolute; inset: 0; display: flex; align-items: center; padding: 0 8px; font-size: 12px; color: var(--ctp-subtext1); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; pointer-events: none; }
+#indexing-panel .idx-bar.done .idx-label { color: var(--ctp-green); }
+#indexing-panel .idx-bar.error .idx-label { color: var(--ctp-red); }
+#indexing-panel .idx-bar.removing { animation: idx-fade 1s ease forwards; }
+@keyframes idx-fade { 0% { opacity: 1; } 100% { opacity: 0; } }
+
 /* Scrollbars (Firefox + WebKit) */
 .pane-body { scrollbar-width: auto; scrollbar-color: var(--ctp-overlay1) var(--ctp-surface1); }
 .pane-body::-webkit-scrollbar { width: 12px; height: 10px; }

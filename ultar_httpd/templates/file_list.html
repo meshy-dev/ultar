@@ -5,6 +5,12 @@
   </li>
   {{/show_parent}}
   {{#entries}}
+  {{#is_unindexed_tar}}
+  <li class="nav-item unindexed">
+    <a>📦 {{name}}</a><button class="index-btn" hx-post="/index?file={{rel_path_enc}}" hx-target="#indexing-panel" hx-swap="outerHTML">Index</button>
+  </li>
+  {{/is_unindexed_tar}}
+  {{^is_unindexed_tar}}
   <li class="nav-item">
     {{#is_dir}}
     <a href="/browse?dir={{rel_path_enc}}" hx-get="/browse?dir={{rel_path_enc}}" hx-target="#file-tree-list" hx-indicator="#file-tree-list" hx-swap="innerHTML" hx-push-url="/?dir={{rel_path_enc}}">📁 {{name}}</a>
@@ -13,5 +19,6 @@
     <a href="/load?file={{rel_path_enc}}" hx-get="/load?file={{rel_path_enc}}" hx-target="#table-container" hx-indicator="#file-tree-list" hx-swap="innerHTML" hx-push-url="/?dir={{dir_enc}}&file={{rel_path_enc}}">📄 {{name}}</a>
     {{/is_dir}}
   </li>
+  {{/is_unindexed_tar}}
   {{/entries}}
 </ul>

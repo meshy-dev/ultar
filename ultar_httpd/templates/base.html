@@ -125,7 +125,7 @@
   <script>
     document.body.addEventListener('click', function(e) {
       var a = e.target.closest('table.table td a');
-      if (!a) return;
+      if (!a || a.closest('.boxed-preview')) return;
       e.preventDefault();
       var td = a.closest('td');
       var tr = td.parentElement;

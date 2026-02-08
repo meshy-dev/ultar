@@ -7,17 +7,18 @@ document.body.addEventListener('indexingDone', function() {
   htmx.ajax('GET', '/browse?dir=' + encodeURIComponent(dir), { target: '#file-tree-list', swap: 'innerHTML' });
 });
 
-/* After each indexing-panel swap, fade out any done/error bars. The server
-   has already purged them from its list; the client owns DOM removal. */
-document.body.addEventListener('htmx:afterSettle', function(e) {
-  var target = e.detail.elt || e.detail.target;
-  if (!target || target.id !== 'indexing-panel') return;
-  target.querySelectorAll('.idx-bar.done, .idx-bar.error').forEach(function(el) {
+/* Periodically check for done/error bars in the indexing panel and fade
+   them out. The server purges completed jobs after one response; the client
+   owns the DOM removal via CSS animation. */
+setInterval(function() {
+  var panel = document.getElementById('indexing-panel');
+  if (!panel) return;
+  panel.querySelectorAll('.idx-bar.done, .idx-bar.error').forEach(function(el) {
     if (el.classList.contains('removing')) return;
     el.classList.add('removing');
     el.addEventListener('animationend', function() { el.remove(); });
   });
-});
+}, 4000);
 
 /* ── Content type detection ─────────────────────────────────── */
 var _imgExts = {jpg:1,jpeg:1,png:1,gif:1,webp:1,bmp:1,svg:1};

@@ -91,7 +91,7 @@ tbody td.sticky-left { background: var(--panel); }
 .image-preview img.loaded { opacity: 1; }
 
 /* Floating windows */
-.float-window { position: fixed; z-index: 100; background: var(--panel); border: 1px solid var(--border); border-radius: 6px; box-shadow: 0 8px 32px rgba(0,0,0,0.5); resize: both; overflow: hidden; min-width: 12rem; min-height: 6rem; animation: float-zoom-in 0.15s ease-out; }
+.float-window { position: fixed; z-index: 100; background: var(--panel); border: 1px solid var(--border); border-radius: 6px; box-shadow: 0 8px 32px rgba(0,0,0,0.5); resize: both; overflow: hidden; min-width: 12rem; min-height: 6rem; max-height: 90vh; display: flex; flex-direction: column; animation: float-zoom-in 0.15s ease-out; }
 @keyframes float-zoom-in { 0% { opacity: 0; transform: scale(0.85); } 100% { opacity: 1; transform: scale(1); } }
 .float-image { min-width: 16rem; max-width: 40rem; }
 .float-titlebar { display: flex; align-items: center; gap: 8px; padding: 6px 10px; border-bottom: 1px solid var(--border); background: var(--ctp-surface0); cursor: grab; user-select: none; }
@@ -101,7 +101,7 @@ tbody td.sticky-left { background: var(--panel); }
 .float-dl:hover { color: var(--ctp-sky); }
 .float-close { background: none; border: none; color: var(--ctp-overlay2); font-size: 16px; cursor: pointer; padding: 0 4px; line-height: 1; }
 .float-close:hover { color: var(--ctp-red); }
-.float-body { overflow: auto; padding: 8px; }
+.float-body { overflow: auto; padding: 8px; flex: 1 1 auto; min-height: 0; }
 .float-body .image-preview { border: none; border-radius: 0; }
 .float-body .json-preview { max-width: none; max-height: none; border: none; background: transparent; padding: 0; }
 .float-body video { max-width: 100%; max-height: 60vh; }

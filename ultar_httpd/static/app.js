@@ -130,8 +130,15 @@ document.body.addEventListener('click', function(e) {
   });
   document.addEventListener('mousemove', function(e) {
     if (!dragging) return;
-    dragging.style.left = (origX + e.clientX - startX) + 'px';
-    dragging.style.top = (origY + e.clientY - startY) + 'px';
+    var x = origX + e.clientX - startX;
+    var y = origY + e.clientY - startY;
+    var w = dragging.offsetWidth;
+    var titleH = 32;
+    /* Keep titlebar within viewport */
+    x = Math.max(-w + 80, Math.min(x, window.innerWidth - 80));
+    y = Math.max(0, Math.min(y, window.innerHeight - titleH));
+    dragging.style.left = x + 'px';
+    dragging.style.top = y + 'px';
   });
   document.addEventListener('mouseup', function() { dragging = null; });
   /* Bring to front on click anywhere on the window */

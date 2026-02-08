@@ -753,76 +753,133 @@ fn handleIndexRequest(arena: std.mem.Allocator, r: zap.Request) !void {
 
     if (file_param.len == 0) {
         r.setStatus(.bad_request);
-        r.setHeader("Content-Type", "application/json") catch {};
-        try r.sendBody("{\"error\":\"missing file parameter\"}");
+        try r.sendBody("missing file parameter");
         return;
     }
 
     const abs_path = try buildSafePathAlloc(arena, file_param);
 
-    // Verify the file exists and is a .tar
     if (!std.mem.endsWith(u8, file_param, ".tar")) {
         r.setStatus(.bad_request);
-        r.setHeader("Content-Type", "application/json") catch {};
-        try r.sendBody("{\"error\":\"not a tar file\"}");
+        try r.sendBody("not a tar file");
         return;
     }
 
     std.fs.accessAbsolute(abs_path, .{}) catch {
         r.setStatus(.not_found);
-        r.setHeader("Content-Type", "application/json") catch {};
-        try r.sendBody("{\"error\":\"file not found\"}");
+        try r.sendBody("file not found");
         return;
     };
 
     indexer_worker.enqueue(abs_path, file_param) catch {
         r.setStatus(.internal_server_error);
-        r.setHeader("Content-Type", "application/json") catch {};
-        try r.sendBody("{\"error\":\"failed to enqueue\"}");
+        try r.sendBody("failed to enqueue");
         return;
     };
 
-    r.setHeader("Content-Type", "application/json") catch {};
-    try r.sendBody("{\"status\":\"queued\"}");
+    // Return the indexing panel HTML with HTMX polling enabled
+    const jobs = try indexer_worker.getStatus(arena);
+    const html = try renderIndexingPanel(arena, jobs);
+    try r.sendBody(html);
 }
 
 fn handleIndexStatus(arena: std.mem.Allocator, r: zap.Request) !void {
     const jobs = try indexer_worker.getStatus(arena);
+    const html = try renderIndexingPanel(arena, jobs);
 
-    // Build JSON array manually
-    var json = try std.ArrayList(u8).initCapacity(arena, 256);
-    try json.append(arena, '[');
-    for (jobs, 0..) |job, i| {
-        if (i > 0) try json.append(arena, ',');
-        try json.appendSlice(arena, "{\"file\":\"");
-        // Escape the rel_path for JSON
-        for (job.rel_path) |ch| {
-            switch (ch) {
-                '"' => try json.appendSlice(arena, "\\\""),
-                '\\' => try json.appendSlice(arena, "\\\\"),
-                else => try json.append(arena, ch),
-            }
-        }
-        try json.appendSlice(arena, "\",\"status\":\"");
-        try json.appendSlice(arena, @tagName(job.status));
-        try json.append(arena, '"');
-        if (job.error_msg) |msg| {
-            try json.appendSlice(arena, ",\"error\":\"");
-            for (msg) |ch| {
-                switch (ch) {
-                    '"' => try json.appendSlice(arena, "\\\""),
-                    '\\' => try json.appendSlice(arena, "\\\\"),
-                    else => try json.append(arena, ch),
-                }
-            }
-            try json.append(arena, '"');
-        }
-        try json.append(arena, '}');
+    // When all jobs are finished, fire an event so the file tree refreshes
+    var has_active = false;
+    var has_done = false;
+    for (jobs) |job| {
+        if (job.status == .queued or job.status == .running) has_active = true;
+        if (job.status == .done) has_done = true;
     }
-    try json.append(arena, ']');
+    if (!has_active and has_done) {
+        r.setHeader("HX-Trigger", "indexingDone") catch {};
+    }
 
-    r.setHeader("Content-Type", "application/json") catch {};
-    try r.sendBody(json.items);
+    try r.sendBody(html);
+}
+
+/// Render the #indexing-panel div as an HTML fragment. When active jobs exist,
+/// includes hx-get/hx-trigger attributes so HTMX continues polling; when idle,
+/// the attributes are omitted and polling stops naturally.
+fn renderIndexingPanel(arena: std.mem.Allocator, jobs: []const IndexerWorker.JobSnapshot) ![]const u8 {
+    var has_active = false;
+    for (jobs) |job| {
+        if (job.status == .queued or job.status == .running) {
+            has_active = true;
+            break;
+        }
+    }
+
+    var html = try std.ArrayList(u8).initCapacity(arena, 512);
+
+    if (has_active) {
+        try html.appendSlice(arena,
+            "<div id=\"indexing-panel\" hx-get=\"/index/status\" hx-trigger=\"every 2s\" hx-swap=\"outerHTML\">");
+    } else {
+        try html.appendSlice(arena, "<div id=\"indexing-panel\">");
+    }
+
+    for (jobs) |job| {
+        // Extract filename (last path component)
+        const fname = if (std.mem.lastIndexOfScalar(u8, job.rel_path, '/')) |idx|
+            job.rel_path[idx + 1 ..]
+        else
+            job.rel_path;
+
+        const pct: u64 = switch (job.status) {
+            .done => 100,
+            .running => if (job.bytes_total > 0) job.bytes_scanned * 100 / job.bytes_total else 0,
+            .@"error" => if (job.bytes_total > 0) job.bytes_scanned * 100 / job.bytes_total else 0,
+            .queued => 0,
+        };
+
+        const cls: []const u8 = switch (job.status) {
+            .done => " done",
+            .@"error" => " error",
+            else => "",
+        };
+
+        const pct_str = try std.fmt.allocPrint(arena, "{d}", .{pct});
+
+        try html.appendSlice(arena, "<div class=\"idx-bar");
+        try html.appendSlice(arena, cls);
+        try html.appendSlice(arena, "\"><div class=\"idx-fill\" style=\"width:");
+        try html.appendSlice(arena, pct_str);
+        try html.appendSlice(arena, "%\"></div><span class=\"idx-label\">");
+
+        switch (job.status) {
+            .queued => {
+                try html.appendSlice(arena, fname);
+                try html.appendSlice(arena, " (queued)");
+            },
+            .running => {
+                try html.appendSlice(arena, fname);
+                try html.appendSlice(arena, " ");
+                try html.appendSlice(arena, pct_str);
+                try html.appendSlice(arena, "%");
+            },
+            .done => {
+                try html.appendSlice(arena, "\xe2\x9c\x93 "); // ✓
+                try html.appendSlice(arena, fname);
+            },
+            .@"error" => {
+                try html.appendSlice(arena, "\xe2\x9c\x97 "); // ✗
+                try html.appendSlice(arena, fname);
+                if (job.error_msg) |msg| {
+                    try html.appendSlice(arena, ": ");
+                    try html.appendSlice(arena, msg);
+                }
+            },
+        }
+
+        try html.appendSlice(arena, "</span></div>");
+    }
+
+    try html.appendSlice(arena, "</div>");
+    return html.items;
 }
 
 pub fn main() !void {

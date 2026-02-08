@@ -27,6 +27,7 @@ pub const Job = struct {
     rel_path: []const u8, // relative path for display (owned)
     status: JobStatus,
     error_msg: ?[]const u8 = null, // owned, if present
+    bytes_total: u64 = 0, // total tar file size in bytes (set when transitioning to running)
 };
 
 /// Snapshot of a job returned to HTTP handlers (allocated on caller's arena).
@@ -34,6 +35,8 @@ pub const JobSnapshot = struct {
     rel_path: []const u8,
     status: JobStatus,
     error_msg: ?[]const u8,
+    bytes_scanned: u64 = 0,
+    bytes_total: u64 = 0,
 };
 
 allocator: std.mem.Allocator,
@@ -46,6 +49,18 @@ running: bool = false,
 jobs: std.ArrayListUnmanaged(Job) = .{},
 // Indices into `jobs` that are still queued. Protected by mutex.
 queue: std.ArrayListUnmanaged(usize) = .{},
+
+/// Byte offset into the tar file currently being scanned.
+/// Written atomically (.monotonic) by xev read callbacks on the worker
+/// thread (via `WdsIndexingState.progress_ptr`); read atomically
+/// (.monotonic) by HTTP handler threads in `getStatus()`.
+///
+/// Lifetime: this field lives on the module-level `indexer_worker` global
+/// in main.zig, which is never freed while any indexing or HTTP handling
+/// is in progress. `WdsIndexingState.progress_ptr` points here only for
+/// the duration of a single `processJob` call and is stack-local to the
+/// worker thread, so the pointee always outlives the pointer holder.
+current_scanned: usize = 0,
 
 pub fn init(allocator: std.mem.Allocator) Self {
     return .{ .allocator = allocator };
@@ -113,12 +128,21 @@ pub fn getStatus(self: *Self, arena: std.mem.Allocator) ![]JobSnapshot {
     self.mutex.lock();
     defer self.mutex.unlock();
 
+    const scanned_now = @atomicLoad(usize, &self.current_scanned, .monotonic);
+
     var snapshots = try std.ArrayListUnmanaged(JobSnapshot).initCapacity(arena, self.jobs.items.len);
     for (self.jobs.items) |*job| {
+        const bs: u64 = switch (job.status) {
+            .running => scanned_now,
+            .done => job.bytes_total,
+            else => 0,
+        };
         try snapshots.append(arena, .{
             .rel_path = try arena.dupe(u8, job.rel_path),
             .status = job.status,
             .error_msg = if (job.error_msg) |msg| try arena.dupe(u8, msg) else null,
+            .bytes_scanned = bs,
+            .bytes_total = job.bytes_total,
         });
     }
     return snapshots.items;
@@ -159,7 +183,7 @@ fn workerLoop(self: *Self) void {
 }
 
 fn processJob(self: *Self, job_idx: usize) void {
-    // Mark as running
+    // Mark as running and stat the file for total size
     const abs_path: []const u8 = blk: {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -168,6 +192,21 @@ fn processJob(self: *Self, job_idx: usize) void {
     };
 
     logger.info("Indexing: {s}", .{abs_path});
+
+    // Stat file for total size
+    const file_size: u64 = if (std.fs.openFileAbsolute(abs_path, .{})) |f| blk: {
+        defer f.close();
+        break :blk f.getEndPos() catch 0;
+    } else |_| 0;
+
+    {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.jobs.items[job_idx].bytes_total = file_size;
+    }
+
+    // Reset progress counter before scanning begins
+    @atomicStore(usize, &self.current_scanned, @as(usize, 0), .monotonic);
 
     // Build output path: abs_path ++ ".utix"
     const out_path = std.mem.concat(self.allocator, u8, &[_][]const u8{ abs_path, ".utix" }) catch {
@@ -199,6 +238,12 @@ fn processJob(self: *Self, job_idx: usize) void {
         self.setJobError(job_idx, msg);
         return;
     };
+
+    // Point WdsIndexingState's progress_ptr at our atomic counter.
+    // Safe: current_scanned lives on the global IndexerWorker, which outlives
+    // this stack-local state. The pointer is only dereferenced inside
+    // scannedEntryCb, which runs synchronously within loop.run() below.
+    state.progress_ptr = &self.current_scanned;
 
     // Init scanner
     var scanner = Indexer.initFp(state, abs_path) catch |err| {

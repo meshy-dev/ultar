@@ -7,7 +7,7 @@
   {{#entries}}
   {{#is_unindexed_tar}}
   <li class="nav-item unindexed">
-    <a>📦 {{name}}</a><button class="index-btn" onclick="startIndex('{{rel_path_enc}}')">Index</button>
+    <a>📦 {{name}}</a><button class="index-btn" hx-post="/index?file={{rel_path_enc}}" hx-target="#indexing-panel" hx-swap="outerHTML">Index</button>
   </li>
   {{/is_unindexed_tar}}
   {{^is_unindexed_tar}}

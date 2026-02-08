@@ -130,6 +130,20 @@ pub const WdsIndexingState = struct {
 
     fmt: SerializationFormat,
 
+    /// Optional pointer to a `usize` that receives the current byte offset
+    /// into the tar file as scanning progresses. Written with `@atomicStore`
+    /// (.monotonic) from the xev callback on the worker thread; read with
+    /// `@atomicLoad` (.monotonic) from HTTP threads (via `IndexerWorker.getStatus`).
+    ///
+    /// Lifetime: the pointee (`IndexerWorker.current_scanned`) is a field on
+    /// the long-lived global `IndexerWorker` and therefore outlives every
+    /// `WdsIndexingState` instance, which is stack-local to `processJob`.
+    /// The pointer is only dereferenced inside `scannedEntryCb`, which runs
+    /// synchronously within `loop.run()` on the worker thread -- never after
+    /// the `WdsIndexingState` is deinited. Safe to leave `null` (standalone
+    /// indexer binary) -- the store is simply skipped.
+    progress_ptr: ?*usize = null,
+
     row_buf: std.ArrayListUnmanaged(Entry),
     row_arena: std.heap.ArenaAllocator,
 
@@ -300,7 +314,9 @@ pub const WdsIndexingState = struct {
                         @panic("Unhandlable indexing error");
                     },
                 };
+            if (state.progress_ptr) |p| @atomicStore(usize, p, offset + size, .monotonic);
         } else {
+            if (state.progress_ptr) |p| @atomicStore(usize, p, offset, .monotonic);
             state.finalize();
             logger.info("End of tar file, {} rows", .{state.rows});
         }

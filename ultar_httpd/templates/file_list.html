@@ -10,7 +10,7 @@
     <a href="/browse?dir={{rel_path_enc}}" hx-get="/browse?dir={{rel_path_enc}}" hx-target="#file-tree-list" hx-indicator="#file-tree-list" hx-swap="innerHTML" hx-push-url="/?dir={{rel_path_enc}}">📁 {{name}}</a>
     {{/is_dir}}
     {{^is_dir}}
-    <a href="/load?file={{rel_path_enc}}" hx-get="/load_stream?file={{rel_path_enc}}" hx-target="#table-container" hx-indicator="#file-tree-list" hx-swap="innerHTML" hx-push-url="/?dir={{dir_enc}}&file={{rel_path_enc}}" hx-config='{"stream":{"reconnect":false}}'>📄 {{name}}</a>
+    <a href="/load?file={{rel_path_enc}}" hx-get="/load?file={{rel_path_enc}}" hx-target="#table-container" hx-indicator="#file-tree-list" hx-swap="innerHTML" hx-push-url="/?dir={{dir_enc}}&file={{rel_path_enc}}">📄 {{name}}</a>
     {{/is_dir}}
   </li>
   {{/entries}}

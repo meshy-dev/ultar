@@ -4,8 +4,6 @@ const zap = @import("zap");
 const clap = @import("clap");
 const msgpack = @import("msgpack");
 // preview templates handled via mustache; htmx 4 loaded via CDN ESM
-const os = std.os;
-const fio = zap.fio;
 
 const TemplateCache = @import("TemplateCache.zig");
 
@@ -333,11 +331,6 @@ pub fn onRequest(r: zap.Request) anyerror!void {
                     },
                 }
             };
-        } else if (std.mem.startsWith(u8, path, "/load_stream")) {
-            handleLoadStream(alloc, r) catch {
-                dumpError(r, @errorReturnTrace());
-                r.sendBody("Internal Server Error") catch {};
-            };
         } else if (std.mem.startsWith(u8, path, "/boxed_file")) {
             handleBoxedFile(alloc, r) catch |err| {
                 dumpError(r, @errorReturnTrace());
@@ -375,7 +368,7 @@ fn handleIndex(arena: std.mem.Allocator, r: zap.Request) !void {
     var loader = try std.fmt.allocPrint(arena, "<ul class=\"nav-list\" hx-get=\"/browse?dir={s}\" hx-trigger=\"load\" hx-target=\"#file-tree-list\" hx-swap=\"innerHTML\"></ul>", .{enc_initial_dir});
     if (initial_file.len > 5 and std.mem.endsWith(u8, initial_file, ".utix")) {
         const enc_initial_file = try urlEncodeAlloc(arena, initial_file);
-        const table_loader = try std.fmt.allocPrint(arena, "<div style=\"display:none\" hx-get=\"/load_stream?file={s}\" hx-trigger=\"load\" hx-target=\"#table-container\" hx-swap=\"innerHTML\" hx-config='{{\"stream\":{{\"reconnect\":false}}}}'></div>", .{enc_initial_file});
+        const table_loader = try std.fmt.allocPrint(arena, "<div style=\"display:none\" hx-get=\"/load?file={s}\" hx-trigger=\"load\" hx-target=\"#table-container\" hx-swap=\"innerHTML\"></div>", .{enc_initial_file});
         const combined = try std.fmt.allocPrint(arena, "{s}{s}", .{ loader, table_loader });
         loader = combined;
     }
@@ -527,212 +520,6 @@ fn handleLoad(arena: std.mem.Allocator, r: zap.Request) !void {
     defer built.deinit();
     const s = built.str() orelse return error.Unexpected;
     try r.sendBody(s);
-}
-
-// ---------------------------------------------------------------------------
-// SSE-based streaming endpoint for table rows (htmx 4 streaming support)
-// ---------------------------------------------------------------------------
-
-/// Context passed through SSE udata for streaming table rows.
-const SseStreamCtx = struct {
-    /// Pre-rendered HTML strings for each table row (allocated with gpa).
-    row_html: [][]const u8,
-    /// Pre-rendered header event (table structure with thead).
-    header_html: []const u8,
-
-    fn deinit(self: *SseStreamCtx) void {
-        for (self.row_html) |html| gpa.free(html);
-        gpa.free(self.row_html);
-        gpa.free(self.header_html);
-        gpa.destroy(self);
-    }
-};
-
-fn fioStr(s: []const u8) fio.fio_str_info_s {
-    return .{ .data = @constCast(s.ptr), .len = s.len, .capa = 0 };
-}
-
-fn sseOnOpen(sse: [*c]fio.http_sse_s) callconv(.c) void {
-    const ctx: *SseStreamCtx = @ptrCast(@alignCast(sse.*.udata.?));
-
-    // Send header / table structure as first event
-    _ = fio.http_sse_write(sse, .{
-        .id = fioStr("header"),
-        .event = fioStr("message"),
-        .data = fioStr(ctx.header_html),
-        .retry = 0,
-    });
-
-    // Stream each row as a separate SSE event
-    for (ctx.row_html, 0..) |html, i| {
-        var idx_buf: [20]u8 = undefined;
-        const idx_str = std.fmt.bufPrint(&idx_buf, "{d}", .{i}) catch "0";
-        _ = fio.http_sse_write(sse, .{
-            .id = fioStr(idx_str),
-            .event = fioStr("row"),
-            .data = fioStr(html),
-            .retry = 0,
-        });
-    }
-
-    // Signal completion and close
-    _ = fio.http_sse_write(sse, .{
-        .id = fioStr("done"),
-        .event = fioStr("done"),
-        .data = fioStr(""),
-        .retry = 0,
-    });
-    _ = fio.http_sse_close(sse);
-}
-
-fn sseOnClose(sse: [*c]fio.http_sse_s) callconv(.c) void {
-    if (sse.*.udata) |udata| {
-        const ctx: *SseStreamCtx = @ptrCast(@alignCast(udata));
-        ctx.deinit();
-    }
-}
-
-fn handleLoadStream(arena: std.mem.Allocator, r: zap.Request) !void {
-    const raw_file = r.getParamSlice("file") orelse (r.getParamSlice("path") orelse "");
-    const path_param = try urlDecodeBuf(raw_file, try arena.alloc(u8, raw_file.len));
-
-    if (path_param.len == 0) {
-        try r.sendBody("<p>No path specified</p>");
-        return;
-    }
-
-    const full_path = try buildSafePathAlloc(arena, path_param);
-    std.fs.accessAbsolute(full_path, .{}) catch {
-        try r.sendBody("<p>File not found</p>");
-        return;
-    };
-
-    const entries = parseUtixFile(arena, full_path) catch {
-        try r.sendBody("<p>Error parsing index file</p>");
-        return;
-    };
-
-    if (entries.len == 0) {
-        try r.sendBody("<p>No items found in the index file.</p>");
-        return;
-    }
-
-    const tar_path = if (std.mem.endsWith(u8, path_param, ".utix"))
-        path_param[0 .. path_param.len - 5]
-    else
-        path_param;
-
-    // Compute union of keys across entries (same logic as handleLoad)
-    var key_set = std.StringHashMap(void).init(arena);
-    defer key_set.deinit();
-    for (entries) |e| {
-        for (e.keys) |k| {
-            if (!key_set.contains(k)) try key_set.put(k, {});
-        }
-    }
-    var all_keys_list = try std.ArrayList([]const u8).initCapacity(arena, key_set.count());
-    var it = key_set.iterator();
-    while (it.next()) |kv| {
-        try all_keys_list.append(arena, kv.key_ptr.*);
-    }
-    std.mem.sort([]const u8, all_keys_list.items, {}, struct {
-        fn lessThan(_: void, a: []const u8, b: []const u8) bool {
-            return std.mem.lessThan(u8, a, b);
-        }
-    }.lessThan);
-
-    const enc_file = try urlEncodeAlloc(arena, tar_path);
-
-    // Build the header HTML (table structure with thead + empty tbody + status bar)
-    var hdr_buf = std.ArrayList(u8).init(arena);
-    const w = hdr_buf.writer(arena);
-    try w.writeAll("<div class=\"pane-body\"><div class=\"table-wrap\"><table class=\"table\" hx-vals:inherited='{\"file\":\"");
-    try w.writeAll(enc_file);
-    try w.writeAll("\"}'><thead><tr>");
-    for (all_keys_list.items) |k| {
-        try w.writeAll("<th class=\"suse\">");
-        try w.writeAll(k);
-        try w.writeAll("</th>");
-    }
-    try w.writeAll("<th class=\"sticky-right-2 suse\">id</th><th class=\"sticky-right suse\">row</th></tr></thead><tbody id=\"stream-tbody\">");
-    try w.writeAll("</tbody></table></div></div><div class=\"status-bar\"><span class=\"suse\">");
-    try w.writeAll(tar_path);
-    try w.writeAll("</span></div>");
-
-    // Pre-render each row as an HTML string (allocated with gpa for SSE lifetime)
-    var row_html = try gpa.alloc([]const u8, entries.len);
-    var rendered: usize = 0;
-    errdefer {
-        for (row_html[0..rendered]) |html| gpa.free(html);
-        gpa.free(row_html);
-    }
-
-    for (entries, 0..) |entry, eidx| {
-        var per_row = std.StringHashMap(usize).init(arena);
-        defer per_row.deinit();
-        for (entry.keys, 0..) |k, kidx| {
-            try per_row.put(k, kidx);
-        }
-
-        var row_buf = std.ArrayList(u8).init(arena);
-        const rw = row_buf.writer(arena);
-
-        const id_value = if (entry.str_idx.len > 0) entry.str_idx else try std.fmt.allocPrint(arena, "{X}", .{entry.iidx});
-        try rw.writeAll("<tr hx-vals:inherited='{\"id\":\"");
-        try rw.writeAll(id_value);
-        try rw.writeAll("\"}'>");
-
-        for (all_keys_list.items) |k| {
-            if (per_row.get(k)) |kidx| {
-                if (kidx < entry.offsets.len and kidx < entry.sizes.len) {
-                    const offset = entry.offset + entry.offsets[kidx];
-                    const size = entry.sizes[kidx];
-                    const range_str = try std.fmt.allocPrint(arena, "{X:0>8}..{X:0>8}", .{ offset, offset + size });
-                    const enc_k = try urlEncodeAlloc(arena, k);
-                    try rw.writeAll("<td hx-vals='{\"k\":\"");
-                    try rw.writeAll(enc_k);
-                    try rw.writeAll("\", \"range_str\":\"");
-                    try rw.writeAll(range_str);
-                    try rw.writeAll("\"}'><a class=\"mono\" hx-get=\"/boxed_file\" hx-swap=\"outerHTML\">");
-                    try rw.writeAll(range_str);
-                    try rw.writeAll("</a></td>");
-                } else {
-                    try rw.writeAll("<td></td>");
-                }
-            } else {
-                try rw.writeAll("<td></td>");
-            }
-        }
-
-        try rw.writeAll("<td class=\"sticky-right-2 mono\">");
-        try rw.writeAll(id_value);
-        try rw.writeAll("</td><td class=\"sticky-right mono\">");
-        try std.fmt.format(rw, "{d}", .{@as(i64, @intCast(eidx))});
-        try rw.writeAll("</td></tr>");
-
-        row_html[eidx] = try gpa.dupe(u8, row_buf.items);
-        rendered = eidx + 1;
-    }
-
-    // Allocate SSE context (persists beyond this request's arena)
-    const ctx = try gpa.create(SseStreamCtx);
-    ctx.* = .{
-        .row_html = row_html,
-        .header_html = try gpa.dupe(u8, hdr_buf.items),
-    };
-
-    // Upgrade connection to SSE – this consumes the http_s handle
-    const ret = fio.http_upgrade2sse(r.h, .{
-        .on_open = sseOnOpen,
-        .on_ready = null,
-        .on_shutdown = null,
-        .on_close = sseOnClose,
-        .udata = @ptrCast(ctx),
-    });
-    if (ret != 0) {
-        ctx.deinit();
-        return error.SseUpgradeFailed;
-    }
 }
 
 fn sanitizeFilename(alloc: std.mem.Allocator, name: []const u8) ![]u8 {

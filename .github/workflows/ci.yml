@@ -231,10 +231,17 @@ jobs:
     needs: [build, python-wheels]
     runs-on: ubuntu-latest
     steps:
-      - name: Download all artifacts
+      - name: Download CLI artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts/
+          pattern: cli-*
+
+      - name: Download wheel artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+          pattern: wheel-*
 
       - name: Package CLI binaries
         run: |

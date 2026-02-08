@@ -1,0 +1,32 @@
+# Caddy reverse-proxy sidecar
+# Usage:
+#   docker compose -f docker-compose.caddy.yml up -d
+#
+# Caddy handles TLS termination + automatic HTTPS (Let's Encrypt).
+# Edit Caddyfile to set your domain or keep :80 for local/plain HTTP.
+
+services:
+  ultar:
+    image: ghcr.io/meshy-dev/ultar:latest
+    # build: .   # uncomment to build from local Dockerfile instead
+    volumes:
+      - ./data:/data:ro
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2-alpine
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"   # HTTP/3
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - ultar
+    restart: unless-stopped
+
+volumes:
+  caddy_data:
+  caddy_config:

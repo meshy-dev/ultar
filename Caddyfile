@@ -1,17 +1,11 @@
-{
-  # Enable HTTP/3
-  servers :443 {
-    protocols h1 h2 h3
-  }
-}
-
+# --- Option A: plain HTTP (local / behind another load balancer) ---
 :80 {
-  encode zstd gzip
-  redir https://{$SITE_HOSTNAME:localhost}
+	reverse_proxy ultar:3000
 }
 
-{$SITE_HOSTNAME:localhost}:443 {
-  encode zstd gzip
-  tls internal
-  reverse_proxy 127.0.0.1:3000
-}
+# --- Option B: automatic HTTPS for a public domain ---
+# Uncomment the block below and remove the :80 block above.
+#
+# your.domain.com {
+# 	reverse_proxy ultar:3000
+# }

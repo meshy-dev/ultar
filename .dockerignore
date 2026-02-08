@@ -1,0 +1,18 @@
+.git
+.github
+.specstory
+.cursorindexingignore
+
+# Zig build artifacts
+zig-out
+zig-cache
+.zig-cache
+
+# Python / Lua packages (not needed for Docker image)
+python
+lua-types
+
+# Docker files
+Dockerfile
+docker-compose*.yml
+Caddyfile

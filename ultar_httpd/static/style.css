@@ -36,6 +36,7 @@
   --accent: var(--ctp-blue);
   --accent-2: var(--ctp-sapphire);
   --left-col-width: 16ch;
+  --data-col-width: 12rem;
 }
 html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text); font-family: system-ui, -apple-system, "Segoe UI", Roboto, Ubuntu, Cantarell, "Noto Sans", sans-serif; }
 a { color: var(--accent); text-decoration: none; }
@@ -67,10 +68,11 @@ a:hover { color: var(--ctp-sky); text-decoration: underline; }
 
 /* Table */
 .table-wrap { overflow-x: visible; overflow-y: clip; min-width: 100%; }
-.table { width: max-content; min-width: 100%; border-collapse: separate; border-spacing: 0; font-size: 14px; table-layout: auto; background: var(--panel); color: var(--text); border-radius: 4px; position: relative; }
+.table { min-width: 100%; border-collapse: separate; border-spacing: 0; font-size: 14px; table-layout: fixed; background: var(--panel); color: var(--text); border-radius: 4px; position: relative; }
 .table thead { position: sticky; top: 0; z-index: 10; }
-.table thead th { text-align: left; padding: 8px; border-bottom: 1px solid var(--border); color: var(--ctp-subtext1); background: rgba(49, 50, 68, 0.85); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); }
-.table tbody td { padding: 6px 8px; vertical-align: top; }
+.table thead th { width: var(--data-col-width); text-align: left; padding: 8px; border-bottom: 1px solid var(--border); color: var(--ctp-subtext1); background: rgba(49, 50, 68, 0.85); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.table thead th.sticky-left { width: var(--left-col-width); }
+.table tbody td { padding: 6px 8px; vertical-align: top; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .table tbody td:not(.sticky-left) { position: relative; }
 .table tr:hover td { background: var(--ctp-surface0); }
 .table tbody td:hover::after { content: ''; position: absolute; left: 0; right: 0; top: -5000px; height: 10000px; background: var(--ctp-surface0); opacity: 0.4; pointer-events: none; z-index: -1; }

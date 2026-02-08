@@ -62,7 +62,7 @@
     .pane-body { flex: 1 1 auto; min-height: 0; overflow-y: auto; overflow-x: auto; padding: 12px 0 12px 12px; scrollbar-gutter: stable; }
     #table-container .pane-body { padding: 0; }
     .status-bar { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 8px 12px; border-top: 1px solid var(--border); color: var(--muted); }
-    .table-wrap { overflow: clip; min-width: 100%; }
+    .table-wrap { overflow-x: visible; overflow-y: clip; min-width: 100%; }
     /* Visible scrollbars (Firefox + WebKit) */
     .pane-body { scrollbar-width: auto; scrollbar-color: var(--ctp-overlay1) var(--ctp-surface1); }
     .pane-body::-webkit-scrollbar { width: 12px; height: 10px; }

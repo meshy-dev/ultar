@@ -1,13 +1,19 @@
 /* ── Indexing ───────────────────────────────────────────────── */
-/* When all indexing jobs finish, the server sends an HX-Trigger: indexingDone
-   header. Refresh the file tree so newly created .utix files appear.
-   The server has already purged completed jobs from its list; the client
-   owns the DOM removal -- fade out done bars via CSS animation. */
+/* When all indexing jobs finish, the server sends HX-Trigger: indexingDone.
+   Refresh the file tree so newly created .utix files appear. */
 document.body.addEventListener('indexingDone', function() {
   var params = new URLSearchParams(window.location.search);
   var dir = params.get('dir') || '';
   htmx.ajax('GET', '/browse?dir=' + encodeURIComponent(dir), { target: '#file-tree-list', swap: 'innerHTML' });
-  document.querySelectorAll('#indexing-panel .idx-bar').forEach(function(el) {
+});
+
+/* After each indexing-panel swap, fade out any done/error bars. The server
+   has already purged them from its list; the client owns DOM removal. */
+document.body.addEventListener('htmx:afterSettle', function(e) {
+  var target = e.detail.elt || e.detail.target;
+  if (!target || target.id !== 'indexing-panel') return;
+  target.querySelectorAll('.idx-bar.done, .idx-bar.error').forEach(function(el) {
+    if (el.classList.contains('removing')) return;
     el.classList.add('removing');
     el.addEventListener('animationend', function() { el.remove(); });
   });

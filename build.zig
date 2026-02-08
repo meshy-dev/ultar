@@ -136,17 +136,6 @@ pub fn build(b: *std.Build) void {
         .openssl = false, // Set to true to enable TLS support
     });
 
-    // Add htmx dependency (non-Zig project; used to embed dist/htmx.min.js)
-    const htmx = b.dependency("htmx", .{ .target = target, .optimize = optimize });
-    // Prepare generated files for embedding htmx
-    const write_files = b.addWriteFiles();
-    const htmx_abs = htmx.path("dist/htmx.min.js").getPath(b);
-    const htmx_bytes = std.fs.cwd().readFileAlloc(b.allocator, htmx_abs, 16 * 1024 * 1024) catch @panic("failed to read htmx.min.js");
-    _ = write_files.add("assets/htmx.min.js", htmx_bytes);
-    const embed_code = "pub const htmx_js: []const u8 = @embedFile(\"assets/htmx.min.js\");\n";
-    const embed_file = write_files.add("htmx_embed.zig", embed_code);
-    const htmx_module = b.createModule(.{ .root_source_file = embed_file });
-
     // Create the web application executable
     const webapp = b.addExecutable(.{
         .name = "ultar_httpd",
@@ -159,7 +148,6 @@ pub fn build(b: *std.Build) void {
 
     webapp.root_module.addImport("zap", zap.module("zap"));
     webapp.root_module.addImport("clap", clap.module("clap"));
-    webapp.root_module.addImport("htmx_embed", htmx_module);
     // Expose root-level msgpack implementation to nested main.zig
     const msgpack_module = b.createModule(.{ .root_source_file = b.path("msgpack.zig") });
     webapp.root_module.addImport("msgpack", msgpack_module);

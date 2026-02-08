@@ -3,9 +3,7 @@ const builtin = @import("builtin");
 const zap = @import("zap");
 const clap = @import("clap");
 const msgpack = @import("msgpack");
-const htmx_embed = @import("htmx_embed");
-// preview templates handled via mustache
-const os = std.os;
+// preview templates handled via mustache; htmx 4 loaded via CDN ESM
 
 const TemplateCache = @import("TemplateCache.zig");
 
@@ -315,6 +313,12 @@ pub fn onRequest(r: zap.Request) anyerror!void {
                 dumpError(r, @errorReturnTrace());
                 r.sendBody("Internal Server Error") catch {};
             };
+        } else if (std.mem.startsWith(u8, path, "/static/")) {
+            handleStatic(alloc, r) catch {
+                dumpError(r, @errorReturnTrace());
+                r.setStatus(.not_found);
+                r.sendBody("Not Found") catch {};
+            };
         } else if (std.mem.startsWith(u8, path, "/map_file")) {
             handleMapFile(alloc, r) catch |err| {
                 dumpError(r, @errorReturnTrace());
@@ -323,23 +327,6 @@ pub fn onRequest(r: zap.Request) anyerror!void {
                     InvalidRangeStrError.invalid_base_offset,
                     InvalidRangeStrError.invalid_end_offset,
                     MapFileClientError.invalid_offset_range,
-                    => {
-                        r.setStatus(.bad_request);
-                        r.sendBody("Bad Request") catch {};
-                    },
-                    else => {
-                        r.setStatus(.internal_server_error);
-                        r.sendBody("Internal Server Error") catch {};
-                    },
-                }
-            };
-        } else if (std.mem.startsWith(u8, path, "/boxed_file")) {
-            handleBoxedFile(alloc, r) catch |err| {
-                dumpError(r, @errorReturnTrace());
-                switch (err) {
-                    BoxedFileClientError.missing_parameters,
-                    InvalidRangeStrError.invalid_base_offset,
-                    InvalidRangeStrError.invalid_end_offset,
                     => {
                         r.setStatus(.bad_request);
                         r.sendBody("Bad Request") catch {};
@@ -360,41 +347,20 @@ pub fn onRequest(r: zap.Request) anyerror!void {
     }
 }
 
-fn handleIndex(arena: std.mem.Allocator, r: zap.Request) !void {
-    // Always render with an empty list and trigger browse after load
-    const dir_raw = r.getParamSlice("dir") orelse "";
-    const initial_dir = try urlDecodeBuf(dir_raw, try arena.alloc(u8, dir_raw.len));
-    const file_raw = r.getParamSlice("file") orelse "";
-    const initial_file = try urlDecodeBuf(file_raw, try arena.alloc(u8, file_raw.len));
-    const enc_initial_dir = try urlEncodeAlloc(arena, initial_dir);
-    var loader = try std.fmt.allocPrint(arena, "<ul class=\"nav-list\" hx-get=\"/browse?dir={s}\" hx-trigger=\"load\" hx-target=\"#file-tree-list\" hx-swap=\"innerHTML\"></ul>", .{enc_initial_dir});
-    if (initial_file.len > 5 and std.mem.endsWith(u8, initial_file, ".utix")) {
-        const enc_initial_file = try urlEncodeAlloc(arena, initial_file);
-        const table_loader = try std.fmt.allocPrint(arena, "<div style=\"display:none\" hx-get=\"/load?file={s}\" hx-trigger=\"load\" hx-target=\"#table-container\" hx-swap=\"innerHTML\"></div>", .{enc_initial_file});
-        const combined = try std.fmt.allocPrint(arena, "{s}{s}", .{ loader, table_loader });
-        loader = combined;
-    }
+// ---------------------------------------------------------------------------
+// Shared rendering helpers (used by both index pre-render and XHR handlers)
+// ---------------------------------------------------------------------------
 
-    const tpl = try template_cache.get("ultar_httpd/templates/base.html");
-    var mustache = try zap.Mustache.fromData(tpl);
-    defer mustache.deinit();
-
-    const data = .{ .body = loader, .htmx_js = htmx_embed.htmx_js };
-    var built = mustache.build(data);
-    defer built.deinit();
-    const s = built.str() orelse return error.Unexpected;
-    try r.sendBody(s);
-}
-
-fn handleBrowse(arena: std.mem.Allocator, r: zap.Request) !void {
-    // Parse directory parameter
-    const dir_raw = r.getParamSlice("dir") orelse "";
-    const dir_param = try urlDecodeBuf(dir_raw, try arena.alloc(u8, dir_raw.len));
-
+/// Render the file-tree HTML for the given (already decoded) directory path.
+/// Empty dir_param means root. Result is allocated on the arena.
+fn renderBrowseHtml(arena: std.mem.Allocator, dir_param: []const u8) ![]const u8 {
     const entries = try listDirectory(arena, dir_param);
 
     const Parent = struct { show: bool, parent: []const u8 };
-    const parent_info: Parent = .{ .show = dir_param.len > 0, .parent = if (dir_param.len > 0) (std.fs.path.dirname(dir_param) orelse "") else "" };
+    const parent_info: Parent = .{
+        .show = dir_param.len > 0,
+        .parent = if (dir_param.len > 0) (std.fs.path.dirname(dir_param) orelse "") else "",
+    };
 
     const Item = struct { is_dir: bool, name: []const u8, rel_path_enc: []const u8, dir_enc: []const u8 };
     var items = try std.ArrayList(Item).initCapacity(arena, entries.len);
@@ -411,40 +377,24 @@ fn handleBrowse(arena: std.mem.Allocator, r: zap.Request) !void {
     const data = .{ .show_parent = parent_info.show, .parent = parent_info.parent, .entries = items.items };
     var built = mustache.build(data);
     defer built.deinit();
-    const s = built.str() orelse return error.Unexpected;
-    try r.sendBody(s);
+    return try arena.dupe(u8, built.str() orelse return error.Unexpected);
 }
 
-fn handleLoad(arena: std.mem.Allocator, r: zap.Request) !void {
-    // Parse query parameter: support new 'file' and legacy 'path'
-    const raw_file = r.getParamSlice("file") orelse (r.getParamSlice("path") orelse "");
-    const path_param = try urlDecodeBuf(raw_file, try arena.alloc(u8, raw_file.len));
+const ROWS_PER_PAGE: usize = 500;
 
-    if (path_param.len == 0) {
-        try r.sendBody("<p>No path specified</p>");
-        return;
-    }
-
-    // Build full path to .utix file
+/// Render the load-table HTML for the given (already decoded) .utix file path.
+/// Only builds Row/Cell structs for the requested page slice.
+fn renderLoadHtml(arena: std.mem.Allocator, path_param: []const u8, page: usize) ![]const u8 {
     const full_path = try buildSafePathAlloc(arena, path_param);
 
-    // Check if file exists
-    std.fs.accessAbsolute(full_path, .{}) catch {
-        try r.sendBody("<p>File not found</p>");
-        return;
-    };
+    std.fs.accessAbsolute(full_path, .{}) catch
+        return try arena.dupe(u8, "<p>File not found</p>");
 
-    // Parse the .utix file
-    const entries = parseUtixFile(arena, full_path) catch {
-        std.debug.print("Error parsing .utix file\n", .{});
-        try r.sendBody("<p>Error parsing index file</p>");
-        return;
-    };
+    const entries = parseUtixFile(arena, full_path) catch
+        return try arena.dupe(u8, "<p>Error parsing index file</p>");
 
-    if (entries.len == 0) {
-        try r.sendBody("<p>No items found in the index file.</p>");
-        return;
-    }
+    if (entries.len == 0)
+        return try arena.dupe(u8, "<p>No items found in the index file.</p>");
 
     // Get tar file path (remove .utix extension)
     const tar_path = if (std.mem.endsWith(u8, path_param, ".utix"))
@@ -452,7 +402,15 @@ fn handleLoad(arena: std.mem.Allocator, r: zap.Request) !void {
     else
         path_param;
 
-    // Compute union of keys across entries
+    // Pagination
+    const total_rows = entries.len;
+    const total_pages = (total_rows + ROWS_PER_PAGE - 1) / ROWS_PER_PAGE;
+    const clamped_page = @min(page, total_pages - 1);
+    const start = clamped_page * ROWS_PER_PAGE;
+    const end = @min(start + ROWS_PER_PAGE, total_rows);
+    const page_entries = entries[start..end];
+
+    // Compute union of keys across ALL entries (need full key set for columns)
     var key_set = std.StringHashMap(void).init(arena);
     defer key_set.deinit();
     for (entries) |e| {
@@ -473,19 +431,22 @@ fn handleLoad(arena: std.mem.Allocator, r: zap.Request) !void {
         }
     }.lessThan);
 
-    const Header = struct { name: []const u8 };
-    const Cell = struct { has: bool, k: []const u8, range_str: []const u8 };
+    const Header = struct { name: []const u8, enc_name: []const u8 };
+    const Cell = struct { has: bool, range_str: []const u8 };
     const Row = struct { cells: []const Cell, id_value: []const u8, row_idx: i64 };
+    const PageLink = struct { num: []const u8, url: []const u8, is_current: bool };
 
     var headers = try std.ArrayList(Header).initCapacity(arena, all_keys_list.items.len);
     for (all_keys_list.items) |k| {
-        try headers.append(arena, .{ .name = k });
+        try headers.append(arena, .{ .name = k, .enc_name = try urlEncodeAlloc(arena, k) });
     }
 
     const enc_file = try urlEncodeAlloc(arena, tar_path);
+    const enc_utix_file = try urlEncodeAlloc(arena, path_param);
 
-    var rows = try std.ArrayList(Row).initCapacity(arena, entries.len);
-    for (entries) |entry| {
+    // Build rows only for the current page slice
+    var rows = try std.ArrayList(Row).initCapacity(arena, page_entries.len);
+    for (page_entries) |entry| {
         var per_row = std.StringHashMap(usize).init(arena);
         defer per_row.deinit();
         for (entry.keys, 0..) |k, kidx| {
@@ -499,13 +460,12 @@ fn handleLoad(arena: std.mem.Allocator, r: zap.Request) !void {
                     const offset = entry.offset + entry.offsets[kidx];
                     const size = entry.sizes[kidx];
                     const range_str = try std.fmt.allocPrint(arena, "{X:0>8}..{X:0>8}", .{ offset, offset + size });
-                    const enc_k = try urlEncodeAlloc(arena, k);
-                    try cells.append(arena, .{ .has = true, .k = enc_k, .range_str = range_str });
+                    try cells.append(arena, .{ .has = true, .range_str = range_str });
                 } else {
-                    try cells.append(arena, .{ .has = false, .k = "", .range_str = "" });
+                    try cells.append(arena, .{ .has = false, .range_str = "" });
                 }
             } else {
-                try cells.append(arena, .{ .has = false, .k = "", .range_str = "" });
+                try cells.append(arena, .{ .has = false, .range_str = "" });
             }
         }
 
@@ -513,15 +473,135 @@ fn handleLoad(arena: std.mem.Allocator, r: zap.Request) !void {
         try rows.append(arena, .{ .cells = cells.items, .id_value = id_value, .row_idx = @intCast(entry.iidx) });
     }
 
+    // Build page links
+    var page_links = try std.ArrayList(PageLink).initCapacity(arena, total_pages);
+    for (0..total_pages) |p| {
+        try page_links.append(arena, .{
+            .num = try std.fmt.allocPrint(arena, "{d}", .{p + 1}),
+            .url = try std.fmt.allocPrint(arena, "/load?file={s}&page={d}", .{ enc_utix_file, p }),
+            .is_current = p == clamped_page,
+        });
+    }
+
+    const has_pages = total_pages > 1;
+    const has_prev = clamped_page > 0;
+    const has_next = clamped_page + 1 < total_pages;
+    const prev_url: []const u8 = if (has_prev)
+        try std.fmt.allocPrint(arena, "/load?file={s}&page={d}", .{ enc_utix_file, clamped_page - 1 })
+    else
+        "";
+    const next_url: []const u8 = if (has_next)
+        try std.fmt.allocPrint(arena, "/load?file={s}&page={d}", .{ enc_utix_file, clamped_page + 1 })
+    else
+        "";
+    const total_rows_str = try std.fmt.allocPrint(arena, "{d}", .{total_rows});
+
     const load_tpl = try template_cache.get("ultar_httpd/templates/load_table.html");
     var mustache = try zap.Mustache.fromData(load_tpl);
     defer mustache.deinit();
 
-    const data = .{ .enc_file = enc_file, .headers = headers.items, .rows = rows.items, .tar_path = tar_path };
+    const tpl_data = .{
+        .enc_file = enc_file,
+        .headers = headers.items,
+        .rows = rows.items,
+        .tar_path = tar_path,
+        .total_rows = total_rows_str,
+        .has_pages = has_pages,
+        .has_prev = has_prev,
+        .has_next = has_next,
+        .prev_url = prev_url,
+        .next_url = next_url,
+        .pages = page_links.items,
+    };
+    var built = mustache.build(tpl_data);
+    defer built.deinit();
+    return try arena.dupe(u8, built.str() orelse return error.Unexpected);
+}
+
+// ---------------------------------------------------------------------------
+// Route handlers
+// ---------------------------------------------------------------------------
+
+fn handleIndex(arena: std.mem.Allocator, r: zap.Request) !void {
+    const dir_raw = r.getParamSlice("dir") orelse "";
+    const initial_dir = try urlDecodeBuf(dir_raw, try arena.alloc(u8, dir_raw.len));
+    const file_raw = r.getParamSlice("file") orelse "";
+    const initial_file = try urlDecodeBuf(file_raw, try arena.alloc(u8, file_raw.len));
+    const page = std.fmt.parseInt(usize, r.getParamSlice("page") orelse "0", 10) catch 0;
+
+    // Pre-render the file tree server-side (no extra XHR round-trip)
+    const browse_html = renderBrowseHtml(arena, initial_dir) catch "";
+
+    // Pre-render the table if a .utix file was specified in the deep-link
+    const table_html: []const u8 = if (initial_file.len > 5 and std.mem.endsWith(u8, initial_file, ".utix"))
+        renderLoadHtml(arena, initial_file, page) catch ""
+    else
+        "";
+
+    const tpl = try template_cache.get("ultar_httpd/templates/base.html");
+    var mustache = try zap.Mustache.fromData(tpl);
+    defer mustache.deinit();
+
+    const data = .{ .body = browse_html, .table_body = table_html };
     var built = mustache.build(data);
     defer built.deinit();
     const s = built.str() orelse return error.Unexpected;
     try r.sendBody(s);
+}
+
+fn handleBrowse(arena: std.mem.Allocator, r: zap.Request) !void {
+    const dir_raw = r.getParamSlice("dir") orelse "";
+    const dir_param = try urlDecodeBuf(dir_raw, try arena.alloc(u8, dir_raw.len));
+    const html = try renderBrowseHtml(arena, dir_param);
+    try r.sendBody(html);
+}
+
+fn handleLoad(arena: std.mem.Allocator, r: zap.Request) !void {
+    const raw_file = r.getParamSlice("file") orelse (r.getParamSlice("path") orelse "");
+    const path_param = try urlDecodeBuf(raw_file, try arena.alloc(u8, raw_file.len));
+
+    if (path_param.len == 0) {
+        try r.sendBody("<p>No path specified</p>");
+        return;
+    }
+
+    const page = std.fmt.parseInt(usize, r.getParamSlice("page") orelse "0", 10) catch 0;
+    const html = try renderLoadHtml(arena, path_param, page);
+    try r.sendBody(html);
+}
+
+fn handleStatic(arena: std.mem.Allocator, r: zap.Request) !void {
+    const path = r.path orelse return error.InvalidPath;
+    const rel = path["/static/".len..];
+
+    // Reject empty, traversal, or absolute paths
+    if (rel.len == 0) return error.InvalidPath;
+    if (std.mem.indexOf(u8, rel, "..") != null) return error.InvalidPath;
+    if (rel[0] == '/') return error.InvalidPath;
+
+    // Only allow simple filenames (letters, digits, dash, dot, underscore)
+    for (rel) |ch| {
+        switch (ch) {
+            'a'...'z', 'A'...'Z', '0'...'9', '-', '_', '.' => {},
+            else => return error.InvalidPath,
+        }
+    }
+
+    const full_path = try std.fs.path.join(arena, &[_][]const u8{ "ultar_httpd/static", rel });
+
+    // Determine Content-Type from extension
+    const ext = std.fs.path.extension(rel);
+    const content_type: []const u8 = if (std.mem.eql(u8, ext, ".js"))
+        "application/javascript; charset=utf-8"
+    else if (std.mem.eql(u8, ext, ".css"))
+        "text/css; charset=utf-8"
+    else
+        "application/octet-stream";
+
+    const data = try template_cache.get(full_path);
+    r.setHeader("Content-Type", content_type) catch {};
+    r.setHeader("Cache-Control", "public, max-age=3600") catch {};
+    try r.sendBody(data);
 }
 
 fn sanitizeFilename(alloc: std.mem.Allocator, name: []const u8) ![]u8 {
@@ -618,69 +698,6 @@ fn handleMapFile(arena: std.mem.Allocator, r: zap.Request) !void {
     // Send the data
     r.setStatus(.ok);
     try r.sendBody(data);
-}
-
-const BoxedFileClientError = error{
-    missing_parameters,
-    invalid_base_offset,
-    invalid_end_offset,
-};
-
-fn handleBoxedFile(arena: std.mem.Allocator, r: zap.Request) !void {
-    // Parse query parameters
-    const file_raw = r.getParamSlice("file") orelse "";
-    const file_param = try urlDecodeBuf(file_raw, try arena.alloc(u8, file_raw.len));
-    const range_str_raw = r.getParamSlice("range_str") orelse "";
-    const range_str_param = try urlDecodeBuf(range_str_raw, try arena.alloc(u8, range_str_raw.len));
-    const k_raw = r.getParamSlice("k") orelse "";
-    const k_param = try urlDecodeBuf(k_raw, try arena.alloc(u8, k_raw.len));
-    const id_raw = r.getParamSlice("id") orelse "";
-    const id_param = try urlDecodeBuf(id_raw, try arena.alloc(u8, id_raw.len));
-
-    if (file_param.len == 0 or range_str_param.len <= 2 or k_param.len == 0) {
-        return BoxedFileClientError.missing_parameters;
-    }
-
-    // Validate offsets
-    _ = try parseRangeStr(range_str_param);
-
-    // Decide preview based on MIME type
-    const mime_type = try findMimeTypeAlloc(arena, k_param);
-
-    // Select a partial based on mime type
-    var partial_path: []const u8 = undefined;
-    if (std.mem.startsWith(u8, mime_type, "image/")) {
-        partial_path = "ultar_httpd/templates/boxed/image.html";
-    } else if (std.mem.eql(u8, mime_type, "application/json")) {
-        partial_path = "ultar_httpd/templates/boxed/json.html";
-    } else if (std.mem.startsWith(u8, mime_type, "video/")) {
-        partial_path = "ultar_httpd/templates/boxed/video.html";
-    } else if (std.mem.startsWith(u8, mime_type, "audio/")) {
-        partial_path = "ultar_httpd/templates/boxed/audio.html";
-    } else if (std.mem.startsWith(u8, mime_type, "text/")) {
-        partial_path = "ultar_httpd/templates/boxed/text.html";
-    } else {
-        partial_path = "ultar_httpd/templates/boxed/other.html";
-    }
-
-    const download_url = try std.fmt.allocPrint(arena, "/map_file?file={s}&k={s}&range_str={s}&id={s}", .{ file_param, k_param, range_str_param, id_param });
-
-    const partial_tpl = try template_cache.get(partial_path);
-    var partial = try zap.Mustache.fromData(partial_tpl);
-    defer partial.deinit();
-    const partial_data = .{ .mime_type = mime_type, .download_url = download_url };
-    var partial_built = partial.build(partial_data);
-    defer partial_built.deinit();
-    const partial_html = partial_built.str() orelse return error.Unexpected;
-
-    const boxed_tpl = try template_cache.get("ultar_httpd/templates/boxed_file.html");
-    var mustache = try zap.Mustache.fromData(boxed_tpl);
-    defer mustache.deinit();
-    const wrapper_data = .{ .partial_html = partial_html, .mime_type = mime_type, .download_url = download_url };
-    var built = mustache.build(wrapper_data);
-    defer built.deinit();
-    const s = built.str() orelse return error.Unexpected;
-    try r.sendBody(s);
 }
 
 pub fn main() !void {

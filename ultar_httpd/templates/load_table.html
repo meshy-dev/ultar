@@ -13,16 +13,16 @@
     <table class="table" data-file="{{enc_file}}">
       <thead>
         <tr>
+          <th class="sticky-left">id</th>
           {{#headers}}
           <th data-k="{{enc_name}}">{{name}}</th>
           {{/headers}}
-          <th class="sticky-right-2">id</th>
-          <th class="sticky-right">row</th>
         </tr>
       </thead>
       <tbody>
         {{#rows}}
         <tr data-id="{{id_value}}">
+          <td class="sticky-left mono">{{id_value}}</td>
           {{#cells}}
           <td>
             {{#has}}
@@ -30,8 +30,6 @@
             {{/has}}
           </td>
           {{/cells}}
-          <td class="sticky-right-2 mono">{{id_value}}</td>
-          <td class="sticky-right mono">{{row_idx}}</td>
         </tr>
         {{/rows}}
       </tbody>

@@ -69,7 +69,7 @@
     .pane-body::-webkit-scrollbar-track { background: var(--ctp-surface1); }
     .pane-body::-webkit-scrollbar-thumb { background: var(--ctp-overlay1); border: 2px solid var(--ctp-surface1); border-radius: 4px; }
     .pane-body::-webkit-scrollbar-thumb:hover { background: var(--ctp-overlay2); }
-    .table { width: max-content; min-width: 100%; border-collapse: collapse; font-size: 14px; table-layout: auto; background: var(--panel); color: var(--text); border-radius: 4px; }
+    .table { width: max-content; min-width: 100%; border-collapse: separate; border-spacing: 0; font-size: 14px; table-layout: auto; background: var(--panel); color: var(--text); border-radius: 4px; }
     .table thead { position: sticky; top: 0; z-index: 10; background: rgba(49, 50, 68, 0.8); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); }
     .table thead th { text-align: left; padding: 8px; border-bottom: 1px solid var(--border); color: var(--ctp-subtext1); }
     .table tbody td { padding: 6px 8px; border-bottom: 1px solid var(--border); vertical-align: top; position: relative; }
@@ -77,12 +77,11 @@
     .table tbody td:hover::after { content: ''; position: absolute; left: 0; right: 0; top: -5000px; height: 10000px; background: var(--ctp-surface0); opacity: 0.4; pointer-events: none; z-index: -1; }
     .table tbody td a { color: var(--ctp-overlay2); font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace; cursor: pointer; }
     .table tbody td a:hover { color: var(--accent-2); }
-    :root { --right-col-width: 7ch; --right-col-2-width: 16ch; }
+    :root { --left-col-width: 16ch; }
     .table { position: relative; }
-    .sticky-right-2 { position: sticky; right: var(--right-col-width); background: var(--ctp-surface0); z-index: 8; min-width: var(--right-col-2-width); max-width: var(--right-col-2-width); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .sticky-right { position: sticky; right: 0; background: var(--ctp-surface0); z-index: 9; min-width: var(--right-col-width); max-width: var(--right-col-width); text-align: right; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    tbody td.sticky-right, tbody td.sticky-right-2 { background: var(--panel); }
-    thead th.sticky-right, thead th.sticky-right-2 { box-shadow: -1px 0 0 0 var(--border) inset; }
+    .sticky-left { position: sticky; left: 0; z-index: 3; min-width: var(--left-col-width); max-width: var(--left-col-width); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; border-right: 1px solid var(--border); }
+    thead th.sticky-left { background: rgba(49, 50, 68, 0.95); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); z-index: 11; }
+    tbody td.sticky-left { background: var(--panel); }
     .image-preview img { max-width: 20rem; max-height: 20rem; }
     div .json-preview { display: block; overflow: auto; max-width: 30rem; max-height: 20rem; padding: 8px; border: 1px solid var(--border); background: var(--ctp-crust); border-radius: 4px; }
     .json-preview pre { margin: 0; }

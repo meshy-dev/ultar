@@ -70,9 +70,10 @@
     .pane-body::-webkit-scrollbar-thumb { background: var(--ctp-overlay1); border: 2px solid var(--ctp-surface1); border-radius: 4px; }
     .pane-body::-webkit-scrollbar-thumb:hover { background: var(--ctp-overlay2); }
     .table { width: max-content; min-width: 100%; border-collapse: separate; border-spacing: 0; font-size: 14px; table-layout: auto; background: var(--panel); color: var(--text); border-radius: 4px; }
-    .table thead { position: sticky; top: 0; z-index: 10; background: rgba(49, 50, 68, 0.8); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); }
-    .table thead th { text-align: left; padding: 8px; border-bottom: 1px solid var(--border); color: var(--ctp-subtext1); }
-    .table tbody td { padding: 6px 8px; border-bottom: 1px solid var(--border); vertical-align: top; position: relative; }
+    .table thead { position: sticky; top: 0; z-index: 10; }
+    .table thead th { text-align: left; padding: 8px; border-bottom: 1px solid var(--border); color: var(--ctp-subtext1); background: rgba(49, 50, 68, 0.85); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); }
+    .table tbody td { padding: 6px 8px; vertical-align: top; }
+    .table tbody td:not(.sticky-left) { position: relative; }
     .table tr:hover td { background: var(--ctp-surface0); }
     .table tbody td:hover::after { content: ''; position: absolute; left: 0; right: 0; top: -5000px; height: 10000px; background: var(--ctp-surface0); opacity: 0.4; pointer-events: none; z-index: -1; }
     .table tbody td a { color: var(--ctp-overlay2); font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace; cursor: pointer; }

@@ -1,3 +1,78 @@
+/* ── Indexing ───────────────────────────────────────────────── */
+var _indexPollTimer = null;
+
+function startIndex(filePath) {
+  fetch('/index?file=' + filePath, { method: 'POST' })
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+      if (d.status === 'queued' || d.status === 'running') {
+        startIndexPolling();
+      }
+    })
+    .catch(function(e) { console.error('Index request failed:', e); });
+}
+
+function startIndexPolling() {
+  if (_indexPollTimer) return; // already polling
+  pollIndexStatus(); // immediate first poll
+  _indexPollTimer = setInterval(pollIndexStatus, 2000);
+}
+
+function pollIndexStatus() {
+  fetch('/index/status')
+    .then(function(r) { return r.json(); })
+    .then(function(jobs) {
+      var panel = document.getElementById('indexing-panel');
+      if (!panel) return;
+
+      var active = jobs.filter(function(j) { return j.status === 'queued' || j.status === 'running'; });
+      var justDone = jobs.filter(function(j) { return j.status === 'done'; });
+
+      if (active.length === 0 && _indexPollTimer) {
+        clearInterval(_indexPollTimer);
+        _indexPollTimer = null;
+
+        // If any jobs completed, refresh the folder browser
+        if (justDone.length > 0) {
+          var treeList = document.getElementById('file-tree-list');
+          if (treeList && window.htmx) {
+            // Extract current dir from the URL
+            var params = new URLSearchParams(window.location.search);
+            var dir = params.get('dir') || '';
+            htmx.ajax('GET', '/browse?dir=' + encodeURIComponent(dir), { target: '#file-tree-list', swap: 'innerHTML' });
+          }
+        }
+
+        // Clear panel after a short delay so user sees the "done" state
+        setTimeout(function() { panel.innerHTML = ''; }, 3000);
+        return;
+      }
+
+      // Build panel HTML
+      var html = '<div class="idx-title">Indexing</div>';
+      for (var i = 0; i < jobs.length; i++) {
+        var j = jobs[i];
+        if (j.status === 'queued') {
+          html += '<div class="idx-job"><span class="idx-spinner"></span> ' + escHtml(j.file) + ' (queued)</div>';
+        } else if (j.status === 'running') {
+          html += '<div class="idx-job"><span class="idx-spinner"></span> ' + escHtml(j.file) + '</div>';
+        } else if (j.status === 'done') {
+          html += '<div class="idx-job idx-done">&#10003; ' + escHtml(j.file) + '</div>';
+        } else if (j.status === 'error') {
+          html += '<div class="idx-job idx-error">&#10007; ' + escHtml(j.file) + (j.error ? ': ' + escHtml(j.error) : '') + '</div>';
+        }
+      }
+      panel.innerHTML = html;
+    })
+    .catch(function(e) { console.error('Index status poll failed:', e); });
+}
+
+function escHtml(s) {
+  var d = document.createElement('div');
+  d.appendChild(document.createTextNode(s));
+  return d.innerHTML;
+}
+
 /* ── Content type detection ─────────────────────────────────── */
 var _imgExts = {jpg:1,jpeg:1,png:1,gif:1,webp:1,bmp:1,svg:1};
 var _vidExts = {mp4:1,webm:1,mov:1,avi:1};

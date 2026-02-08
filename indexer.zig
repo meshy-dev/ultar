@@ -4,7 +4,7 @@ const xev = @import("xev");
 
 const tardefs = @import("tardefs.zig");
 const scanners = @import("scanners.zig");
-const M = @import("msgpack.zig");
+const M = @import("msgpack");
 const OStream = @import("XevOstream.zig");
 
 const index_ext = "utix";
@@ -92,7 +92,7 @@ pub const IndexMetadataError = error{
 
 pub const Indexer = scanners.TarFileScanner(WdsIndexingState, WdsIndexingState.scannedEntryCb, WdsIndexingState.errorCb);
 
-const WdsIndexingState = struct {
+pub const WdsIndexingState = struct {
     const Self = @This();
 
     const Entry = struct {

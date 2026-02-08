@@ -1,4 +1,13 @@
-<div class="status-bar"><span>{{tar_path}}</span></div>
+<div class="status-bar">
+  <span>{{tar_path}} · {{total_rows}} rows</span>
+  {{#has_pages}}
+  <nav class="pagination">
+    {{#has_prev}}<a class="pg" hx-get="{{prev_url}}" hx-target="#table-container" hx-swap="innerHTML">‹</a>{{/has_prev}}
+    {{#pages}}<a class="pg {{#is_current}}current{{/is_current}}" hx-get="{{url}}" hx-target="#table-container" hx-swap="innerHTML">{{num}}</a>{{/pages}}
+    {{#has_next}}<a class="pg" hx-get="{{next_url}}" hx-target="#table-container" hx-swap="innerHTML">›</a>{{/has_next}}
+  </nav>
+  {{/has_pages}}
+</div>
 <div class="pane-body">
   <div class="table-wrap">
     <table class="table" data-file="{{enc_file}}">

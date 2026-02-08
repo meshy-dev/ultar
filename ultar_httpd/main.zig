@@ -391,9 +391,11 @@ fn renderBrowseHtml(arena: std.mem.Allocator, dir_param: []const u8) ![]const u8
     return try arena.dupe(u8, built.str() orelse return error.Unexpected);
 }
 
+const ROWS_PER_PAGE: usize = 500;
+
 /// Render the load-table HTML for the given (already decoded) .utix file path.
-/// Result is allocated on the arena.
-fn renderLoadHtml(arena: std.mem.Allocator, path_param: []const u8) ![]const u8 {
+/// Only builds Row/Cell structs for the requested page slice.
+fn renderLoadHtml(arena: std.mem.Allocator, path_param: []const u8, page: usize) ![]const u8 {
     const full_path = try buildSafePathAlloc(arena, path_param);
 
     std.fs.accessAbsolute(full_path, .{}) catch
@@ -411,7 +413,15 @@ fn renderLoadHtml(arena: std.mem.Allocator, path_param: []const u8) ![]const u8 
     else
         path_param;
 
-    // Compute union of keys across entries
+    // Pagination
+    const total_rows = entries.len;
+    const total_pages = (total_rows + ROWS_PER_PAGE - 1) / ROWS_PER_PAGE;
+    const clamped_page = @min(page, total_pages - 1);
+    const start = clamped_page * ROWS_PER_PAGE;
+    const end = @min(start + ROWS_PER_PAGE, total_rows);
+    const page_entries = entries[start..end];
+
+    // Compute union of keys across ALL entries (need full key set for columns)
     var key_set = std.StringHashMap(void).init(arena);
     defer key_set.deinit();
     for (entries) |e| {
@@ -435,6 +445,7 @@ fn renderLoadHtml(arena: std.mem.Allocator, path_param: []const u8) ![]const u8 
     const Header = struct { name: []const u8, enc_name: []const u8 };
     const Cell = struct { has: bool, range_str: []const u8 };
     const Row = struct { cells: []const Cell, id_value: []const u8, row_idx: i64 };
+    const PageLink = struct { num: []const u8, url: []const u8, is_current: bool };
 
     var headers = try std.ArrayList(Header).initCapacity(arena, all_keys_list.items.len);
     for (all_keys_list.items) |k| {
@@ -442,9 +453,11 @@ fn renderLoadHtml(arena: std.mem.Allocator, path_param: []const u8) ![]const u8 
     }
 
     const enc_file = try urlEncodeAlloc(arena, tar_path);
+    const enc_utix_file = try urlEncodeAlloc(arena, path_param);
 
-    var rows = try std.ArrayList(Row).initCapacity(arena, entries.len);
-    for (entries) |entry| {
+    // Build rows only for the current page slice
+    var rows = try std.ArrayList(Row).initCapacity(arena, page_entries.len);
+    for (page_entries) |entry| {
         var per_row = std.StringHashMap(usize).init(arena);
         defer per_row.deinit();
         for (entry.keys, 0..) |k, kidx| {
@@ -471,11 +484,46 @@ fn renderLoadHtml(arena: std.mem.Allocator, path_param: []const u8) ![]const u8 
         try rows.append(arena, .{ .cells = cells.items, .id_value = id_value, .row_idx = @intCast(entry.iidx) });
     }
 
+    // Build page links
+    var page_links = try std.ArrayList(PageLink).initCapacity(arena, total_pages);
+    for (0..total_pages) |p| {
+        try page_links.append(arena, .{
+            .num = try std.fmt.allocPrint(arena, "{d}", .{p + 1}),
+            .url = try std.fmt.allocPrint(arena, "/load?file={s}&page={d}", .{ enc_utix_file, p }),
+            .is_current = p == clamped_page,
+        });
+    }
+
+    const has_pages = total_pages > 1;
+    const has_prev = clamped_page > 0;
+    const has_next = clamped_page + 1 < total_pages;
+    const prev_url: []const u8 = if (has_prev)
+        try std.fmt.allocPrint(arena, "/load?file={s}&page={d}", .{ enc_utix_file, clamped_page - 1 })
+    else
+        "";
+    const next_url: []const u8 = if (has_next)
+        try std.fmt.allocPrint(arena, "/load?file={s}&page={d}", .{ enc_utix_file, clamped_page + 1 })
+    else
+        "";
+    const total_rows_str = try std.fmt.allocPrint(arena, "{d}", .{total_rows});
+
     const load_tpl = try template_cache.get("ultar_httpd/templates/load_table.html");
     var mustache = try zap.Mustache.fromData(load_tpl);
     defer mustache.deinit();
 
-    const tpl_data = .{ .enc_file = enc_file, .headers = headers.items, .rows = rows.items, .tar_path = tar_path };
+    const tpl_data = .{
+        .enc_file = enc_file,
+        .headers = headers.items,
+        .rows = rows.items,
+        .tar_path = tar_path,
+        .total_rows = total_rows_str,
+        .has_pages = has_pages,
+        .has_prev = has_prev,
+        .has_next = has_next,
+        .prev_url = prev_url,
+        .next_url = next_url,
+        .pages = page_links.items,
+    };
     var built = mustache.build(tpl_data);
     defer built.deinit();
     return try arena.dupe(u8, built.str() orelse return error.Unexpected);
@@ -490,13 +538,14 @@ fn handleIndex(arena: std.mem.Allocator, r: zap.Request) !void {
     const initial_dir = try urlDecodeBuf(dir_raw, try arena.alloc(u8, dir_raw.len));
     const file_raw = r.getParamSlice("file") orelse "";
     const initial_file = try urlDecodeBuf(file_raw, try arena.alloc(u8, file_raw.len));
+    const page = std.fmt.parseInt(usize, r.getParamSlice("page") orelse "0", 10) catch 0;
 
     // Pre-render the file tree server-side (no extra XHR round-trip)
     const browse_html = renderBrowseHtml(arena, initial_dir) catch "";
 
     // Pre-render the table if a .utix file was specified in the deep-link
     const table_html: []const u8 = if (initial_file.len > 5 and std.mem.endsWith(u8, initial_file, ".utix"))
-        renderLoadHtml(arena, initial_file) catch ""
+        renderLoadHtml(arena, initial_file, page) catch ""
     else
         "";
 
@@ -527,7 +576,8 @@ fn handleLoad(arena: std.mem.Allocator, r: zap.Request) !void {
         return;
     }
 
-    const html = try renderLoadHtml(arena, path_param);
+    const page = std.fmt.parseInt(usize, r.getParamSlice("page") orelse "0", 10) catch 0;
+    const html = try renderLoadHtml(arena, path_param, page);
     try r.sendBody(html);
 }
 

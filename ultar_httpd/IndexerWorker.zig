@@ -123,7 +123,9 @@ pub fn enqueue(self: *Self, abs_path: []const u8, rel_path: []const u8) !void {
     self.cond.signal();
 }
 
-/// Return a snapshot of all jobs. Allocated on the provided arena.
+/// Return a snapshot of all jobs, then purge completed ones from the list.
+/// The snapshot includes each done/error job exactly once (at its final state);
+/// the server deletes the job immediately after, handing lifecycle to the client.
 pub fn getStatus(self: *Self, arena: std.mem.Allocator) ![]JobSnapshot {
     self.mutex.lock();
     defer self.mutex.unlock();
@@ -145,6 +147,25 @@ pub fn getStatus(self: *Self, arena: std.mem.Allocator) ![]JobSnapshot {
             .bytes_total = job.bytes_total,
         });
     }
+
+    // Purge completed jobs after including them in the snapshot.
+    // Reverse iteration keeps earlier indices stable during removal.
+    var i: usize = self.jobs.items.len;
+    while (i > 0) {
+        i -= 1;
+        const job = &self.jobs.items[i];
+        if (job.status == .done or job.status == .@"error") {
+            self.allocator.free(job.abs_path);
+            self.allocator.free(job.rel_path);
+            if (job.error_msg) |msg| self.allocator.free(msg);
+            _ = self.jobs.orderedRemove(i);
+            // Fix up queue indices that pointed past the removed slot
+            for (self.queue.items) |*qi| {
+                if (qi.* > i) qi.* -= 1;
+            }
+        }
+    }
+
     return snapshots.items;
 }
 

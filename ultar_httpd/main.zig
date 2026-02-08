@@ -802,8 +802,9 @@ fn handleIndexStatus(arena: std.mem.Allocator, r: zap.Request) !void {
 }
 
 /// Render the #indexing-panel div as an HTML fragment. When active jobs exist,
-/// includes hx-get/hx-trigger attributes so HTMX continues polling; when idle,
-/// the attributes are omitted and polling stops naturally.
+/// includes hx-get/hx-trigger so HTMX continues polling; when idle, the
+/// attributes are omitted and polling stops. Completed entries are cleared
+/// client-side via the indexingDone event handler.
 fn renderIndexingPanel(arena: std.mem.Allocator, jobs: []const IndexerWorker.JobSnapshot) ![]const u8 {
     var has_active = false;
     for (jobs) |job| {

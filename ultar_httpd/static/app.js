@@ -1,10 +1,15 @@
 /* ── Indexing ───────────────────────────────────────────────── */
 /* When all indexing jobs finish, the server sends an HX-Trigger: indexingDone
-   header. Refresh the file tree so newly created .utix files appear. */
+   header. Refresh the file tree so newly created .utix files appear, then
+   clear the completed entries from the panel after a short delay. */
 document.body.addEventListener('indexingDone', function() {
   var params = new URLSearchParams(window.location.search);
   var dir = params.get('dir') || '';
   htmx.ajax('GET', '/browse?dir=' + encodeURIComponent(dir), { target: '#file-tree-list', swap: 'innerHTML' });
+  setTimeout(function() {
+    var panel = document.getElementById('indexing-panel');
+    if (panel) panel.innerHTML = '';
+  }, 3000);
 });
 
 /* ── Content type detection ─────────────────────────────────── */

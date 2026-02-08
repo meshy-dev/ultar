@@ -78,8 +78,8 @@ a:hover { color: var(--ctp-sky); text-decoration: underline; }
 #indexing-panel .idx-label { position: absolute; inset: 0; display: flex; align-items: center; padding: 0 8px; font-size: 12px; color: var(--ctp-subtext1); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; pointer-events: none; }
 #indexing-panel .idx-bar.done .idx-label { color: var(--ctp-green); }
 #indexing-panel .idx-bar.error .idx-label { color: var(--ctp-red); }
-#indexing-panel .idx-bar.removing { animation: idx-fade 1.5s ease forwards; }
-@keyframes idx-fade { 0%, 60% { opacity: 1; } 100% { opacity: 0; height: 0; border: none; overflow: hidden; } }
+#indexing-panel .idx-bar.removing { animation: idx-fade 1s ease forwards; }
+@keyframes idx-fade { 0% { opacity: 1; } 100% { opacity: 0; } }
 
 /* Scrollbars (Firefox + WebKit) */
 .pane-body { scrollbar-width: auto; scrollbar-color: var(--ctp-overlay1) var(--ctp-surface1); }

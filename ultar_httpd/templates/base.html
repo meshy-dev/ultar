@@ -103,7 +103,9 @@
     <main id="table-container" class="pane">
     </main>
   </div>
-  <script>{{{htmx_js}}}</script>
+  <script type="module">
+    import htmx from 'https://cdn.jsdelivr.net/npm/htmx.org@4.0.0-alpha6/dist/htmx.esm.min.js';
+  </script>
   <style id="hljs-css">
     /* Catppuccin Mocha for highlight.js (inline, no CDN) */
     .hljs { color: var(--ctp-text); background: var(--ctp-crust); font-family: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
@@ -144,7 +146,7 @@
       }
     }
     function scan(){ document.querySelectorAll('.json-code:not([data-initialized])').forEach(function(el){ el.setAttribute('data-initialized','1'); init(el); }); }
-    document.body.addEventListener('htmx:afterSwap', scan);
+    document.body.addEventListener('htmx:after:swap', scan);
     scan();
   })();</script>
 </body>

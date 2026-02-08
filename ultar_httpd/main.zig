@@ -358,41 +358,20 @@ pub fn onRequest(r: zap.Request) anyerror!void {
     }
 }
 
-fn handleIndex(arena: std.mem.Allocator, r: zap.Request) !void {
-    // Always render with an empty list and trigger browse after load
-    const dir_raw = r.getParamSlice("dir") orelse "";
-    const initial_dir = try urlDecodeBuf(dir_raw, try arena.alloc(u8, dir_raw.len));
-    const file_raw = r.getParamSlice("file") orelse "";
-    const initial_file = try urlDecodeBuf(file_raw, try arena.alloc(u8, file_raw.len));
-    const enc_initial_dir = try urlEncodeAlloc(arena, initial_dir);
-    var loader = try std.fmt.allocPrint(arena, "<ul class=\"nav-list\" hx-get=\"/browse?dir={s}\" hx-trigger=\"load\" hx-target=\"#file-tree-list\" hx-swap=\"innerHTML\"></ul>", .{enc_initial_dir});
-    if (initial_file.len > 5 and std.mem.endsWith(u8, initial_file, ".utix")) {
-        const enc_initial_file = try urlEncodeAlloc(arena, initial_file);
-        const table_loader = try std.fmt.allocPrint(arena, "<div style=\"display:none\" hx-get=\"/load?file={s}\" hx-trigger=\"load\" hx-target=\"#table-container\" hx-swap=\"innerHTML\"></div>", .{enc_initial_file});
-        const combined = try std.fmt.allocPrint(arena, "{s}{s}", .{ loader, table_loader });
-        loader = combined;
-    }
+// ---------------------------------------------------------------------------
+// Shared rendering helpers (used by both index pre-render and XHR handlers)
+// ---------------------------------------------------------------------------
 
-    const tpl = try template_cache.get("ultar_httpd/templates/base.html");
-    var mustache = try zap.Mustache.fromData(tpl);
-    defer mustache.deinit();
-
-    const data = .{ .body = loader };
-    var built = mustache.build(data);
-    defer built.deinit();
-    const s = built.str() orelse return error.Unexpected;
-    try r.sendBody(s);
-}
-
-fn handleBrowse(arena: std.mem.Allocator, r: zap.Request) !void {
-    // Parse directory parameter
-    const dir_raw = r.getParamSlice("dir") orelse "";
-    const dir_param = try urlDecodeBuf(dir_raw, try arena.alloc(u8, dir_raw.len));
-
+/// Render the file-tree HTML for the given (already decoded) directory path.
+/// Empty dir_param means root. Result is allocated on the arena.
+fn renderBrowseHtml(arena: std.mem.Allocator, dir_param: []const u8) ![]const u8 {
     const entries = try listDirectory(arena, dir_param);
 
     const Parent = struct { show: bool, parent: []const u8 };
-    const parent_info: Parent = .{ .show = dir_param.len > 0, .parent = if (dir_param.len > 0) (std.fs.path.dirname(dir_param) orelse "") else "" };
+    const parent_info: Parent = .{
+        .show = dir_param.len > 0,
+        .parent = if (dir_param.len > 0) (std.fs.path.dirname(dir_param) orelse "") else "",
+    };
 
     const Item = struct { is_dir: bool, name: []const u8, rel_path_enc: []const u8, dir_enc: []const u8 };
     var items = try std.ArrayList(Item).initCapacity(arena, entries.len);
@@ -409,40 +388,22 @@ fn handleBrowse(arena: std.mem.Allocator, r: zap.Request) !void {
     const data = .{ .show_parent = parent_info.show, .parent = parent_info.parent, .entries = items.items };
     var built = mustache.build(data);
     defer built.deinit();
-    const s = built.str() orelse return error.Unexpected;
-    try r.sendBody(s);
+    return try arena.dupe(u8, built.str() orelse return error.Unexpected);
 }
 
-fn handleLoad(arena: std.mem.Allocator, r: zap.Request) !void {
-    // Parse query parameter: support new 'file' and legacy 'path'
-    const raw_file = r.getParamSlice("file") orelse (r.getParamSlice("path") orelse "");
-    const path_param = try urlDecodeBuf(raw_file, try arena.alloc(u8, raw_file.len));
-
-    if (path_param.len == 0) {
-        try r.sendBody("<p>No path specified</p>");
-        return;
-    }
-
-    // Build full path to .utix file
+/// Render the load-table HTML for the given (already decoded) .utix file path.
+/// Result is allocated on the arena.
+fn renderLoadHtml(arena: std.mem.Allocator, path_param: []const u8) ![]const u8 {
     const full_path = try buildSafePathAlloc(arena, path_param);
 
-    // Check if file exists
-    std.fs.accessAbsolute(full_path, .{}) catch {
-        try r.sendBody("<p>File not found</p>");
-        return;
-    };
+    std.fs.accessAbsolute(full_path, .{}) catch
+        return try arena.dupe(u8, "<p>File not found</p>");
 
-    // Parse the .utix file
-    const entries = parseUtixFile(arena, full_path) catch {
-        std.debug.print("Error parsing .utix file\n", .{});
-        try r.sendBody("<p>Error parsing index file</p>");
-        return;
-    };
+    const entries = parseUtixFile(arena, full_path) catch
+        return try arena.dupe(u8, "<p>Error parsing index file</p>");
 
-    if (entries.len == 0) {
-        try r.sendBody("<p>No items found in the index file.</p>");
-        return;
-    }
+    if (entries.len == 0)
+        return try arena.dupe(u8, "<p>No items found in the index file.</p>");
 
     // Get tar file path (remove .utix extension)
     const tar_path = if (std.mem.endsWith(u8, path_param, ".utix"))
@@ -515,11 +476,60 @@ fn handleLoad(arena: std.mem.Allocator, r: zap.Request) !void {
     var mustache = try zap.Mustache.fromData(load_tpl);
     defer mustache.deinit();
 
-    const data = .{ .enc_file = enc_file, .headers = headers.items, .rows = rows.items, .tar_path = tar_path };
+    const tpl_data = .{ .enc_file = enc_file, .headers = headers.items, .rows = rows.items, .tar_path = tar_path };
+    var built = mustache.build(tpl_data);
+    defer built.deinit();
+    return try arena.dupe(u8, built.str() orelse return error.Unexpected);
+}
+
+// ---------------------------------------------------------------------------
+// Route handlers
+// ---------------------------------------------------------------------------
+
+fn handleIndex(arena: std.mem.Allocator, r: zap.Request) !void {
+    const dir_raw = r.getParamSlice("dir") orelse "";
+    const initial_dir = try urlDecodeBuf(dir_raw, try arena.alloc(u8, dir_raw.len));
+    const file_raw = r.getParamSlice("file") orelse "";
+    const initial_file = try urlDecodeBuf(file_raw, try arena.alloc(u8, file_raw.len));
+
+    // Pre-render the file tree server-side (no extra XHR round-trip)
+    const browse_html = renderBrowseHtml(arena, initial_dir) catch "";
+
+    // Pre-render the table if a .utix file was specified in the deep-link
+    const table_html: []const u8 = if (initial_file.len > 5 and std.mem.endsWith(u8, initial_file, ".utix"))
+        renderLoadHtml(arena, initial_file) catch ""
+    else
+        "";
+
+    const tpl = try template_cache.get("ultar_httpd/templates/base.html");
+    var mustache = try zap.Mustache.fromData(tpl);
+    defer mustache.deinit();
+
+    const data = .{ .body = browse_html, .table_body = table_html };
     var built = mustache.build(data);
     defer built.deinit();
     const s = built.str() orelse return error.Unexpected;
     try r.sendBody(s);
+}
+
+fn handleBrowse(arena: std.mem.Allocator, r: zap.Request) !void {
+    const dir_raw = r.getParamSlice("dir") orelse "";
+    const dir_param = try urlDecodeBuf(dir_raw, try arena.alloc(u8, dir_raw.len));
+    const html = try renderBrowseHtml(arena, dir_param);
+    try r.sendBody(html);
+}
+
+fn handleLoad(arena: std.mem.Allocator, r: zap.Request) !void {
+    const raw_file = r.getParamSlice("file") orelse (r.getParamSlice("path") orelse "");
+    const path_param = try urlDecodeBuf(raw_file, try arena.alloc(u8, raw_file.len));
+
+    if (path_param.len == 0) {
+        try r.sendBody("<p>No path specified</p>");
+        return;
+    }
+
+    const html = try renderLoadHtml(arena, path_param);
+    try r.sendBody(html);
 }
 
 fn sanitizeFilename(alloc: std.mem.Allocator, name: []const u8) ![]u8 {

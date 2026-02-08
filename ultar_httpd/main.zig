@@ -313,6 +313,12 @@ pub fn onRequest(r: zap.Request) anyerror!void {
                 dumpError(r, @errorReturnTrace());
                 r.sendBody("Internal Server Error") catch {};
             };
+        } else if (std.mem.startsWith(u8, path, "/static/")) {
+            handleStatic(alloc, r) catch {
+                dumpError(r, @errorReturnTrace());
+                r.setStatus(.not_found);
+                r.sendBody("Not Found") catch {};
+            };
         } else if (std.mem.startsWith(u8, path, "/map_file")) {
             handleMapFile(alloc, r) catch |err| {
                 dumpError(r, @errorReturnTrace());
@@ -321,23 +327,6 @@ pub fn onRequest(r: zap.Request) anyerror!void {
                     InvalidRangeStrError.invalid_base_offset,
                     InvalidRangeStrError.invalid_end_offset,
                     MapFileClientError.invalid_offset_range,
-                    => {
-                        r.setStatus(.bad_request);
-                        r.sendBody("Bad Request") catch {};
-                    },
-                    else => {
-                        r.setStatus(.internal_server_error);
-                        r.sendBody("Internal Server Error") catch {};
-                    },
-                }
-            };
-        } else if (std.mem.startsWith(u8, path, "/boxed_file")) {
-            handleBoxedFile(alloc, r) catch |err| {
-                dumpError(r, @errorReturnTrace());
-                switch (err) {
-                    BoxedFileClientError.missing_parameters,
-                    InvalidRangeStrError.invalid_base_offset,
-                    InvalidRangeStrError.invalid_end_offset,
                     => {
                         r.setStatus(.bad_request);
                         r.sendBody("Bad Request") catch {};
@@ -581,6 +570,40 @@ fn handleLoad(arena: std.mem.Allocator, r: zap.Request) !void {
     try r.sendBody(html);
 }
 
+fn handleStatic(arena: std.mem.Allocator, r: zap.Request) !void {
+    const path = r.path orelse return error.InvalidPath;
+    const rel = path["/static/".len..];
+
+    // Reject empty, traversal, or absolute paths
+    if (rel.len == 0) return error.InvalidPath;
+    if (std.mem.indexOf(u8, rel, "..") != null) return error.InvalidPath;
+    if (rel[0] == '/') return error.InvalidPath;
+
+    // Only allow simple filenames (letters, digits, dash, dot, underscore)
+    for (rel) |ch| {
+        switch (ch) {
+            'a'...'z', 'A'...'Z', '0'...'9', '-', '_', '.' => {},
+            else => return error.InvalidPath,
+        }
+    }
+
+    const full_path = try std.fs.path.join(arena, &[_][]const u8{ "ultar_httpd/static", rel });
+
+    // Determine Content-Type from extension
+    const ext = std.fs.path.extension(rel);
+    const content_type: []const u8 = if (std.mem.eql(u8, ext, ".js"))
+        "application/javascript; charset=utf-8"
+    else if (std.mem.eql(u8, ext, ".css"))
+        "text/css; charset=utf-8"
+    else
+        "application/octet-stream";
+
+    const data = try template_cache.get(full_path);
+    r.setHeader("Content-Type", content_type) catch {};
+    r.setHeader("Cache-Control", "public, max-age=3600") catch {};
+    try r.sendBody(data);
+}
+
 fn sanitizeFilename(alloc: std.mem.Allocator, name: []const u8) ![]u8 {
     var buf = try alloc.alloc(u8, name.len);
     var i: usize = 0;
@@ -675,69 +698,6 @@ fn handleMapFile(arena: std.mem.Allocator, r: zap.Request) !void {
     // Send the data
     r.setStatus(.ok);
     try r.sendBody(data);
-}
-
-const BoxedFileClientError = error{
-    missing_parameters,
-    invalid_base_offset,
-    invalid_end_offset,
-};
-
-fn handleBoxedFile(arena: std.mem.Allocator, r: zap.Request) !void {
-    // Parse query parameters
-    const file_raw = r.getParamSlice("file") orelse "";
-    const file_param = try urlDecodeBuf(file_raw, try arena.alloc(u8, file_raw.len));
-    const range_str_raw = r.getParamSlice("range_str") orelse "";
-    const range_str_param = try urlDecodeBuf(range_str_raw, try arena.alloc(u8, range_str_raw.len));
-    const k_raw = r.getParamSlice("k") orelse "";
-    const k_param = try urlDecodeBuf(k_raw, try arena.alloc(u8, k_raw.len));
-    const id_raw = r.getParamSlice("id") orelse "";
-    const id_param = try urlDecodeBuf(id_raw, try arena.alloc(u8, id_raw.len));
-
-    if (file_param.len == 0 or range_str_param.len <= 2 or k_param.len == 0) {
-        return BoxedFileClientError.missing_parameters;
-    }
-
-    // Validate offsets
-    _ = try parseRangeStr(range_str_param);
-
-    // Decide preview based on MIME type
-    const mime_type = try findMimeTypeAlloc(arena, k_param);
-
-    // Select a partial based on mime type
-    var partial_path: []const u8 = undefined;
-    if (std.mem.startsWith(u8, mime_type, "image/")) {
-        partial_path = "ultar_httpd/templates/boxed/image.html";
-    } else if (std.mem.eql(u8, mime_type, "application/json")) {
-        partial_path = "ultar_httpd/templates/boxed/json.html";
-    } else if (std.mem.startsWith(u8, mime_type, "video/")) {
-        partial_path = "ultar_httpd/templates/boxed/video.html";
-    } else if (std.mem.startsWith(u8, mime_type, "audio/")) {
-        partial_path = "ultar_httpd/templates/boxed/audio.html";
-    } else if (std.mem.startsWith(u8, mime_type, "text/")) {
-        partial_path = "ultar_httpd/templates/boxed/text.html";
-    } else {
-        partial_path = "ultar_httpd/templates/boxed/other.html";
-    }
-
-    const download_url = try std.fmt.allocPrint(arena, "/map_file?file={s}&k={s}&range_str={s}&id={s}", .{ file_param, k_param, range_str_param, id_param });
-
-    const partial_tpl = try template_cache.get(partial_path);
-    var partial = try zap.Mustache.fromData(partial_tpl);
-    defer partial.deinit();
-    const partial_data = .{ .mime_type = mime_type, .download_url = download_url };
-    var partial_built = partial.build(partial_data);
-    defer partial_built.deinit();
-    const partial_html = partial_built.str() orelse return error.Unexpected;
-
-    const boxed_tpl = try template_cache.get("ultar_httpd/templates/boxed_file.html");
-    var mustache = try zap.Mustache.fromData(boxed_tpl);
-    defer mustache.deinit();
-    const wrapper_data = .{ .partial_html = partial_html, .mime_type = mime_type, .download_url = download_url };
-    var built = mustache.build(wrapper_data);
-    defer built.deinit();
-    const s = built.str() orelse return error.Unexpected;
-    try r.sendBody(s);
 }
 
 pub fn main() !void {

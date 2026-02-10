@@ -222,7 +222,7 @@ jobs:
         with:
           images: |
             ghcr.io/${{ github.repository }}
-            meshyorg/ultar
+            meshyai/ultar
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}

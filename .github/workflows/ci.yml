@@ -6,6 +6,13 @@ on:
     branches: [ main ]
   release:
     types: [ published ]
+  workflow_dispatch:
+    inputs:
+      docker_build:
+        description: "Build docker image"
+        type: boolean
+        default: false
+
 
 permissions:
   contents: write
@@ -162,11 +169,11 @@ jobs:
           name: wheel-${{ matrix.target.platform }}
           path: python/dist/*.whl
 
-  # Build and push multi-arch Docker image to GHCR (release only)
+  # Build and push multi-arch Docker image to GHCR (release or manual with docker_build)
   docker:
     name: Docker image
     needs: [build]
-    if: github.event_name == 'release'
+    if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && github.event.inputs.docker_build == 'true')
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -221,13 +228,34 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=raw,value=latest
 
+      - name: Set tags for manual runs
+        id: tags
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            REF="${{ github.ref_name }}"
+            REF_SANITIZED=$(echo "$REF" | tr '/' '-')
+            SHA=$(git rev-parse --short HEAD)
+            {
+              echo "all_tags<<EOF"
+              echo "${{ steps.meta.outputs.tags }}"
+              echo "manual-${REF_SANITIZED}-${SHA}"
+              echo "EOF"
+            } >> $GITHUB_OUTPUT
+          else
+            {
+              echo "all_tags<<EOF"
+              echo "${{ steps.meta.outputs.tags }}"
+              echo "EOF"
+            } >> $GITHUB_OUTPUT
+          fi
+
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
           context: .
           push: true
           platforms: linux/amd64,linux/arm64
-          tags: ${{ steps.meta.outputs.tags }}
+          tags: ${{ steps.tags.outputs.all_tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

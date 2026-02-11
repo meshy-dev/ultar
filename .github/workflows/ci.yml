@@ -230,15 +230,19 @@ jobs:
 
       - name: Set tags for manual runs
         id: tags
+        env:
+          GH_REPO: ${{ github.repository }}
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             REF="${{ github.ref_name }}"
             REF_SANITIZED=$(echo "$REF" | tr '/' '-')
             SHA=$(git rev-parse --short HEAD)
+            MANUAL_TAG="manual-${REF_SANITIZED}-${SHA}"
             {
               echo "all_tags<<EOF"
               echo "${{ steps.meta.outputs.tags }}"
-              echo "manual-${REF_SANITIZED}-${SHA}"
+              echo "ghcr.io/${GH_REPO}:${MANUAL_TAG}"
+              echo "meshyai/ultar:${MANUAL_TAG}"
               echo "EOF"
             } >> $GITHUB_OUTPUT
           else

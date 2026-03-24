@@ -8,8 +8,9 @@ const logger = std.log.scoped(.dataloader);
 const wlog = std.log.scoped(.dataloader_io_thread);
 
 pub const FileHandle = packed struct {
-    idx: u10,
-    generation: u14,
+    _: u14 = 0,
+    idx: u20,
+    generation: u20,
     path_checksum: u8,
 };
 

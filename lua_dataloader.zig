@@ -26,7 +26,7 @@ const c_u8ptr = [*c]const u8;
 pub const LoadedRow = extern struct {
     keys: [*c]c_u8ptr = null,
     data: [*c]c_u8ptr = null,
-    sizes: [*c]c_uint = null,
+    sizes: [*c]u64 = null,
     num_keys: c_uint = 0,
 };
 
@@ -80,14 +80,14 @@ pub const LuaDataLoader = struct {
         },
         close_file: struct {
             // args
-            file_handle: u32,
+            file_handle: u64,
         },
         add_entry: struct {
             // args
             key: [:0]const u8,
             offset: u64,
             size: u32,
-            file_handle: u32,
+            file_handle: u64,
             // state
             entry: ?*Row.Entry = null,
         },
@@ -143,7 +143,7 @@ pub const LuaDataLoader = struct {
 
     fn gCloseFile(lua: *Lua) !i32 {
         const loader = try lua.toUserdata(Self, 1);
-        const handle: u32 = try lua_rt.toUnsigned(lua, 2);
+        const handle: u64 = try lua_rt.toUnsigned64(lua, 2);
         loader.u_yielded_from = .{
             .close_file = .{
                 .file_handle = handle,
@@ -154,7 +154,7 @@ pub const LuaDataLoader = struct {
 
     fn gAddEntry(lua: *Lua) !i32 {
         const loader = try lua.toUserdata(Self, 1);
-        const handle: u32 = try lua_rt.toUnsigned(lua, 2);
+        const handle: u64 = try lua_rt.toUnsigned64(lua, 2);
         // We yield after this function & the string ref should live long enough
         const key = try lua.toString(3);
         const offset: u64 = @intFromFloat(try lua.toNumber(4));
@@ -358,7 +358,7 @@ pub const LuaDataLoader = struct {
                 switch (payload) {
                     .open_file => |f| {
                         std.debug.assert((self.u_yielded_from orelse @panic("Unresolved open_file req")) == .open_file);
-                        lua_rt.pushUnsigned(self.lua, @intCast(@as(u32, @bitCast(f))));
+                        lua_rt.pushUnsigned64(self.lua, f);
                         self.u_resume_nargs = 1;
                         self.u_yielded_from = null;
                     },
@@ -557,20 +557,56 @@ pub const LuaDataLoader = struct {
 
     pub fn init(spec: LuaLoaderSpec, alloc: std.mem.Allocator) !*Self {
         var self = try alloc.create(Self);
-        const now = try std.time.Instant.now();
-        self.* = .{ .alloc = alloc, .load_rid_to_row = try std.AutoArrayHashMapUnmanaged(u64, *Row).init(alloc, &.{}, &.{}), .last_instant = now, .last_log_instant = now };
         errdefer alloc.destroy(self);
+        const now = try std.time.Instant.now();
+        self.alloc = alloc;
+        self.loader = undefined;
+        self.lua = undefined;
+        self.u_loader_fn = .{};
+        self.u_ctx = 0;
+        self.u_ctx_funcs_table = 0;
+        self.u_resume_nargs = 0;
+        self.u_yielded_from = null;
+        self.u_completed = false;
+        self.queue_size_rows = 4;
+        self.in_progress_row = null;
+        self.queue = .{};
+        self.queue_len = 0;
+        self.row_buf_mutex = .{};
+        self.free_list = .{};
+        self.num_floating_rows = 0;
+        self.load_rid_to_row = try std.AutoArrayHashMapUnmanaged(u64, *Row).init(alloc, &.{}, &.{});
+        self.last_instant = now;
+        self.last_log_instant = now;
+        self.mbps_smoothed = 0.0;
+        self.mbps_period_max = 0.0;
+        self.samples_count = 0;
+        var row_initialized = false;
+        var loader_initialized = false;
+        var lua_initialized = false;
+        errdefer {
+            if (lua_initialized) self.lua.deinit();
+            if (loader_initialized) self.loader.deinit();
+            if (row_initialized) {
+                const row = self.in_progress_row orelse unreachable;
+                row.deinit();
+                self.alloc.destroy(row);
+                self.in_progress_row = null;
+            }
+            self.load_rid_to_row.deinit(self.alloc);
+        }
 
         try self.newInprogressRow();
+        row_initialized = true;
 
-        self.loader = try LoaderCtx.init(alloc);
-        errdefer self.loader.deinit();
+        try self.loader.initInPlace(alloc);
+        loader_initialized = true;
         try self.loader.start();
 
         // This init the Lua VM,
         // runs init_ctx, and setup generator coroutine
         self.lua = try Lua.init(alloc);
-        errdefer self.lua.deinit();
+        lua_initialized = true;
         try self.initLua(spec);
 
         return self;

@@ -1,33 +1,44 @@
 //! Python ABI3 bindings for ultar DataLoader.
 //!
-//! ## Object Hierarchy
+//! ## Ownership Layout
 //!
 //! ```
+//! module object
+//! `-- ModuleState
+//!     |-- data_loader_type: ?*PyTypeObject
+//!     `-- loaded_row_type: ?*PyTypeObject
+//!
 //! DataLoaderObject
-//! ├── ob_base: PyObject      (refcount managed by Python)
-//! └── loader: *LuaLoaderCCtx (native, destroyed in dealloc)
+//! |-- ob_base: PyObject          (refcount managed by Python)
+//! |-- typ: ?*PyTypeObject        (cached heap type for dealloc)
+//! `-- loader: ?*LuaLoaderCCtx    (native, destroyed once in dealloc)
 //!
 //! LoadedRowObject
-//! ├── ob_base: PyObject          (refcount managed by Python)
-//! ├── parent: ?*DataLoaderObject (incref'd reference to parent)
-//! └── row: ?*LoadedRow           (native ptr, reclaimed to parent's loader)
+//! |-- ob_base: PyObject          (refcount managed by Python)
+//! |-- typ: ?*PyTypeObject        (cached heap type for dealloc)
+//! |-- parent: ?*DataLoaderObject (incref'd reference to parent)
+//! `-- row: ?*LoadedRow           (native ptr, reclaimed once before parent release)
 //! ```
 //!
 //! ## Reference Ownership
 //!
 //! - `DataLoaderObject`: Created by `tp_new`, returned to Python with refcount=1.
-//!   Caller owns it. On dealloc, destroys the native loader.
+//!   Caller owns it. The instance caches its heap type pointer so custom dealloc can
+//!   call `tp_free` and discharge the heap-type reference without reading `PyObject`
+//!   headers directly.
 //!
 //! - `LoadedRowObject`: Created by `dataLoaderNext`, returned with refcount=1.
 //!   Holds an incref'd reference to its parent `DataLoaderObject` to keep it alive.
-//!   On dealloc, reclaims the native row to the parent's loader, then decrefs parent.
+//!   It also caches its heap type pointer for the same dealloc rule. On dealloc,
+//!   it reclaims the native row to the parent's loader, then decrefs parent.
 //!
 //! - No reference cycles: LoadedRow → DataLoader (one-way ownership).
 //!
 //! ## Error Handling Pattern
 //!
-//! Internal functions use Zig error semantics (`PyError!T`) with `errdefer` for cleanup.
-//! C ABI wrappers catch errors and set Python exceptions.
+//! Internal functions use Zig error semantics (`PyError!T`) with explicit partial-init
+//! cleanup. Python-owned fields are zeroed before fallible work so clear/dealloc paths
+//! tolerate partially initialized instances.
 //!
 //! ## Thread Safety
 //!
@@ -52,16 +63,7 @@ const py = @cImport({
 
 const zeros = std.mem.zeroes;
 
-/// Get the type of a Python object (ABI3-safe replacement for Py_TYPE)
-/// In limited API, Py_TYPE may not be exported as a symbol in all Python versions
-inline fn pyType(obj: ?*py.PyObject) ?*py.PyTypeObject {
-    if (obj) |o| {
-        return o.ob_type;
-    }
-    return null;
-}
-
-// ABI3-safe type checking helpers (avoid *_Check macros which use Py_TYPE internally)
+// ABI3-safe type checking helpers (avoid *_Check macros that inspect object headers)
 inline fn isUnicode(obj: ?*py.PyObject) bool {
     if (obj) |o| {
         return py.PyObject_IsInstance(o, @ptrCast(@alignCast(&py.PyUnicode_Type))) == 1;
@@ -83,22 +85,46 @@ inline fn isDict(obj: ?*py.PyObject) bool {
     return false;
 }
 
+const ModuleState = struct {
+    data_loader_type: ?*py.PyTypeObject = null,
+    loaded_row_type: ?*py.PyTypeObject = null,
+};
+
+inline fn moduleState(module: *py.PyObject) *ModuleState {
+    return @ptrCast(@alignCast(py.PyModule_GetState(module).?));
+}
+
+inline fn moduleStateFromType(typ: *py.PyTypeObject) *ModuleState {
+    return @ptrCast(@alignCast(py.PyType_GetModuleState(typ).?));
+}
+
+inline fn loadedRowType(parent: *DataLoaderObject) PyError!*py.PyTypeObject {
+    const parent_type = parent.typ orelse return error.RuntimeError;
+    return moduleStateFromType(parent_type).loaded_row_type orelse return error.RuntimeError;
+}
+
+fn freeHeapTypeInstance(typ: ?*py.PyTypeObject, self_obj: ?*py.PyObject) void {
+    const heap_type = typ orelse return;
+    const free_fn = py.PyType_GetSlot(heap_type, py.Py_tp_free) orelse unreachable;
+    const free: *const fn (?*anyopaque) callconv(.c) void = @ptrCast(@alignCast(free_fn));
+    free(self_obj);
+    py.Py_DecRef(@ptrCast(@alignCast(heap_type)));
+}
+
 // Our DataLoader object
 const DataLoaderObject = extern struct {
     ob_base: py.PyObject,
+    typ: ?*py.PyTypeObject,
     loader: ?*LuaLoaderCCtx,
 };
 
 // Our LoadedRow object (represents a single row from the dataloader)
 const LoadedRowObject = extern struct {
     ob_base: py.PyObject,
+    typ: ?*py.PyTypeObject,
     parent: ?*DataLoaderObject, // Keep reference to parent
     row: ?*LoadedRow,
 };
-
-// Type objects - stored as PyObject pointers (opaque with limited API)
-var DataLoaderType: ?*py.PyTypeObject = null;
-var LoadedRowType: ?*py.PyTypeObject = null;
 
 // Slot definitions for DataLoader type
 const DataLoader_slots = [_]py.PyType_Slot{
@@ -281,14 +307,11 @@ fn dataLoaderNewImpl(
     const alloc_fn = py.PyType_GetSlot(typ, py.Py_tp_alloc) orelse return error.RuntimeError;
     const alloc: *const fn (?*py.PyTypeObject, py.Py_ssize_t) callconv(.c) ?*py.PyObject = @ptrCast(@alignCast(alloc_fn));
     const self_obj = alloc(typ, 0) orelse return error.PythonException;
-    errdefer {
-        if (py.PyType_GetSlot(typ, py.Py_tp_free)) |f| {
-            const free: *const fn (?*anyopaque) callconv(.c) void = @ptrCast(@alignCast(f));
-            free(self_obj);
-        }
-    }
 
     const self: *DataLoaderObject = @ptrCast(@alignCast(self_obj));
+    self.typ = typ;
+    self.loader = null;
+    errdefer freeHeapTypeInstance(self.typ, self_obj);
 
     // Release GIL during heavy initialization
     const gil_state = py.PyEval_SaveThread();
@@ -353,21 +376,20 @@ fn dataLoaderNew(typ: ?*py.PyTypeObject, args: ?*py.PyObject, kwargs: ?*py.PyObj
     return @ptrCast(self);
 }
 
+fn dataLoaderClear(self: *DataLoaderObject) void {
+    if (self.loader) |loader| {
+        self.loader = null;
+        lua_dataloader.ultarDestroyLuaLoader(loader);
+    }
+}
+
 fn dataLoaderDealloc(self_obj: ?*py.PyObject) callconv(.c) void {
     const self: *DataLoaderObject = @ptrCast(@alignCast(self_obj));
 
-    if (self.loader) |loader| {
-        lua_dataloader.ultarDestroyLuaLoader(loader);
-        self.loader = null;
-    }
-
-    // Get the type and call tp_free
-    const typ = pyType(self_obj);
-    const free_fn = py.PyType_GetSlot(typ, py.Py_tp_free);
-    if (free_fn) |f| {
-        const free: *const fn (?*anyopaque) callconv(.c) void = @ptrCast(@alignCast(f));
-        free(self_obj);
-    }
+    dataLoaderClear(self);
+    const typ = self.typ;
+    self.typ = null;
+    freeHeapTypeInstance(typ, self_obj);
 }
 
 fn dataLoaderRepr(_: ?*py.PyObject) callconv(.c) ?*py.PyObject {
@@ -415,13 +437,16 @@ fn dataLoaderNext(self_obj: ?*py.PyObject) callconv(.c) ?*py.PyObject {
 /// On success: The returned Python object owns `row` and will reclaim it on dealloc.
 /// On failure: `row` is returned, caller must handle reclaim.
 fn wrapOwnedRow(parent: *DataLoaderObject, row: *LoadedRow) PyError!*py.PyObject {
-    const typ = LoadedRowType orelse return error.RuntimeError;
+    const typ = try loadedRowType(parent);
 
     const alloc_fn = py.PyType_GetSlot(typ, py.Py_tp_alloc) orelse return error.RuntimeError;
     const alloc: *const fn (?*py.PyTypeObject, py.Py_ssize_t) callconv(.c) ?*py.PyObject = @ptrCast(@alignCast(alloc_fn));
     const self_obj = alloc(typ, 0) orelse return error.PythonException;
 
     const row_obj: *LoadedRowObject = @ptrCast(@alignCast(self_obj));
+    row_obj.typ = typ;
+    row_obj.parent = null;
+    row_obj.row = null;
     row_obj.parent = parent;
     row_obj.row = row;
 
@@ -430,37 +455,28 @@ fn wrapOwnedRow(parent: *DataLoaderObject, row: *LoadedRow) PyError!*py.PyObject
     return self_obj;
 }
 
-fn loadedRowDealloc(self_obj: ?*py.PyObject) callconv(.c) void {
-    const self: *LoadedRowObject = @ptrCast(@alignCast(self_obj));
-
-    // Reclaim the row before releasing parent
-    // Null out row immediately to prevent double-free on any error path
+fn loadedRowClear(self: *LoadedRowObject) void {
     const row_to_reclaim = self.row;
     self.row = null;
 
     if (self.parent) |parent| {
+        self.parent = null;
         if (row_to_reclaim) |row| {
             if (parent.loader) |loader| {
                 lua_dataloader.ultarReclaimRow(loader, row);
             }
-            // Note: if parent.loader is null, the loader was already destroyed.
-            // This shouldn't happen with correct refcounting (we hold a ref to parent),
-            // but if it does, the row memory is already freed by ultarDestroyLuaLoader.
         }
-        self.parent = null;
         py.Py_DecRef(@ptrCast(parent));
     }
-    // Note: if self.parent is null but row_to_reclaim was set, we have a bug
-    // in createLoadedRowObject. The row is leaked but we can't reclaim it
-    // without knowing which loader it belongs to.
+}
 
-    // Get the type and call tp_free
-    const typ = pyType(self_obj);
-    const free_fn = py.PyType_GetSlot(typ, py.Py_tp_free);
-    if (free_fn) |f| {
-        const free: *const fn (?*anyopaque) callconv(.c) void = @ptrCast(@alignCast(f));
-        free(self_obj);
-    }
+fn loadedRowDealloc(self_obj: ?*py.PyObject) callconv(.c) void {
+    const self: *LoadedRowObject = @ptrCast(@alignCast(self_obj));
+
+    loadedRowClear(self);
+    const typ = self.typ;
+    self.typ = null;
+    freeHeapTypeInstance(typ, self_obj);
 }
 
 fn loadedRowRepr(self_obj: ?*py.PyObject) callconv(.c) ?*py.PyObject {
@@ -645,6 +661,55 @@ const module_methods = [_]py.PyMethodDef{
     std.mem.zeroes(py.PyMethodDef),
 };
 
+fn moduleTraverse(module_obj: ?*py.PyObject, visit: py.visitproc, arg: ?*anyopaque) callconv(.c) c_int {
+    const state = moduleState(module_obj.?);
+
+    if (state.data_loader_type) |typ| {
+        if (visit.?(@ptrCast(@alignCast(typ)), arg) != 0) return -1;
+    }
+    if (state.loaded_row_type) |typ| {
+        if (visit.?(@ptrCast(@alignCast(typ)), arg) != 0) return -1;
+    }
+    return 0;
+}
+
+fn moduleClear(module_obj: ?*py.PyObject) callconv(.c) c_int {
+    const state = moduleState(module_obj.?);
+
+    if (state.data_loader_type) |typ| {
+        state.data_loader_type = null;
+        py.Py_DecRef(@ptrCast(@alignCast(typ)));
+    }
+    if (state.loaded_row_type) |typ| {
+        state.loaded_row_type = null;
+        py.Py_DecRef(@ptrCast(@alignCast(typ)));
+    }
+    return 0;
+}
+
+fn moduleExec(module_obj: ?*py.PyObject) callconv(.c) c_int {
+    const module = module_obj orelse return -1;
+    const state = moduleState(module);
+    state.* = zeros(ModuleState);
+
+    state.data_loader_type = @ptrCast(py.PyType_FromModuleAndSpec(module, &DataLoader_spec, null));
+    if (state.data_loader_type == null) return -1;
+    errdefer _ = moduleClear(module_obj);
+
+    state.loaded_row_type = @ptrCast(py.PyType_FromModuleAndSpec(module, &LoadedRow_spec, null));
+    if (state.loaded_row_type == null) return -1;
+
+    if (py.PyModule_AddObjectRef(module, "DataLoader", @ptrCast(@alignCast(state.data_loader_type))) < 0) return -1;
+    if (py.PyModule_AddObjectRef(module, "LoadedRow", @ptrCast(@alignCast(state.loaded_row_type))) < 0) return -1;
+
+    return 0;
+}
+
+const module_slots = [_]py.PyModuleDef_Slot{
+    .{ .slot = py.Py_mod_exec, .value = @ptrCast(@constCast(&moduleExec)) },
+    zeros(py.PyModuleDef_Slot),
+};
+
 var module_def: py.PyModuleDef = undefined;
 var module_def_initialized = false;
 
@@ -656,46 +721,16 @@ fn getModuleDef() *py.PyModuleDef {
 
         module_def.m_name = "ultar_dataloader._native";
         module_def.m_doc = "Fast async dataloader with Lua scripting (Zig implementation)";
-        module_def.m_size = -1;
+        module_def.m_size = @sizeOf(ModuleState);
         module_def.m_methods = @ptrCast(@constCast(&module_methods));
+        module_def.m_slots = @ptrCast(@constCast(&module_slots));
+        module_def.m_traverse = &moduleTraverse;
+        module_def.m_clear = &moduleClear;
         module_def_initialized = true;
     }
     return &module_def;
 }
 
 export fn PyInit__native() ?*py.PyObject {
-    // Create DataLoader type using PyType_FromSpec
-    DataLoaderType = @ptrCast(py.PyType_FromSpec(&DataLoader_spec));
-    if (DataLoaderType == null) {
-        return null;
-    }
-
-    // Create LoadedRow type using PyType_FromSpec
-    LoadedRowType = @ptrCast(py.PyType_FromSpec(&LoadedRow_spec));
-    if (LoadedRowType == null) {
-        py.Py_DecRef(@ptrCast(@alignCast(DataLoaderType)));
-        return null;
-    }
-
-    const m = py.PyModule_Create(getModuleDef()) orelse {
-        py.Py_DecRef(@ptrCast(@alignCast(DataLoaderType)));
-        py.Py_DecRef(@ptrCast(@alignCast(LoadedRowType)));
-        return null;
-    };
-
-    if (py.PyModule_AddObjectRef(m, "DataLoader", @ptrCast(@alignCast(DataLoaderType))) < 0) {
-        py.Py_DecRef(m);
-        py.Py_DecRef(@ptrCast(@alignCast(DataLoaderType)));
-        py.Py_DecRef(@ptrCast(@alignCast(LoadedRowType)));
-        return null;
-    }
-
-    if (py.PyModule_AddObjectRef(m, "LoadedRow", @ptrCast(@alignCast(LoadedRowType))) < 0) {
-        py.Py_DecRef(m);
-        py.Py_DecRef(@ptrCast(@alignCast(DataLoaderType)));
-        py.Py_DecRef(@ptrCast(@alignCast(LoadedRowType)));
-        return null;
-    }
-
-    return m;
+    return py.PyModuleDef_Init(getModuleDef());
 }

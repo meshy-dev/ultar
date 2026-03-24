@@ -7,15 +7,35 @@ const concurrent_ring = @import("concurrent_ring.zig");
 const logger = std.log.scoped(.dataloader);
 const wlog = std.log.scoped(.dataloader_io_thread);
 
-pub const FileHandle = packed struct {
-    _: u14 = 0,
-    idx: u20,
-    generation: u20,
-    path_checksum: u8,
-};
+pub const FileHandle = u64;
 
-const max_file_slots = std.math.maxInt(@FieldType(FileHandle, "idx"));
-const max_generation = std.math.maxInt(@FieldType(FileHandle, "generation"));
+const file_handle_idx_bits = 20;
+const file_handle_generation_bits = 20;
+const file_handle_checksum_bits = 8;
+const file_handle_generation_shift = file_handle_checksum_bits;
+const file_handle_idx_shift = file_handle_generation_shift + file_handle_generation_bits;
+const file_handle_field_mask = (1 << file_handle_idx_bits) - 1;
+
+const max_file_slots = std.math.maxInt(u20);
+const max_generation = std.math.maxInt(u20);
+
+inline fn makeFileHandle(idx: u20, generation: u20, checksum: u8) FileHandle {
+    return (@as(u64, idx) << file_handle_idx_shift) |
+        (@as(u64, generation) << file_handle_generation_shift) |
+        checksum;
+}
+
+inline fn fileHandleIdx(file: FileHandle) usize {
+    return @intCast((file >> file_handle_idx_shift) & file_handle_field_mask);
+}
+
+inline fn fileHandleGeneration(file: FileHandle) u32 {
+    return @intCast((file >> file_handle_generation_shift) & file_handle_field_mask);
+}
+
+inline fn fileHandleChecksum(file: FileHandle) u8 {
+    return @intCast(file & std.math.maxInt(u8));
+}
 
 pub const ReadBlockReq = struct {
     base: u64,
@@ -101,17 +121,15 @@ pub const LoaderCtx = struct {
     req_mem_pool: std.heap.MemoryPool(XevReq),
 
     fn findFreeFileSlot(self: *Self) !FileHandle {
+        const file_slots = self.file_slots[0..];
+
         // This isn't called too often, just linear scan
         for (0..max_file_slots) |offset| {
             const i = (self.last_slot + offset) % max_file_slots;
-            const f = self.file_slots[i];
+            const f = file_slots[i];
             if (f == null) {
                 self.last_slot = (i + 1) % max_file_slots;
-                return .{
-                    .idx = @intCast(i),
-                    .generation = 0,
-                    .path_checksum = 0,
-                };
+                return makeFileHandle(@intCast(i), 0, 0);
             }
         }
 
@@ -119,10 +137,14 @@ pub const LoaderCtx = struct {
     }
 
     fn checkFilehandle(self: *Self, file: FileHandle) !void {
-        const slot: usize = @intCast(file.idx);
-        if (self.file_slots[slot] == null) return LoaderError.InvalidFileHandle;
-        if (self.file_slots_generation[slot] != file.generation or self.file_slots_checksum[slot] != file.path_checksum) {
-            logger.warn("File handle {} is corrupted, current generation: {}, checksum: {}", .{ file, self.file_slots_generation[slot], self.file_slots_checksum[slot] });
+        const slot = fileHandleIdx(file);
+        const file_slots = self.file_slots[0..];
+        const generations = self.file_slots_generation[0..];
+        const checksums = self.file_slots_checksum[0..];
+
+        if (file_slots[slot] == null) return LoaderError.InvalidFileHandle;
+        if (generations[slot] != fileHandleGeneration(file) or checksums[slot] != fileHandleChecksum(file)) {
+            logger.warn("File handle {} is corrupted, current generation: {}, checksum: {}", .{ file, generations[slot], checksums[slot] });
             return LoaderError.InvalidFileHandle;
         }
     }
@@ -153,12 +175,15 @@ pub const LoaderCtx = struct {
         const self = ud orelse unreachable;
 
         const xreq: *XevReq = @fieldParentPtr("c", c);
+        const slot = fileHandleIdx(xreq.req.file);
+        const request_id = xreq.request_id;
 
         const actual = r catch {
-            self.sendResponseSynced(xreq.request_id, LoaderError.ReadError);
+            self.fileDecRef(slot);
+            self.req_mem_pool.destroy(xreq);
+            self.sendResponseSynced(request_id, LoaderError.ReadError);
             return .disarm;
         };
-        const slot: usize = @intCast(xreq.req.file.idx);
         self.fileDecRef(slot);
 
         if (actual != xreq.req.result_buffer.len) {
@@ -172,24 +197,34 @@ pub const LoaderCtx = struct {
     }
 
     fn fileAddRef(self: *Self, slot: usize) void {
+        const refcounts = self.file_refcount[0..];
+
         // Should start on 1
-        std.debug.assert(self.file_refcount[slot] > 0);
-        self.file_refcount[slot] += 1;
+        std.debug.assert(refcounts[slot] > 0);
+        refcounts[slot] += 1;
     }
 
     fn fileDecRef(self: *Self, slot: usize) void {
-        std.debug.assert(self.file_refcount[slot] > 0);
-        self.file_refcount[slot] -= 1;
-        if (self.file_refcount[slot] == 0) {
-            const f = self.file_slots[slot] orelse unreachable;
+        const refcounts = self.file_refcount[0..];
+        const file_slots = self.file_slots[0..];
+
+        std.debug.assert(refcounts[slot] > 0);
+        refcounts[slot] -= 1;
+        if (refcounts[slot] == 0) {
+            const f = file_slots[slot] orelse unreachable;
             f.close();
-            self.file_slots[slot] = null;
+            file_slots[slot] = null;
         }
     }
 
     fn handleReq(self: *Self, req_id: u64, req: Request) void {
         switch (req) {
             .open_file => |open_req| {
+                const file_slots = self.file_slots[0..];
+                const xfile_slots = self.xfile_slots[0..];
+                const refcounts = self.file_refcount[0..];
+                const generations = self.file_slots_generation[0..];
+                const checksums = self.file_slots_checksum[0..];
                 const file_path = open_req.file_path;
                 wlog.debug("Req {}: open_file: file = {s}", .{ req_id, file_path });
 
@@ -206,16 +241,16 @@ pub const LoaderCtx = struct {
                 const xf = xev.File.init(f) catch unreachable;
 
                 // Commit state
-                const slot: usize = @intCast(h.idx);
-                h.path_checksum = path_checksum(file_path);
-                self.file_slots[slot] = f;
-                self.xfile_slots[slot] = xf;
-                self.file_refcount[slot] = 1;
-                self.file_slots_generation[slot] += 1; // gen 0 is reserved to catch errors
-                self.file_slots_checksum[slot] = h.path_checksum;
-                const gen = self.file_slots_generation[slot];
+                const slot = fileHandleIdx(h);
+                const checksum = path_checksum(file_path);
+                file_slots[slot] = f;
+                xfile_slots[slot] = xf;
+                refcounts[slot] = 1;
+                generations[slot] += 1; // gen 0 is reserved to catch errors
+                checksums[slot] = checksum;
+                const gen = generations[slot];
                 if (gen > max_generation) @panic("Open file generation overflow");
-                h.generation = @intCast(gen);
+                h = makeFileHandle(@intCast(slot), @intCast(gen), checksum);
 
                 self.sendResponseSynced(req_id, .{ .open_file = h });
             },
@@ -228,7 +263,7 @@ pub const LoaderCtx = struct {
                     return;
                 };
 
-                const slot: usize = @intCast(file_handle.idx);
+                const slot = fileHandleIdx(file_handle);
 
                 self.fileDecRef(slot);
             },
@@ -241,7 +276,7 @@ pub const LoaderCtx = struct {
                     return;
                 };
 
-                const slot: usize = @intCast(read_req.file.idx);
+                const slot = fileHandleIdx(read_req.file);
                 const xf = self.xfile_slots[slot];
 
                 // Prepare read request
@@ -383,14 +418,26 @@ pub const LoaderCtx = struct {
         logger.debug("Worker thread started", .{});
     }
 
-    pub fn init(alloc: std.mem.Allocator) !Self {
-        return .{
-            .alloc = alloc,
-            .file_slots = [_]?std.fs.File{null} ** max_file_slots,
-            .file_slots_generation = [_]u32{0} ** max_file_slots,
-            .loop = try xev.Loop.init(.{}),
-            .req_mem_pool = try std.heap.MemoryPool(XevReq).initPreheated(alloc, 16),
-        };
+    pub fn initInPlace(self: *Self, alloc: std.mem.Allocator) !void {
+        self.alloc = alloc;
+        self.request_ring = ReqRing.init();
+        self.result_ring = ResultRing.init();
+        self.file_slots = @splat(null);
+        self.xfile_slots = undefined;
+        self.file_refcount = @splat(0);
+        self.file_slots_generation = std.mem.zeroes([max_file_slots]u32);
+        self.file_slots_checksum = undefined;
+        self.loop = try xev.Loop.init(.{});
+        errdefer self.loop.deinit();
+        self.worker_thread = null;
+        self.req_cnt = 0;
+        self.is_running = false;
+        self.is_draining = false;
+        self.last_slot = 0;
+        self.debug_max_req_id = std.math.maxInt(u64);
+        self.tick = 0;
+        self.debug_max_tick = std.math.maxInt(u64);
+        self.req_mem_pool = try std.heap.MemoryPool(XevReq).initPreheated(alloc, 16);
     }
 
     pub fn deinit(self: *Self) void {
@@ -421,7 +468,9 @@ test "test dataloader" {
     var debug_alloc = std.heap.DebugAllocator(.{}).init;
     defer _ = debug_alloc.deinit();
 
-    var ctx = try LoaderCtx.init(debug_alloc.allocator());
+    const ctx = try debug_alloc.allocator().create(LoaderCtx);
+    defer debug_alloc.allocator().destroy(ctx);
+    try ctx.initInPlace(debug_alloc.allocator());
     ctx.debug_max_req_id = 5;
     ctx.debug_max_tick = 1000;
     try ctx.start();
@@ -450,7 +499,9 @@ test "test dataloader blocked join" {
     var debug_alloc = std.heap.DebugAllocator(.{}).init;
     defer _ = debug_alloc.deinit();
 
-    var ctx = try LoaderCtx.init(debug_alloc.allocator());
+    const ctx = try debug_alloc.allocator().create(LoaderCtx);
+    defer debug_alloc.allocator().destroy(ctx);
+    try ctx.initInPlace(debug_alloc.allocator());
     ctx.debug_max_req_id = 100;
     ctx.debug_max_tick = 1000;
     try ctx.start();

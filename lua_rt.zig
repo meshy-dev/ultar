@@ -88,9 +88,27 @@ pub fn toUnsigned(lua: *Lua, idx: i32) !u32 {
     }
 }
 
+pub fn toUnsigned64(lua: *Lua, idx: i32) !u64 {
+    if (zlua.lang == .luau or zlua.lang == .lua52) {
+        return lua.toUnsigned(idx);
+    } else {
+        const f = try lua.toNumber(idx);
+        return @intFromFloat(f);
+    }
+}
+
 pub fn pushUnsigned(lua: *Lua, v: u32) void {
     if (zlua.lang == .luau or zlua.lang == .lua52) {
         lua.pushUnsigned(v);
+    } else {
+        const f: f64 = @floatFromInt(v);
+        lua.pushNumber(f);
+    }
+}
+
+pub fn pushUnsigned64(lua: *Lua, v: u64) void {
+    if (zlua.lang == .luau or zlua.lang == .lua52) {
+        lua.pushUnsigned(@intCast(v));
     } else {
         const f: f64 = @floatFromInt(v);
         lua.pushNumber(f);

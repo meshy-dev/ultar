@@ -101,12 +101,10 @@ pub const LoaderCtx = struct {
     req_mem_pool: std.heap.MemoryPool(XevReq),
 
     fn findFreeFileSlot(self: *Self) !FileHandle {
-        const file_slots = self.file_slots[0..];
-
         // This isn't called too often, just linear scan
         for (0..max_file_slots) |offset| {
             const i = (self.last_slot + offset) % max_file_slots;
-            const f = file_slots[i];
+            const f = self.file_slots[0..][i];
             if (f == null) {
                 self.last_slot = (i + 1) % max_file_slots;
                 return .{ .idx = @intCast(i), .generation = 0, .path_checksum = 0 };
@@ -177,23 +175,18 @@ pub const LoaderCtx = struct {
     }
 
     fn fileAddRef(self: *Self, slot: usize) void {
-        const refcounts = self.file_refcount[0..];
-
         // Should start on 1
-        std.debug.assert(refcounts[slot] > 0);
-        refcounts[slot] += 1;
+        std.debug.assert(self.file_refcount[0..][slot] > 0);
+        self.file_refcount[0..][slot] += 1;
     }
 
     fn fileDecRef(self: *Self, slot: usize) void {
-        const refcounts = self.file_refcount[0..];
-        const file_slots = self.file_slots[0..];
-
-        std.debug.assert(refcounts[slot] > 0);
-        refcounts[slot] -= 1;
-        if (refcounts[slot] == 0) {
-            const f = file_slots[slot] orelse unreachable;
+        std.debug.assert(self.file_refcount[0..][slot] > 0);
+        self.file_refcount[0..][slot] -= 1;
+        if (self.file_refcount[0..][slot] == 0) {
+            const f = self.file_slots[0..][slot] orelse unreachable;
             f.close();
-            file_slots[slot] = null;
+            self.file_slots[0..][slot] = null;
         }
     }
 

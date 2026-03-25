@@ -120,6 +120,7 @@ pub const LoaderCtx = struct {
         const generations = self.file_slots_generation[0..];
         const checksums = self.file_slots_checksum[0..];
 
+        if (slot >= file_slots.len) return LoaderError.InvalidFileHandle;
         if (file_slots[slot] == null) return LoaderError.InvalidFileHandle;
         if (generations[slot] != file.generation or checksums[slot] != file.path_checksum) {
             logger.warn("File handle {} is corrupted, current generation: {}, checksum: {}", .{ file, generations[slot], checksums[slot] });
@@ -482,4 +483,23 @@ test "test dataloader blocked join" {
 
     try std.testing.expect(ctx.is_running == false);
     try std.testing.expectEqual(null, ctx.result_ring.dequeue());
+}
+
+test "invalid file handle index is rejected" {
+    var debug_alloc = std.heap.DebugAllocator(.{}).init;
+    defer _ = debug_alloc.deinit();
+
+    const ctx = try debug_alloc.allocator().create(LoaderCtx);
+    defer debug_alloc.allocator().destroy(ctx);
+    try ctx.initInPlace(debug_alloc.allocator());
+    defer ctx.deinit();
+
+    try std.testing.expectError(
+        LoaderError.InvalidFileHandle,
+        ctx.checkFilehandle(.{
+            .idx = std.math.maxInt(u20),
+            .generation = 0,
+            .path_checksum = 0,
+        }),
+    );
 }

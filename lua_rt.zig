@@ -5,6 +5,10 @@ const msgpack = @import("msgpack.zig");
 
 const logger = std.log.scoped(.lua_rt);
 
+const max_exact_lua_handle = std.math.maxInt(u48);
+const can_use_lua_unsigned64 =
+    (zlua.lang == .luau or zlua.lang == .lua52) and std.math.maxInt(zlua.Unsigned) >= max_exact_lua_handle;
+
 const ScanCtx = struct {
     dir: std.fs.Dir,
     iter: std.fs.Dir.Iterator,
@@ -89,10 +93,11 @@ pub fn toUnsigned(lua: *Lua, idx: i32) !u32 {
 }
 
 pub fn toUnsigned64(lua: *Lua, idx: i32) !u64 {
-    if (zlua.lang == .luau or zlua.lang == .lua52) {
+    if (can_use_lua_unsigned64) {
         return lua.toUnsigned(idx);
     } else {
         const f = try lua.toNumber(idx);
+        std.debug.assert(f >= 0 and f <= max_exact_lua_handle);
         return @intFromFloat(f);
     }
 }
@@ -107,9 +112,10 @@ pub fn pushUnsigned(lua: *Lua, v: u32) void {
 }
 
 pub fn pushUnsigned64(lua: *Lua, v: u64) void {
-    if (zlua.lang == .luau or zlua.lang == .lua52) {
+    if (can_use_lua_unsigned64) {
         lua.pushUnsigned(@intCast(v));
     } else {
+        std.debug.assert(v <= max_exact_lua_handle);
         const f: f64 = @floatFromInt(v);
         lua.pushNumber(f);
     }

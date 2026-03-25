@@ -357,16 +357,16 @@ pub const LuaDataLoader = struct {
 
                 switch (payload) {
                     .open_file => |f| {
-                        std.debug.assert((self.u_yielded_from orelse @panic("Unresolved open_file req")) == .open_file);
+                        if (self.u_yielded_from == null or self.u_yielded_from.? != .open_file) {
+                            return error.UnexpectedOpenFileResponse;
+                        }
                         lua_rt.pushUnsigned64(self.lua, @bitCast(f));
                         self.u_resume_nargs = 1;
                         self.u_yielded_from = null;
                     },
                     .read_block => {
-                        const rid = resp.request_id;
-                        const kv = self.load_rid_to_row.fetchSwapRemove(rid) orelse @panic("read_block rid not found in map");
-                        const row = kv.value;
-                        row.num_fullfilled += 1;
+                        const kv = self.load_rid_to_row.fetchSwapRemove(resp.request_id) orelse @panic("read_block rid not found in map");
+                        kv.value.num_fullfilled += 1;
                     },
                 }
             }

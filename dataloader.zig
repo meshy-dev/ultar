@@ -8,10 +8,10 @@ const logger = std.log.scoped(.dataloader);
 const wlog = std.log.scoped(.dataloader_io_thread);
 
 pub const FileHandle = packed struct {
-    _: u16 = 0,
     idx: u20,
     generation: u20,
     path_checksum: u8,
+    _: u16 = 0,
 };
 
 const max_file_slots = std.math.maxInt(u20);
@@ -88,6 +88,7 @@ pub const LoaderCtx = struct {
 
     loop: xev.Loop,
     worker_thread: ?std.Thread = null,
+    worker_done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     req_cnt: u64 = 0,
     is_running: bool = false,
@@ -301,7 +302,7 @@ pub const LoaderCtx = struct {
             }
         }
 
-        self.worker_thread = null;
+        self.worker_done.store(true, .release);
     }
 
     // Loader side functions
@@ -361,14 +362,14 @@ pub const LoaderCtx = struct {
             self.drainResponse();
             std.Thread.yield() catch {};
         }
-        // Now wait until the worker thread is done
-        while (self.worker_thread != null) {
+        // Now wait until the worker thread signals done
+        while (!self.worker_done.load(.acquire)) {
             self.drainResponse();
             std.Thread.yield() catch {};
         }
-        // When worker thread is null, it means the thread has exited
         self.drainResponse();
         thread.join();
+        self.worker_thread = null;
     }
 
     pub fn start(self: *Self) !void {
@@ -377,6 +378,7 @@ pub const LoaderCtx = struct {
         }
 
         self.is_running = true;
+        self.worker_done.store(false, .monotonic);
 
         self.worker_thread = try std.Thread.spawn(.{
             .allocator = self.alloc,
@@ -398,6 +400,7 @@ pub const LoaderCtx = struct {
         self.loop = try xev.Loop.init(.{});
         errdefer self.loop.deinit();
         self.worker_thread = null;
+        self.worker_done = std.atomic.Value(bool).init(false);
         self.req_cnt = 0;
         self.is_running = false;
         self.is_draining = false;

@@ -358,7 +358,7 @@ pub const LuaDataLoader = struct {
                 switch (payload) {
                     .open_file => |f| {
                         std.debug.assert((self.u_yielded_from orelse @panic("Unresolved open_file req")) == .open_file);
-                        lua_rt.pushUnsigned64(self.lua, f);
+                        lua_rt.pushUnsigned64(self.lua, @bitCast(f));
                         self.u_resume_nargs = 1;
                         self.u_yielded_from = null;
                     },
@@ -581,32 +581,24 @@ pub const LuaDataLoader = struct {
         self.mbps_smoothed = 0.0;
         self.mbps_period_max = 0.0;
         self.samples_count = 0;
-        var row_initialized = false;
-        var loader_initialized = false;
-        var lua_initialized = false;
-        errdefer {
-            if (lua_initialized) self.lua.deinit();
-            if (loader_initialized) self.loader.deinit();
-            if (row_initialized) {
-                const row = self.in_progress_row orelse unreachable;
-                row.deinit();
-                self.alloc.destroy(row);
-                self.in_progress_row = null;
-            }
-            self.load_rid_to_row.deinit(self.alloc);
-        }
+        errdefer self.load_rid_to_row.deinit(self.alloc);
 
         try self.newInprogressRow();
-        row_initialized = true;
+        errdefer {
+            const row = self.in_progress_row orelse unreachable;
+            row.deinit();
+            self.alloc.destroy(row);
+            self.in_progress_row = null;
+        }
 
         try self.loader.initInPlace(alloc);
-        loader_initialized = true;
+        errdefer self.loader.deinit();
         try self.loader.start();
 
         // This init the Lua VM,
         // runs init_ctx, and setup generator coroutine
         self.lua = try Lua.init(alloc);
-        lua_initialized = true;
+        errdefer self.lua.deinit();
         try self.initLua(spec);
 
         return self;

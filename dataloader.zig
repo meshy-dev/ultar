@@ -7,35 +7,15 @@ const concurrent_ring = @import("concurrent_ring.zig");
 const logger = std.log.scoped(.dataloader);
 const wlog = std.log.scoped(.dataloader_io_thread);
 
-pub const FileHandle = u64;
-
-const file_handle_idx_bits = 20;
-const file_handle_generation_bits = 20;
-const file_handle_checksum_bits = 8;
-const file_handle_generation_shift = file_handle_checksum_bits;
-const file_handle_idx_shift = file_handle_generation_shift + file_handle_generation_bits;
-const file_handle_field_mask = (1 << file_handle_idx_bits) - 1;
+pub const FileHandle = packed struct {
+    _: u16 = 0,
+    idx: u20,
+    generation: u20,
+    path_checksum: u8,
+};
 
 const max_file_slots = std.math.maxInt(u20);
 const max_generation = std.math.maxInt(u20);
-
-inline fn makeFileHandle(idx: u20, generation: u20, checksum: u8) FileHandle {
-    return (@as(u64, idx) << file_handle_idx_shift) |
-        (@as(u64, generation) << file_handle_generation_shift) |
-        checksum;
-}
-
-inline fn fileHandleIdx(file: FileHandle) usize {
-    return @intCast((file >> file_handle_idx_shift) & file_handle_field_mask);
-}
-
-inline fn fileHandleGeneration(file: FileHandle) u32 {
-    return @intCast((file >> file_handle_generation_shift) & file_handle_field_mask);
-}
-
-inline fn fileHandleChecksum(file: FileHandle) u8 {
-    return @intCast(file & std.math.maxInt(u8));
-}
 
 pub const ReadBlockReq = struct {
     base: u64,
@@ -129,7 +109,7 @@ pub const LoaderCtx = struct {
             const f = file_slots[i];
             if (f == null) {
                 self.last_slot = (i + 1) % max_file_slots;
-                return makeFileHandle(@intCast(i), 0, 0);
+                return .{ .idx = @intCast(i), .generation = 0, .path_checksum = 0 };
             }
         }
 
@@ -137,13 +117,13 @@ pub const LoaderCtx = struct {
     }
 
     fn checkFilehandle(self: *Self, file: FileHandle) !void {
-        const slot = fileHandleIdx(file);
+        const slot: usize = file.idx;
         const file_slots = self.file_slots[0..];
         const generations = self.file_slots_generation[0..];
         const checksums = self.file_slots_checksum[0..];
 
         if (file_slots[slot] == null) return LoaderError.InvalidFileHandle;
-        if (generations[slot] != fileHandleGeneration(file) or checksums[slot] != fileHandleChecksum(file)) {
+        if (generations[slot] != file.generation or checksums[slot] != file.path_checksum) {
             logger.warn("File handle {} is corrupted, current generation: {}, checksum: {}", .{ file, generations[slot], checksums[slot] });
             return LoaderError.InvalidFileHandle;
         }
@@ -175,7 +155,7 @@ pub const LoaderCtx = struct {
         const self = ud orelse unreachable;
 
         const xreq: *XevReq = @fieldParentPtr("c", c);
-        const slot = fileHandleIdx(xreq.req.file);
+        const slot: usize = xreq.req.file.idx;
         const request_id = xreq.request_id;
 
         const actual = r catch {
@@ -220,13 +200,7 @@ pub const LoaderCtx = struct {
     fn handleReq(self: *Self, req_id: u64, req: Request) void {
         switch (req) {
             .open_file => |open_req| {
-                const file_slots = self.file_slots[0..];
-                const xfile_slots = self.xfile_slots[0..];
-                const refcounts = self.file_refcount[0..];
-                const generations = self.file_slots_generation[0..];
-                const checksums = self.file_slots_checksum[0..];
-                const file_path = open_req.file_path;
-                wlog.debug("Req {}: open_file: file = {s}", .{ req_id, file_path });
+                wlog.debug("Req {}: open_file: file = {s}", .{ req_id, open_req.file_path });
 
                 var h = self.findFreeFileSlot() catch |err| {
                     self.sendResponseSynced(req_id, err);
@@ -241,16 +215,16 @@ pub const LoaderCtx = struct {
                 const xf = xev.File.init(f) catch unreachable;
 
                 // Commit state
-                const slot = fileHandleIdx(h);
-                const checksum = path_checksum(file_path);
-                file_slots[slot] = f;
-                xfile_slots[slot] = xf;
-                refcounts[slot] = 1;
-                generations[slot] += 1; // gen 0 is reserved to catch errors
-                checksums[slot] = checksum;
-                const gen = generations[slot];
+                const slot: usize = h.idx;
+                const checksum = path_checksum(open_req.file_path);
+                self.file_slots[slot] = f;
+                self.xfile_slots[slot] = xf;
+                self.file_refcount[slot] = 1;
+                self.file_slots_generation[slot] += 1; // gen 0 is reserved to catch errors
+                self.file_slots_checksum[slot] = checksum;
+                const gen = self.file_slots_generation[slot];
                 if (gen > max_generation) @panic("Open file generation overflow");
-                h = makeFileHandle(@intCast(slot), @intCast(gen), checksum);
+                h = .{ .idx = @intCast(slot), .generation = @intCast(gen), .path_checksum = checksum };
 
                 self.sendResponseSynced(req_id, .{ .open_file = h });
             },
@@ -263,7 +237,7 @@ pub const LoaderCtx = struct {
                     return;
                 };
 
-                const slot = fileHandleIdx(file_handle);
+                const slot: usize = file_handle.idx;
 
                 self.fileDecRef(slot);
             },
@@ -276,7 +250,7 @@ pub const LoaderCtx = struct {
                     return;
                 };
 
-                const slot = fileHandleIdx(read_req.file);
+                const slot: usize = read_req.file.idx;
                 const xf = self.xfile_slots[slot];
 
                 // Prepare read request

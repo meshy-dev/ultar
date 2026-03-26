@@ -694,13 +694,21 @@ fn moduleExec(module_obj: ?*py.PyObject) callconv(.c) c_int {
 
     state.data_loader_type = @ptrCast(py.PyType_FromModuleAndSpec(module, &DataLoader_spec, null));
     if (state.data_loader_type == null) return -1;
-    errdefer _ = moduleClear(module_obj);
 
     state.loaded_row_type = @ptrCast(py.PyType_FromModuleAndSpec(module, &LoadedRow_spec, null));
-    if (state.loaded_row_type == null) return -1;
+    if (state.loaded_row_type == null) {
+        _ = moduleClear(module_obj);
+        return -1;
+    }
 
-    if (py.PyModule_AddObjectRef(module, "DataLoader", @ptrCast(@alignCast(state.data_loader_type))) < 0) return -1;
-    if (py.PyModule_AddObjectRef(module, "LoadedRow", @ptrCast(@alignCast(state.loaded_row_type))) < 0) return -1;
+    if (py.PyModule_AddObjectRef(module, "DataLoader", @ptrCast(@alignCast(state.data_loader_type))) < 0) {
+        _ = moduleClear(module_obj);
+        return -1;
+    }
+    if (py.PyModule_AddObjectRef(module, "LoadedRow", @ptrCast(@alignCast(state.loaded_row_type))) < 0) {
+        _ = moduleClear(module_obj);
+        return -1;
+    }
 
     return 0;
 }

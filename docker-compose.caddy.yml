@@ -10,7 +10,10 @@ services:
     image: ghcr.io/meshy-dev/ultar:latest
     # build: .   # uncomment to build from local Dockerfile instead
     volumes:
-      - ./data:/data:ro
+      - ./data:/data
+    # Allow io_uring in the container; otherwise xev loop init fails with EPERM.
+    security_opt:
+      - seccomp:unconfined
     restart: unless-stopped
 
   caddy:

@@ -1,96 +1,22 @@
-const std = @import("std");
-const builtin = @import("builtin");
-const zap = @import("zap");
-const clap = @import("clap");
-const msgpack = @import("msgpack");
-// preview templates handled via mustache; htmx 4 loaded via CDN ESM
+//! Entry point for `ultar_httpd`: wires up singletons and runs the httpz server until SIGINT/SIGTERM.
 
+const std = @import("std");
+const clap = @import("clap");
+const httpz = @import("httpz");
+
+const App = @import("App.zig");
+const handlers = @import("handlers.zig");
 const TemplateCache = @import("TemplateCache.zig");
 const IndexerWorker = @import("IndexerWorker.zig");
 
-const urlDecodeBuf = @import("encodings.zig").urlDecodeBuf;
-const urlEncodeAlloc = @import("encodings.zig").urlEncodeAlloc;
+/// Shared between `main` and `shutdown`; non-null only while the server is listening.
+var server_instance: ?*httpz.Server(*App) = null;
 
-// Global gpa
-var gpa_instance = std.heap.GeneralPurposeAllocator(.{}){};
-const gpa = gpa_instance.allocator();
-
-// Base directory to browse
-var base_dir_buf: [std.fs.MAX_PATH_BYTES]u8 = undefined;
-var base_dir: []const u8 = undefined;
-
-var template_cache: TemplateCache = undefined;
-var indexer_worker: IndexerWorker = undefined;
-
-// Join and normalize a path under base_dir; reject traversal outside base_dir
-fn buildSafePathAlloc(alloc: std.mem.Allocator, rel: []const u8) ![]u8 {
-    if (rel.len == 0) return error.InvalidPath;
-    // Consider all incoming paths relative to base_dir, regardless of absolute/relative form
-    const parts = &[_][]const u8{ base_dir, rel };
-    const resolved = try std.fs.path.resolve(alloc, parts);
-    return resolved; // allocated with alloc; caller frees (arena in route handlers)
+fn shutdown(_: std.posix.SIG) callconv(.c) void {
+    if (server_instance) |srv| srv.stop();
 }
 
-fn findMimeTypeAlloc(alloc: std.mem.Allocator, file_name: []const u8) ![]const u8 {
-    // zig std considers .* to be no extension, however this is ultar keys
-    // thus we don't use std.fs.path.extension
-    var i = file_name.len;
-    while (i > 0 and file_name[i - 1] != '.') {
-        i -= 1;
-    }
-    const e = file_name[i..];
-
-    const obj = zap.fio.http_mimetype_find(@constCast(e.ptr), e.len);
-
-    if (obj == 0) return try alloc.dupe(u8, "application/octet-stream");
-
-    return try zap.util.fio2strAlloc(alloc, obj);
-}
-
-// Directory entry structure
-const DirEntry = struct {
-    typ: enum { dir, file, unindexed_tar },
-    name: []const u8,
-    rel_path: []const u8,
-
-    fn deinit(self: *const DirEntry) void {
-        gpa.free(self.name);
-        gpa.free(self.rel_path);
-    }
-};
-
-// Utix entry structure
-const UtixEntry = struct {
-    str_idx: []const u8,
-    iidx: u64,
-    offset: u64,
-    keys: [][]const u8,
-    offsets: []u64,
-    sizes: []u64,
-
-    fn deinit(self: *const UtixEntry) void {
-        gpa.free(self.str_idx);
-        for (self.keys) |key| {
-            gpa.free(key);
-        }
-        gpa.free(self.keys);
-        gpa.free(self.offsets);
-        gpa.free(self.sizes);
-    }
-};
-
-const UtixField = enum { none, str_idx, iidx, offset, keys, offsets, sizes, unknown };
-
-fn utixFieldFromKey(key: []const u8) UtixField {
-    if (std.mem.eql(u8, key, "str_idx")) return .str_idx;
-    if (std.mem.eql(u8, key, "iidx")) return .iidx;
-    if (std.mem.eql(u8, key, "offset")) return .offset;
-    if (std.mem.eql(u8, key, "keys")) return .keys;
-    if (std.mem.eql(u8, key, "offsets")) return .offsets;
-    if (std.mem.eql(u8, key, "sizes")) return .sizes;
-    return .unknown;
-}
-
+/// Drop trailing path separators, preserving a lone leading `/`.
 fn trimTrailingSep(path: []const u8) []const u8 {
     var end: usize = path.len;
     while (end > 1 and path[end - 1] == std.fs.path.sep) {
@@ -99,798 +25,43 @@ fn trimTrailingSep(path: []const u8) []const u8 {
     return path[0..end];
 }
 
-// Initialize base directory
-fn initBaseDir() !void {
-    // Prefer DATA_PATH env var; fallback to current working directory
-    if (std.posix.getenv("DATA_PATH")) |env_path| {
-        // Resolve to absolute path if possible
-        const env_slice: []const u8 = std.mem.sliceTo(env_path, 0);
-        const abs = if (std.fs.path.isAbsolute(env_slice))
-            env_slice
-        else blk: {
-            const abs_join = try std.fs.path.resolve(gpa, &[_][]const u8{ ".", env_slice });
-            defer gpa.free(abs_join);
-            break :blk abs_join;
-        };
-        base_dir = try gpa.dupe(u8, trimTrailingSep(abs));
-        return;
-    }
-
-    var cwd_buf: [1024]u8 = undefined;
-    const cwd = try std.fs.cwd().realpath(".", &cwd_buf);
-    base_dir = try gpa.dupe(u8, trimTrailingSep(cwd));
-}
-
-// Parse .utix file using msgpack.Scanner
-fn parseUtixFile(alloc: std.mem.Allocator, file_path: []const u8) ![]UtixEntry {
-    var file = try std.fs.openFileAbsolute(file_path, .{ .mode = .read_only });
-    defer file.close();
-
-    const read_buf = try alloc.alloc(u8, 16384);
-    defer alloc.free(read_buf);
-    var reader = std.fs.File.readerStreaming(file, read_buf);
-    var scanner = msgpack.Scanner.init(&reader.interface, alloc);
-    defer scanner.deinit();
-
-    var entries = try std.ArrayList(UtixEntry).initCapacity(alloc, 0);
-    var current: ?UtixEntry = null;
-    var current_field: UtixField = .none;
-
-    while (true) {
-        const tok = try scanner.next();
-        switch (tok) {
-            .end => break,
-            .map_begin => |_| {
-                current = UtixEntry{
-                    .str_idx = "",
-                    .iidx = 0,
-                    .offset = 0,
-                    .keys = &[_][]const u8{},
-                    .offsets = &[_]u64{},
-                    .sizes = &[_]u64{},
-                };
-            },
-            .map_key => |key| {
-                current_field = utixFieldFromKey(key);
-            },
-            .map_end => {
-                if (current) |entry| {
-                    try entries.append(alloc, entry);
-                    current = null;
-                }
-            },
-            .array_begin => |len| {
-                if (current == null) continue;
-                if (current_field == .keys) {
-                    var tmp = try std.ArrayList([]const u8).initCapacity(alloc, len);
-                    var i: usize = 0;
-                    while (i < len) : (i += 1) {
-                        const it = try scanner.next();
-                        switch (it) {
-                            .string => |s| try tmp.append(alloc, try alloc.dupe(u8, s)),
-                            else => return error.InvalidFormat,
-                        }
-                    }
-                    // consume array_end
-                    _ = try scanner.next();
-                    current.?.keys = try tmp.toOwnedSlice(alloc);
-                } else if (current_field == .offsets or current_field == .sizes) {
-                    var tmp = try std.ArrayList(u64).initCapacity(alloc, len);
-                    var i: usize = 0;
-                    while (i < len) : (i += 1) {
-                        const it = try scanner.next();
-                        switch (it) {
-                            .uint => |u| try tmp.append(alloc, u),
-                            .int => |iv| try tmp.append(alloc, @intCast(iv)),
-                            else => return error.InvalidFormat,
-                        }
-                    }
-                    // consume array_end
-                    _ = try scanner.next();
-                    if (current_field == .offsets) {
-                        current.?.offsets = try tmp.toOwnedSlice(alloc);
-                    } else {
-                        current.?.sizes = try tmp.toOwnedSlice(alloc);
-                    }
-                } else {
-                    // Skip unknown arrays
-                    var i: usize = 0;
-                    while (i < len) : (i += 1) {
-                        _ = try scanner.next();
-                    }
-                    _ = try scanner.next();
-                }
-            },
-            .string => |s| {
-                if (current == null) continue;
-                if (current_field == .str_idx) {
-                    current.?.str_idx = try alloc.dupe(u8, s);
-                }
-            },
-            .uint => |u| {
-                if (current == null) continue;
-                switch (current_field) {
-                    .iidx => current.?.iidx = u,
-                    .offset => current.?.offset = u,
-                    else => {},
-                }
-            },
-            .int => |iv| {
-                if (current == null) continue;
-                switch (current_field) {
-                    .iidx => current.?.iidx = @intCast(iv),
-                    .offset => current.?.offset = @intCast(iv),
-                    else => {},
-                }
-            },
-            else => {},
-        }
-    }
-
-    return entries.toOwnedSlice(alloc);
-}
-
-// List directories and .utix files
-fn listDirectory(alloc: std.mem.Allocator, path: []const u8) ![]DirEntry {
-    // Build safe full path
-    const full_path = if (std.mem.eql(u8, path, ""))
-        base_dir
-    else
-        try buildSafePathAlloc(alloc, path);
-    defer if (!std.mem.eql(u8, path, "")) alloc.free(full_path);
-
-    // Open directory
-    var dir = try std.fs.openDirAbsolute(full_path, .{ .iterate = true });
-    defer dir.close();
-
-    var entries = try std.ArrayList(DirEntry).initCapacity(alloc, 0);
-
-    // Collect all names first so we can check for .utix counterparts
-    var name_list = try std.ArrayList([]const u8).initCapacity(alloc, 0);
-    var kind_list = try std.ArrayList(std.fs.File.Kind).initCapacity(alloc, 0);
-    var iter = dir.iterate();
-    while (try iter.next()) |entry| {
-        try name_list.append(alloc, try alloc.dupe(u8, entry.name));
-        try kind_list.append(alloc, entry.kind);
-    }
-
-    // Build a set of filenames for quick lookup
-    var name_set = std.StringHashMap(void).init(alloc);
-    for (name_list.items) |n| {
-        try name_set.put(n, {});
-    }
-
-    // Iterate through directory entries
-    for (name_list.items, kind_list.items) |name, kind| {
-        if (kind == .directory) {
-            const rel_path = if (std.mem.eql(u8, path, ""))
-                try alloc.dupe(u8, name)
-            else
-                try std.fs.path.join(alloc, &[_][]const u8{ path, name });
-
-            try entries.append(alloc, .{
-                .typ = .dir,
-                .name = try alloc.dupe(u8, name),
-                .rel_path = rel_path,
-            });
-        } else if (std.mem.endsWith(u8, name, ".utix")) {
-            const rel_path = if (std.mem.eql(u8, path, ""))
-                try alloc.dupe(u8, name)
-            else
-                try std.fs.path.join(alloc, &[_][]const u8{ path, name });
-
-            try entries.append(alloc, .{
-                .typ = .file,
-                .name = try alloc.dupe(u8, name),
-                .rel_path = rel_path,
-            });
-        } else if (std.mem.endsWith(u8, name, ".tar")) {
-            // Check if a corresponding .utix file exists
-            const utix_name = try std.mem.concat(alloc, u8, &[_][]const u8{ name, ".utix" });
-            if (!name_set.contains(utix_name)) {
-                const rel_path = if (std.mem.eql(u8, path, ""))
-                    try alloc.dupe(u8, name)
-                else
-                    try std.fs.path.join(alloc, &[_][]const u8{ path, name });
-
-                try entries.append(alloc, .{
-                    .typ = .unindexed_tar,
-                    .name = try alloc.dupe(u8, name),
-                    .rel_path = rel_path,
-                });
-            }
-        }
-    }
-
-    // Sort entries
-    std.mem.sort(DirEntry, entries.items, {}, struct {
-        fn lessThan(_: void, a: DirEntry, b: DirEntry) bool {
-            return std.mem.lessThan(u8, a.name, b.name);
-        }
-    }.lessThan);
-
-    return entries.toOwnedSlice(alloc);
-}
-
-pub fn dumpError(r: zap.Request, trace: ?*std.builtin.StackTrace) void {
-    var slices = r.getParamSlices();
-    while (slices.next()) |param| {
-        std.debug.print("Param: {s}={s}\n", .{ param.name, param.value });
-    }
-    if (trace) |t| {
-        std.debug.dumpStackTrace(t.*);
-    }
-}
-
-pub fn onRequest(r: zap.Request) anyerror!void {
-    var arena = std.heap.ArenaAllocator.init(gpa);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-
-    // Handle different routes
-    if (r.path) |path| {
-        if (std.mem.eql(u8, path, "/")) {
-            handleIndex(alloc, r) catch {
-                dumpError(r, @errorReturnTrace());
-                r.sendBody("Internal Server Error") catch {};
-            };
-        } else if (std.mem.startsWith(u8, path, "/browse")) {
-            handleBrowse(alloc, r) catch {
-                dumpError(r, @errorReturnTrace());
-                r.sendBody("Internal Server Error") catch {};
-            };
-        } else if (std.mem.startsWith(u8, path, "/load")) {
-            handleLoad(alloc, r) catch {
-                dumpError(r, @errorReturnTrace());
-                r.sendBody("Internal Server Error") catch {};
-            };
-        } else if (std.mem.startsWith(u8, path, "/static/")) {
-            handleStatic(alloc, r) catch {
-                dumpError(r, @errorReturnTrace());
-                r.setStatus(.not_found);
-                r.sendBody("Not Found") catch {};
-            };
-        } else if (std.mem.startsWith(u8, path, "/index/status")) {
-            handleIndexStatus(alloc, r) catch {
-                dumpError(r, @errorReturnTrace());
-                r.sendBody("Internal Server Error") catch {};
-            };
-        } else if (std.mem.eql(u8, path, "/index")) {
-            handleIndexRequest(alloc, r) catch {
-                dumpError(r, @errorReturnTrace());
-                r.sendBody("Internal Server Error") catch {};
-            };
-        } else if (std.mem.startsWith(u8, path, "/map_file")) {
-            handleMapFile(alloc, r) catch |err| {
-                dumpError(r, @errorReturnTrace());
-                switch (err) {
-                    MapFileClientError.missing_parameters,
-                    InvalidRangeStrError.invalid_base_offset,
-                    InvalidRangeStrError.invalid_end_offset,
-                    MapFileClientError.invalid_offset_range,
-                    => {
-                        r.setStatus(.bad_request);
-                        r.sendBody("Bad Request") catch {};
-                    },
-                    else => {
-                        r.setStatus(.internal_server_error);
-                        r.sendBody("Internal Server Error") catch {};
-                    },
-                }
-            };
-        } else {
-            r.setStatus(.not_found);
-            r.sendBody("Not Found") catch {};
-        }
-    } else {
-        r.setStatus(.bad_request);
-        r.sendBody("Bad Request") catch {};
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Shared rendering helpers (used by both index pre-render and XHR handlers)
-// ---------------------------------------------------------------------------
-
-/// Render the file-tree HTML for the given (already decoded) directory path.
-/// Empty dir_param means root. Result is allocated on the arena.
-fn renderBrowseHtml(arena: std.mem.Allocator, dir_param: []const u8) ![]const u8 {
-    const entries = try listDirectory(arena, dir_param);
-
-    const Parent = struct { show: bool, parent: []const u8 };
-    const parent_info: Parent = .{
-        .show = dir_param.len > 0,
-        .parent = if (dir_param.len > 0) (std.fs.path.dirname(dir_param) orelse "") else "",
-    };
-
-    const Item = struct { is_dir: bool, is_unindexed_tar: bool, name: []const u8, rel_path_enc: []const u8, dir_enc: []const u8 };
-    var items = try std.ArrayList(Item).initCapacity(arena, entries.len);
-    const enc_dir_param = try urlEncodeAlloc(arena, dir_param);
-    for (entries) |entry| {
-        const enc_rel = try urlEncodeAlloc(arena, entry.rel_path);
-        try items.append(arena, .{
-            .is_dir = entry.typ == .dir,
-            .is_unindexed_tar = entry.typ == .unindexed_tar,
-            .name = entry.name,
-            .rel_path_enc = enc_rel,
-            .dir_enc = enc_dir_param,
-        });
-    }
-
-    const list_tpl = try template_cache.get("ultar_httpd/templates/file_list.html");
-    var mustache = try zap.Mustache.fromData(list_tpl);
-    defer mustache.deinit();
-
-    const data = .{ .show_parent = parent_info.show, .parent = parent_info.parent, .entries = items.items };
-    var built = mustache.build(data);
-    defer built.deinit();
-    return try arena.dupe(u8, built.str() orelse return error.Unexpected);
-}
-
-const ROWS_PER_PAGE: usize = 500;
-
-/// Render the load-table HTML for the given (already decoded) .utix file path.
-/// Only builds Row/Cell structs for the requested page slice.
-fn renderLoadHtml(arena: std.mem.Allocator, path_param: []const u8, page: usize) ![]const u8 {
-    const full_path = try buildSafePathAlloc(arena, path_param);
-
-    std.fs.accessAbsolute(full_path, .{}) catch
-        return try arena.dupe(u8, "<p>File not found</p>");
-
-    const entries = parseUtixFile(arena, full_path) catch
-        return try arena.dupe(u8, "<p>Error parsing index file</p>");
-
-    if (entries.len == 0)
-        return try arena.dupe(u8, "<p>No items found in the index file.</p>");
-
-    // Get tar file path (remove .utix extension)
-    const tar_path = if (std.mem.endsWith(u8, path_param, ".utix"))
-        path_param[0 .. path_param.len - 5]
-    else
-        path_param;
-
-    // Pagination
-    const total_rows = entries.len;
-    const total_pages = (total_rows + ROWS_PER_PAGE - 1) / ROWS_PER_PAGE;
-    const clamped_page = @min(page, total_pages - 1);
-    const start = clamped_page * ROWS_PER_PAGE;
-    const end = @min(start + ROWS_PER_PAGE, total_rows);
-    const page_entries = entries[start..end];
-
-    // Compute union of keys across ALL entries (need full key set for columns)
-    var key_set = std.StringHashMap(void).init(arena);
-    defer key_set.deinit();
-    for (entries) |e| {
-        for (e.keys) |k| {
-            if (!key_set.contains(k)) try key_set.put(k, {});
-        }
-    }
-
-    // Build a stable ordered list of keys (sorted)
-    var all_keys_list = try std.ArrayList([]const u8).initCapacity(arena, key_set.count());
-    var it = key_set.iterator();
-    while (it.next()) |kv| {
-        try all_keys_list.append(arena, kv.key_ptr.*);
-    }
-    std.mem.sort([]const u8, all_keys_list.items, {}, struct {
-        fn lessThan(_: void, a: []const u8, b: []const u8) bool {
-            return std.mem.lessThan(u8, a, b);
-        }
-    }.lessThan);
-
-    const Header = struct { name: []const u8, enc_name: []const u8 };
-    const Cell = struct { has: bool, range_str: []const u8 };
-    const Row = struct { cells: []const Cell, id_value: []const u8, row_idx: i64 };
-    const PageLink = struct { num: []const u8, url: []const u8, is_current: bool };
-
-    var headers = try std.ArrayList(Header).initCapacity(arena, all_keys_list.items.len);
-    for (all_keys_list.items) |k| {
-        try headers.append(arena, .{ .name = k, .enc_name = try urlEncodeAlloc(arena, k) });
-    }
-
-    const enc_file = try urlEncodeAlloc(arena, tar_path);
-    const enc_utix_file = try urlEncodeAlloc(arena, path_param);
-
-    // Build rows only for the current page slice
-    var rows = try std.ArrayList(Row).initCapacity(arena, page_entries.len);
-    for (page_entries) |entry| {
-        var per_row = std.StringHashMap(usize).init(arena);
-        defer per_row.deinit();
-        for (entry.keys, 0..) |k, kidx| {
-            try per_row.put(k, kidx);
-        }
-
-        var cells = try std.ArrayList(Cell).initCapacity(arena, all_keys_list.items.len);
-        for (all_keys_list.items) |k| {
-            if (per_row.get(k)) |kidx| {
-                if (kidx < entry.offsets.len and kidx < entry.sizes.len) {
-                    const offset = entry.offset + entry.offsets[kidx];
-                    const size = entry.sizes[kidx];
-                    const range_str = try std.fmt.allocPrint(arena, "{X:0>8}..{X:0>8}", .{ offset, offset + size });
-                    try cells.append(arena, .{ .has = true, .range_str = range_str });
-                } else {
-                    try cells.append(arena, .{ .has = false, .range_str = "" });
-                }
-            } else {
-                try cells.append(arena, .{ .has = false, .range_str = "" });
-            }
-        }
-
-        const id_value = if (entry.str_idx.len > 0) entry.str_idx else try std.fmt.allocPrint(arena, "{X}", .{entry.iidx});
-        try rows.append(arena, .{ .cells = cells.items, .id_value = id_value, .row_idx = @intCast(entry.iidx) });
-    }
-
-    // Build page links
-    var page_links = try std.ArrayList(PageLink).initCapacity(arena, total_pages);
-    for (0..total_pages) |p| {
-        try page_links.append(arena, .{
-            .num = try std.fmt.allocPrint(arena, "{d}", .{p + 1}),
-            .url = try std.fmt.allocPrint(arena, "/load?file={s}&page={d}", .{ enc_utix_file, p }),
-            .is_current = p == clamped_page,
-        });
-    }
-
-    const has_pages = total_pages > 1;
-    const has_prev = clamped_page > 0;
-    const has_next = clamped_page + 1 < total_pages;
-    const prev_url: []const u8 = if (has_prev)
-        try std.fmt.allocPrint(arena, "/load?file={s}&page={d}", .{ enc_utix_file, clamped_page - 1 })
-    else
-        "";
-    const next_url: []const u8 = if (has_next)
-        try std.fmt.allocPrint(arena, "/load?file={s}&page={d}", .{ enc_utix_file, clamped_page + 1 })
-    else
-        "";
-    const total_rows_str = try std.fmt.allocPrint(arena, "{d}", .{total_rows});
-
-    const load_tpl = try template_cache.get("ultar_httpd/templates/load_table.html");
-    var mustache = try zap.Mustache.fromData(load_tpl);
-    defer mustache.deinit();
-
-    const tpl_data = .{
-        .enc_file = enc_file,
-        .headers = headers.items,
-        .rows = rows.items,
-        .tar_path = tar_path,
-        .total_rows = total_rows_str,
-        .has_pages = has_pages,
-        .has_prev = has_prev,
-        .has_next = has_next,
-        .prev_url = prev_url,
-        .next_url = next_url,
-        .pages = page_links.items,
-    };
-    var built = mustache.build(tpl_data);
-    defer built.deinit();
-    return try arena.dupe(u8, built.str() orelse return error.Unexpected);
-}
-
-// ---------------------------------------------------------------------------
-// Route handlers
-// ---------------------------------------------------------------------------
-
-fn handleIndex(arena: std.mem.Allocator, r: zap.Request) !void {
-    const dir_raw = r.getParamSlice("dir") orelse "";
-    const initial_dir = try urlDecodeBuf(dir_raw, try arena.alloc(u8, dir_raw.len));
-    const file_raw = r.getParamSlice("file") orelse "";
-    const initial_file = try urlDecodeBuf(file_raw, try arena.alloc(u8, file_raw.len));
-    const page = std.fmt.parseInt(usize, r.getParamSlice("page") orelse "0", 10) catch 0;
-
-    // Pre-render the file tree server-side (no extra XHR round-trip)
-    const browse_html = renderBrowseHtml(arena, initial_dir) catch "";
-
-    // Pre-render the table if a .utix file was specified in the deep-link
-    const table_html: []const u8 = if (initial_file.len > 5 and std.mem.endsWith(u8, initial_file, ".utix"))
-        renderLoadHtml(arena, initial_file, page) catch ""
-    else
-        "";
-
-    const tpl = try template_cache.get("ultar_httpd/templates/base.html");
-    var mustache = try zap.Mustache.fromData(tpl);
-    defer mustache.deinit();
-
-    const data = .{ .body = browse_html, .table_body = table_html };
-    var built = mustache.build(data);
-    defer built.deinit();
-    const s = built.str() orelse return error.Unexpected;
-    try r.sendBody(s);
-}
-
-fn handleBrowse(arena: std.mem.Allocator, r: zap.Request) !void {
-    const dir_raw = r.getParamSlice("dir") orelse "";
-    const dir_param = try urlDecodeBuf(dir_raw, try arena.alloc(u8, dir_raw.len));
-    const html = try renderBrowseHtml(arena, dir_param);
-    try r.sendBody(html);
-}
-
-fn handleLoad(arena: std.mem.Allocator, r: zap.Request) !void {
-    const raw_file = r.getParamSlice("file") orelse (r.getParamSlice("path") orelse "");
-    const path_param = try urlDecodeBuf(raw_file, try arena.alloc(u8, raw_file.len));
-
-    if (path_param.len == 0) {
-        try r.sendBody("<p>No path specified</p>");
-        return;
-    }
-
-    const page = std.fmt.parseInt(usize, r.getParamSlice("page") orelse "0", 10) catch 0;
-    const html = try renderLoadHtml(arena, path_param, page);
-    try r.sendBody(html);
-}
-
-fn handleStatic(arena: std.mem.Allocator, r: zap.Request) !void {
-    const path = r.path orelse return error.InvalidPath;
-    const rel = path["/static/".len..];
-
-    // Reject empty, traversal, or absolute paths
-    if (rel.len == 0) return error.InvalidPath;
-    if (std.mem.indexOf(u8, rel, "..") != null) return error.InvalidPath;
-    if (rel[0] == '/') return error.InvalidPath;
-
-    // Only allow simple filenames (letters, digits, dash, dot, underscore)
-    for (rel) |ch| {
-        switch (ch) {
-            'a'...'z', 'A'...'Z', '0'...'9', '-', '_', '.' => {},
-            else => return error.InvalidPath,
-        }
-    }
-
-    const full_path = try std.fs.path.join(arena, &[_][]const u8{ "ultar_httpd/static", rel });
-
-    // Determine Content-Type from extension
-    const ext = std.fs.path.extension(rel);
-    const content_type: []const u8 = if (std.mem.eql(u8, ext, ".js"))
-        "application/javascript; charset=utf-8"
-    else if (std.mem.eql(u8, ext, ".css"))
-        "text/css; charset=utf-8"
-    else
-        "application/octet-stream";
-
-    const data = try template_cache.get(full_path);
-    r.setHeader("Content-Type", content_type) catch {};
-    r.setHeader("Cache-Control", "public, max-age=3600") catch {};
-    try r.sendBody(data);
-}
-
-fn sanitizeFilename(alloc: std.mem.Allocator, name: []const u8) ![]u8 {
-    var buf = try alloc.alloc(u8, name.len);
-    var i: usize = 0;
-    for (name) |ch| {
-        buf[i] = switch (ch) {
-            'a'...'z', 'A'...'Z', '0'...'9', '-', '_', '.', '+' => ch,
-            else => '_',
-        };
-        i += 1;
-    }
-    return buf;
-}
-
-const InvalidRangeStrError = error{
-    invalid_base_offset,
-    invalid_end_offset,
-};
-
-fn parseRangeStr(range_str: []const u8) !struct { u64, u64 } {
-    var parts = std.mem.splitSequence(u8, range_str, "..");
-    const base = std.fmt.parseInt(u64, parts.next() orelse return error.invalid_base_offset, 16) catch return error.invalid_base_offset;
-    const end = std.fmt.parseInt(u64, parts.next() orelse return error.invalid_end_offset, 16) catch return error.invalid_end_offset;
-
-    return .{ base, end };
-}
-
-const MapFileClientError = error{
-    missing_parameters,
-    invalid_offset_range,
-} || InvalidRangeStrError;
-
-fn handleMapFile(arena: std.mem.Allocator, r: zap.Request) !void {
-    // Parse query parameters (decoded via zap)
-    const file_raw = r.getParamSlice("file") orelse "";
-    const file_param = try urlDecodeBuf(file_raw, try arena.alloc(u8, file_raw.len));
-    const range_str = r.getParamSlice("range_str") orelse "";
-    const k_raw = r.getParamSlice("k") orelse "";
-    const k_param = try urlDecodeBuf(k_raw, try arena.alloc(u8, k_raw.len));
-    const id_raw_opt = r.getParamSlice("id");
-    const id_param = if (id_raw_opt) |id_raw| blk: {
-        break :blk try urlDecodeBuf(id_raw, try arena.alloc(u8, id_raw.len));
-    } else null;
-
-    if (file_param.len == 0 or range_str.len <= 2 or k_param.len == 0) {
-        return MapFileClientError.missing_parameters;
-    }
-
-    // Parse hex values
-    const base_offset, const end_offset = try parseRangeStr(range_str);
-
-    if (end_offset <= base_offset) {
-        return MapFileClientError.invalid_offset_range;
-    }
-
-    // Build full file path
-    const full_path = try buildSafePathAlloc(arena, file_param);
-
-    // Open and memory map the file
-    var file = try std.fs.openFileAbsolute(full_path, .{});
-    defer file.close();
-
-    const file_size = try file.getEndPos();
-    if (end_offset > file_size) {
-        return MapFileClientError.invalid_offset_range;
-    }
-
-    // Read the data
-    const read_buf = try arena.alloc(u8, 16384);
-    var reader = file.reader(read_buf);
-    try reader.seekTo(base_offset);
-    const data = try reader.interface.readAlloc(arena, end_offset - base_offset);
-
-    // Set appropriate MIME type
-    const mime_type = try findMimeTypeAlloc(arena, k_param);
-    r.setHeader("Content-Type", mime_type) catch {};
-
-    // Content-Disposition filename: {str_idx}.{key}
-    if (id_param) |id_val| {
-        const cleaned_id = try sanitizeFilename(arena, id_val);
-        var filename: []const u8 = undefined;
-        if (k_param.len > 0 and k_param[0] == '.') {
-            filename = try std.fmt.allocPrint(arena, "{s}{s}", .{ cleaned_id, k_param });
-        } else if (k_param.len > 0) {
-            filename = try std.fmt.allocPrint(arena, "{s}.{s}", .{ cleaned_id, k_param });
-        } else {
-            filename = try std.fmt.allocPrint(arena, "{s}", .{cleaned_id});
-        }
-        const header_val = try std.fmt.allocPrint(arena, "attachment; filename=\"{s}\"", .{filename});
-        r.setHeader("Content-Disposition", header_val) catch {};
-    }
-
-    // Send the data
-    r.setStatus(.ok);
-    try r.sendBody(data);
-}
-
-fn handleIndexRequest(arena: std.mem.Allocator, r: zap.Request) !void {
-    const file_raw = r.getParamSlice("file") orelse "";
-    const file_param = try urlDecodeBuf(file_raw, try arena.alloc(u8, file_raw.len));
-
-    if (file_param.len == 0) {
-        r.setStatus(.bad_request);
-        try r.sendBody("missing file parameter");
-        return;
-    }
-
-    const abs_path = try buildSafePathAlloc(arena, file_param);
-
-    if (!std.mem.endsWith(u8, file_param, ".tar")) {
-        r.setStatus(.bad_request);
-        try r.sendBody("not a tar file");
-        return;
-    }
-
-    std.fs.accessAbsolute(abs_path, .{}) catch {
-        r.setStatus(.not_found);
-        try r.sendBody("file not found");
-        return;
-    };
-
-    indexer_worker.enqueue(abs_path, file_param) catch {
-        r.setStatus(.internal_server_error);
-        try r.sendBody("failed to enqueue");
-        return;
-    };
-
-    // Return the indexing panel HTML with HTMX polling enabled
-    const jobs = try indexer_worker.getStatus(arena);
-    const html = try renderIndexingPanel(arena, jobs);
-    try r.sendBody(html);
-}
-
-fn handleIndexStatus(arena: std.mem.Allocator, r: zap.Request) !void {
-    const jobs = try indexer_worker.getStatus(arena);
-    const html = try renderIndexingPanel(arena, jobs);
-
-    // When all jobs are finished, fire an event so the file tree refreshes
-    var has_active = false;
-    var has_done = false;
-    for (jobs) |job| {
-        if (job.status == .queued or job.status == .running) has_active = true;
-        if (job.status == .done) has_done = true;
-    }
-    if (!has_active and has_done) {
-        r.setHeader("HX-Trigger", "indexingDone") catch {};
-    }
-
-    try r.sendBody(html);
-}
-
-/// Render the #indexing-panel div as an HTML fragment. When active jobs exist,
-/// includes hx-get/hx-trigger so HTMX continues polling; when idle, the
-/// attributes are omitted and polling stops. Completed entries are cleared
-/// client-side via the indexingDone event handler.
-fn renderIndexingPanel(arena: std.mem.Allocator, jobs: []const IndexerWorker.JobSnapshot) ![]const u8 {
-    var has_active = false;
-    for (jobs) |job| {
-        if (job.status == .queued or job.status == .running) {
-            has_active = true;
-            break;
-        }
-    }
-
-    var html = try std.ArrayList(u8).initCapacity(arena, 512);
-
-    if (has_active) {
-        try html.appendSlice(arena,
-            "<div id=\"indexing-panel\" hx-get=\"/index/status\" hx-trigger=\"every 2s\" hx-swap=\"outerHTML\">");
-    } else {
-        try html.appendSlice(arena, "<div id=\"indexing-panel\">");
-    }
-
-    for (jobs) |job| {
-        // Extract filename (last path component)
-        const fname = if (std.mem.lastIndexOfScalar(u8, job.rel_path, '/')) |idx|
-            job.rel_path[idx + 1 ..]
+/// Resolve the base directory from `--data`, `DATA_PATH`, or cwd. Returned slice is owned by `gpa`.
+fn resolveBaseDir(gpa: std.mem.Allocator, io: std.Io, data_flag: ?[]const u8, env_data_path: ?[]const u8) ![]const u8 {
+    if (data_flag) |data_dir| {
+        const abs = if (std.fs.path.isAbsolute(data_dir))
+            try gpa.dupe(u8, data_dir)
         else
-            job.rel_path;
-
-        const pct: u64 = switch (job.status) {
-            .done => 100,
-            .running => if (job.bytes_total > 0) job.bytes_scanned * 100 / job.bytes_total else 0,
-            .@"error" => if (job.bytes_total > 0) job.bytes_scanned * 100 / job.bytes_total else 0,
-            .queued => 0,
-        };
-
-        const cls: []const u8 = switch (job.status) {
-            .done => " done",
-            .@"error" => " error",
-            else => "",
-        };
-
-        const pct_str = try std.fmt.allocPrint(arena, "{d}", .{pct});
-
-        try html.appendSlice(arena, "<div class=\"idx-bar");
-        try html.appendSlice(arena, cls);
-        try html.appendSlice(arena, "\"><div class=\"idx-fill\" style=\"width:");
-        try html.appendSlice(arena, pct_str);
-        try html.appendSlice(arena, "%\"></div><span class=\"idx-label\">");
-
-        switch (job.status) {
-            .queued => {
-                try html.appendSlice(arena, fname);
-                try html.appendSlice(arena, " (queued)");
-            },
-            .running => {
-                try html.appendSlice(arena, fname);
-                try html.appendSlice(arena, " ");
-                try html.appendSlice(arena, pct_str);
-                try html.appendSlice(arena, "%");
-            },
-            .done => {
-                try html.appendSlice(arena, "\xe2\x9c\x93 "); // ✓
-                try html.appendSlice(arena, fname);
-            },
-            .@"error" => {
-                try html.appendSlice(arena, "\xe2\x9c\x97 "); // ✗
-                try html.appendSlice(arena, fname);
-                if (job.error_msg) |msg| {
-                    try html.appendSlice(arena, ": ");
-                    try html.appendSlice(arena, msg);
-                }
-            },
-        }
-
-        try html.appendSlice(arena, "</span></div>");
+            try std.fs.path.resolve(gpa, &[_][]const u8{ ".", data_dir });
+        defer gpa.free(abs);
+        return try gpa.dupe(u8, trimTrailingSep(abs));
     }
 
-    try html.appendSlice(arena, "</div>");
-    return html.items;
+    if (env_data_path) |env_path| {
+        const abs = if (std.fs.path.isAbsolute(env_path))
+            try gpa.dupe(u8, env_path)
+        else
+            try std.fs.path.resolve(gpa, &[_][]const u8{ ".", env_path });
+        defer gpa.free(abs);
+        return try gpa.dupe(u8, trimTrailingSep(abs));
+    }
+
+    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd_len = try std.Io.Dir.cwd().realPath(io, &cwd_buf);
+    return try gpa.dupe(u8, trimTrailingSep(cwd_buf[0..cwd_len]));
 }
 
-pub fn main() !void {
-    defer _ = gpa_instance.deinit();
-    var arena = std.heap.ArenaAllocator.init(gpa);
-    defer arena.deinit();
-    const allocator = arena.allocator();
+/// Map `--addr` to `httpz.Config.Address`; unknown values warn and bind to `.all`.
+fn pickAddress(addr_flag: []const u8, port: u16) httpz.Config.Address {
+    if (std.mem.eql(u8, addr_flag, "0.0.0.0")) return httpz.Config.Address.all(port);
+    if (std.mem.eql(u8, addr_flag, "127.0.0.1")) return httpz.Config.Address.localhost(port);
+    if (std.mem.eql(u8, addr_flag, "localhost")) return httpz.Config.Address.localhost(port);
+    std.log.warn("unsupported --addr '{s}'; binding to 0.0.0.0", .{addr_flag});
+    return httpz.Config.Address.all(port);
+}
 
+pub fn main(init: std.process.Init) !void {
     var stderr_buffer: [1024]u8 = undefined;
-    var stderr_writer = std.fs.File.stderr().writer(&stderr_buffer);
+    var stderr_writer = std.Io.File.stderr().writer(init.io, &stderr_buffer);
     const stderr = &stderr_writer.interface;
     defer stderr.flush() catch {};
 
@@ -905,13 +76,13 @@ pub fn main() !void {
     const parsers = comptime .{
         .STR = clap.parsers.string,
         .PORT = clap.parsers.int(u16, 10),
-        .INT = clap.parsers.int(isize, 10),
+        .INT = clap.parsers.int(u32, 10),
         .DIR = clap.parsers.string,
     };
     var diag = clap.Diagnostic{};
-    var res = clap.parse(clap.Help, &params, parsers, .{
+    var res = clap.parse(clap.Help, &params, parsers, init.minimal.args, .{
         .diagnostic = &diag,
-        .allocator = allocator,
+        .allocator = init.gpa,
     }) catch |err| {
         diag.report(stderr, err) catch {};
         return err;
@@ -921,55 +92,62 @@ pub fn main() !void {
     if (res.args.help != 0)
         return clap.help(stderr, clap.Help, &params, .{});
 
-    const addr = res.args.addr orelse "0.0.0.0";
+    const addr_flag = res.args.addr orelse "0.0.0.0";
     const port: u16 = res.args.port orelse 3000;
+    const threads: u32 = res.args.threads orelse 4;
 
-    std.log.info("Launching with args of addr={s}:{} data={s} threads={?}", .{ addr, port, res.args.data orelse "?", res.args.threads });
+    std.log.info("Launching with addr={s}:{} data={s} threads={d}", .{ addr_flag, port, res.args.data orelse "?", threads });
 
-    // Initialize base directory (override if provided)
-    if (res.args.data) |data_dir| {
-        const abs = if (std.fs.path.isAbsolute(data_dir))
-            data_dir
-        else blk: {
-            const abs_join = try std.fs.path.resolve(allocator, &[_][]const u8{ ".", data_dir });
-            break :blk abs_join;
-        };
-        base_dir = try gpa.dupe(u8, abs);
-    } else {
-        try initBaseDir();
-        std.log.warn("Using DATA_PATH or cwd as base dir: {s}", .{base_dir});
-    }
-    defer gpa.free(base_dir);
+    const env_data_path = init.environ_map.get("DATA_PATH");
+    const base_dir = try resolveBaseDir(init.gpa, init.io, res.args.data, env_data_path);
+    defer init.gpa.free(base_dir);
+    std.log.info("Serving base dir: {s}", .{base_dir});
 
-    // Initialize template cache
-    template_cache = TemplateCache.init(gpa);
+    var template_cache: TemplateCache = undefined;
+    try template_cache.init(init.gpa);
     defer template_cache.deinit();
-    template_cache.setupWatcher();
 
-    // Initialize indexer worker
-    indexer_worker = IndexerWorker.init(gpa);
+    var indexer_worker: IndexerWorker = undefined;
+    try indexer_worker.init(init.gpa);
     defer indexer_worker.deinit();
-    try indexer_worker.start();
 
-    var addr_buf: [1024]u8 = undefined;
-    std.mem.copyForwards(u8, addr_buf[0..addr.len], addr);
-    addr_buf[addr.len] = 0;
+    var app = App{
+        .gpa = init.gpa,
+        .io = init.io,
+        .base_dir = base_dir,
+        .template_cache = &template_cache,
+        .indexer_worker = &indexer_worker,
+    };
 
-    var listener = zap.HttpListener.init(.{
-        .port = port,
-        .interface = &addr_buf,
-        .on_request = onRequest,
-        .log = true,
-        .max_clients = 100000,
-    });
-    try listener.listen();
+    var server = try httpz.Server(*App).init(init.io, init.gpa, .{
+        .address = pickAddress(addr_flag, port),
+        // httpz max_conn is u16; cap at its max.
+        .workers = .{ .count = 1, .max_conn = 65535 },
+        .thread_pool = .{ .count = @intCast(threads) },
+    }, &app);
+    defer server.deinit();
 
-    const threads = res.args.threads orelse 4;
+    var router = try server.router(.{});
+    router.get("/", handlers.indexRoot, .{});
+    router.get("/browse", handlers.browse, .{});
+    router.get("/load", handlers.load, .{});
+    router.get("/static/*", handlers.staticAsset, .{});
+    router.post("/index", handlers.indexRequest, .{});
+    router.get("/index", handlers.indexRequest, .{});
+    router.get("/index/status", handlers.indexStatus, .{});
+    router.get("/map_file", handlers.mapFile, .{});
 
-    std.log.info("Listening on {s}:{d} with {} threads\n", .{ addr, port, threads });
+    var sigact: std.posix.Sigaction = .{
+        .handler = .{ .handler = shutdown },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    std.posix.sigaction(.INT, &sigact, null);
+    std.posix.sigaction(.TERM, &sigact, null);
 
-    zap.start(.{
-        .threads = @intCast(threads),
-        .workers = 1, // 1 worker enables sharing state between threads
-    });
+    server_instance = &server;
+    defer server_instance = null;
+
+    std.log.info("Listening on {s}:{d} with {d} threads", .{ addr_flag, port, threads });
+    try server.listen();
 }

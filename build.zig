@@ -1,18 +1,24 @@
 const std = @import("std");
+const httpd_build = @import("ultar_httpd/build.zig");
 
 pub fn build(b: *std.Build) void {
-    const target = b.standardTargetOptions(.{});
+    // Pin glibc to 2.39 to force Zig's bundled crt; host crt1.o on glibc >=2.40
+    // emits `.sframe` with R_X86_64_PC64 relocs that Zig 0.16's lld rejects.
+    const target = b.standardTargetOptions(.{
+        .default_target = .{ .abi = .gnu, .os_tag = .linux, .glibc_version = .{ .major = 2, .minor = 39, .patch = 0 } },
+    });
     const optimize = b.standardOptimizeOption(.{});
 
     const engine = b.option([]const u8, "lua", "Use specified lua engine (default to luajit). Available: luajit, luau, lua54") orelse "luajit";
 
-    // Python bindings options
     const build_python = b.option(bool, "python-bindings", "Build Python ABI3 extension module") orelse false;
     const python_exe = b.option([]const u8, "python", "Python interpreter path for bindings") orelse
-        std.process.getEnvVarOwned(b.allocator, "PYTHON") catch null;
+        b.graph.environ_map.get("PYTHON");
 
     const clap = b.dependency("clap", .{ .target = target, .optimize = optimize });
     const xev = b.dependency("libxev", .{ .target = target, .optimize = optimize });
+    const httpz = b.dependency("httpz", .{ .target = target, .optimize = optimize });
+    const mustach_dep = b.dependency("mustach", .{});
 
     var zlua: *std.Build.Dependency = undefined;
     if (std.mem.eql(u8, engine, "luajit")) {
@@ -40,7 +46,6 @@ pub fn build(b: *std.Build) void {
         std.debug.panic("Unknown lua engine: {s}", .{engine});
     }
 
-    // Shared msgpack module (used by both indexer and webapp)
     const msgpack_module = b.createModule(.{ .root_source_file = b.path("msgpack.zig") });
 
     const indexer = b.addExecutable(.{
@@ -72,7 +77,7 @@ pub fn build(b: *std.Build) void {
     lib_dataloader.root_module.addImport("zlua", zlua.module("zlua"));
     b.installArtifact(lib_dataloader);
 
-    // Create lua_dataloader module for sharing with Python bindings
+    // Reused by the Python bindings library below.
     const lua_dataloader_mod = b.createModule(.{
         .root_source_file = b.path("lua_dataloader.zig"),
         .target = target,
@@ -83,17 +88,15 @@ pub fn build(b: *std.Build) void {
     lua_dataloader_mod.addImport("xev", xev.module("xev"));
     lua_dataloader_mod.addImport("zlua", zlua.module("zlua"));
 
-    // Python bindings (optional, enabled with -Dpython-bindings=true)
     if (build_python) {
         buildPythonBindings(b, target, optimize, lua_dataloader_mod, python_exe);
     }
 
-    // Named step for building Python bindings
     const python_step = b.step("python-bindings", "Build Python ABI3 extension module");
     const python_lib = buildPythonBindingsStep(b, target, optimize, lua_dataloader_mod, python_exe);
 
-    // Install directly into python/src/ultar_dataloader/ (used by both dev and wheel builds)
-    // Use shell to copy with correct extension based on what was built
+    // Stage the built artifact into the Python source tree under its
+    // platform-specific extension (.so / .dylib / .pyd).
     const copy_native = b.addSystemCommand(&.{
         "sh", "-c",
         \\for f in zig-out/lib/*_native.abi3.*; do
@@ -105,15 +108,13 @@ pub fn build(b: *std.Build) void {
     copy_native.step.dependOn(&b.addInstallArtifact(python_lib, .{}).step);
     python_step.dependOn(&copy_native.step);
 
-    // Copy lua-types to python package
     const copy_lua_types = b.addSystemCommand(&.{
         "cp", "-rf", "lua-types/ultar", "python/src/ultar_dataloader/lua-types/",
     });
     python_step.dependOn(&copy_lua_types.step);
 
-    // Generate _version.py from build.zig.zon version + git info
-    // Version format: X.Y.Z or X.Y.Z+gSHORTSHA (if not on exact tag)
-    // If ULTAR_VERSION env var is set, use that directly (for CI)
+    // ULTAR_VERSION wins (CI); otherwise emit X.Y.Z on a tagged HEAD or
+    // X.Y.Z+gSHORTSHA off-tag.
     const base_version = @import("build.zig.zon").version;
     const gen_version = b.addSystemCommand(&.{
         "sh", "-c",
@@ -133,44 +134,26 @@ pub fn build(b: *std.Build) void {
     });
     python_step.dependOn(&gen_version.step);
 
-    // Add Zap dependency
-    const zap = b.dependency("zap", .{
+    const webapp = httpd_build.addWebapp(b, .{
         .target = target,
         .optimize = optimize,
-        .openssl = false, // Set to true to enable TLS support
+        .clap = clap.module("clap"),
+        .xev = xev.module("xev"),
+        .msgpack = msgpack_module,
+        .httpz = httpz.module("httpz"),
+        .mustach = mustach_dep,
     });
-
-    // Create the web application executable
-    const webapp = b.addExecutable(.{
-        .name = "ultar_httpd",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("ultar_httpd/main.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-
-    webapp.root_module.addImport("zap", zap.module("zap"));
-    webapp.root_module.addImport("clap", clap.module("clap"));
-    webapp.root_module.addImport("xev", xev.module("xev"));
-    webapp.root_module.addImport("msgpack", msgpack_module);
-    // Expose indexer module so the webapp can run indexing in-process
-    const indexer_module = b.createModule(.{ .root_source_file = b.path("indexer.zig") });
-    indexer_module.addImport("xev", xev.module("xev"));
-    indexer_module.addImport("msgpack", msgpack_module);
-    webapp.root_module.addImport("indexer", indexer_module);
-    webapp.linkLibC();
     b.installArtifact(webapp);
 
-    // Named step for building CLI tools only (no Lua/dataloader)
     const cli_step = b.step("cli", "Build CLI tools (indexer, ultar_httpd)");
     cli_step.dependOn(&b.addInstallArtifact(indexer, .{}).step);
     cli_step.dependOn(&b.addInstallArtifact(webapp, .{}).step);
 
-    // Add a step to run the webapp
-    const run_webapp = b.addRunArtifact(webapp);
     const run_step = b.step("run", "Run the web application");
-    run_step.dependOn(&run_webapp.step);
+    const run = b.addRunArtifact(webapp);
+    run.step.dependOn(b.getInstallStep());
+    if (b.args) |args| run.addArgs(args);
+    run_step.dependOn(&run.step);
 
     const test_step = b.step("test", "Run unit tests");
 
@@ -185,7 +168,6 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_unit_tests.step);
 }
 
-/// Build Python ABI3 extension and install it
 fn buildPythonBindings(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
@@ -197,7 +179,6 @@ fn buildPythonBindings(
     b.installArtifact(lib);
 }
 
-/// Create the Python bindings library artifact
 fn buildPythonBindingsStep(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
@@ -205,8 +186,7 @@ fn buildPythonBindingsStep(
     lua_dataloader_mod: *std.Build.Module,
     python_exe: ?[]const u8,
 ) *std.Build.Step.Compile {
-    // Get Python include path
-    const python_include = getPythonIncludePath(b.allocator, python_exe) orelse {
+    const python_include = getPythonIncludePath(b.allocator, b.graph.io, python_exe) orelse {
         std.log.err(
             \\Failed to get Python include path.
             \\
@@ -226,10 +206,7 @@ fn buildPythonBindingsStep(
         .pic = true,
     });
 
-    // Add Python include path
     python_mod.addSystemIncludePath(.{ .cwd_relative = python_include });
-
-    // Import lua_dataloader module
     python_mod.addImport("lua_dataloader", lua_dataloader_mod);
 
     const lib = b.addLibrary(.{
@@ -238,43 +215,39 @@ fn buildPythonBindingsStep(
         .root_module = python_mod,
     });
 
-    // Allow undefined symbols - Python symbols are resolved at runtime
     lib.root_module.addRPathSpecial("$ORIGIN");
+    // Python C-API symbols are resolved by the host interpreter at load time.
     lib.linker_allow_shlib_undefined = true;
 
     return lib;
 }
 
-/// Get Python include path by running the interpreter
-fn getPythonIncludePath(allocator: std.mem.Allocator, python_exe: ?[]const u8) ?[]const u8 {
+fn getPythonIncludePath(allocator: std.mem.Allocator, io: std.Io, python_exe: ?[]const u8) ?[]const u8 {
     const get_include_cmd = "import sysconfig; print(sysconfig.get_path('include'), end='')";
 
     if (python_exe) |py| {
-        return runPythonCommand(allocator, py, get_include_cmd);
+        return runPythonCommand(allocator, io, py, get_include_cmd);
     }
 
-    // Fallback: try common Python interpreters
     const interpreters = [_][]const u8{ "python3", "python" };
     for (interpreters) |python| {
-        if (runPythonCommand(allocator, python, get_include_cmd)) |result| {
+        if (runPythonCommand(allocator, io, python, get_include_cmd)) |result| {
             return result;
         }
     }
     return null;
 }
 
-/// Run a Python command and return stdout if successful
-fn runPythonCommand(allocator: std.mem.Allocator, python: []const u8, cmd: []const u8) ?[]const u8 {
-    const result = std.process.Child.run(.{
-        .allocator = allocator,
+/// Runs `python -c cmd`; returns stdout (allocator-owned) on exit 0, else null.
+fn runPythonCommand(allocator: std.mem.Allocator, io: std.Io, python: []const u8, cmd: []const u8) ?[]const u8 {
+    const result = std.process.run(allocator, io, .{
         .argv = &.{ python, "-c", cmd },
     }) catch return null;
 
     defer allocator.free(result.stderr);
 
-    // Check if process exited successfully
     switch (result.term) {
-        .Exited => |code| {
+        .exited => |code| {
             if (code == 0 and result.stdout.len > 0) {
                 return result.stdout;
             }

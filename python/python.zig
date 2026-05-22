@@ -63,24 +63,33 @@ const py = @cImport({
 
 const zeros = std.mem.zeroes;
 
-// ABI3-safe type checking helpers (avoid *_Check macros that inspect object headers)
+// Under `Py_LIMITED_API`, `PyTypeObject` is opaque, so a Zig translation of
+// `extern PyTypeObject PyLong_Type;` would need a variable with opaque type
+// — which Zig's language rules forbid, so translate-c emits a `@compileError`
+// at the use site. Declare each type symbol with `@extern` instead: the
+// linker resolves it from libpython, and treating the address as `*PyObject`
+// is safe because we only pass it to `PyObject_IsInstance`.
+const PyUnicode_Type_ptr = @extern(*py.PyObject, .{ .name = "PyUnicode_Type" });
+const PyLong_Type_ptr = @extern(*py.PyObject, .{ .name = "PyLong_Type" });
+const PyDict_Type_ptr = @extern(*py.PyObject, .{ .name = "PyDict_Type" });
+
 inline fn isUnicode(obj: ?*py.PyObject) bool {
     if (obj) |o| {
-        return py.PyObject_IsInstance(o, @ptrCast(@alignCast(&py.PyUnicode_Type))) == 1;
+        return py.PyObject_IsInstance(o, PyUnicode_Type_ptr) == 1;
     }
     return false;
 }
 
 inline fn isLong(obj: ?*py.PyObject) bool {
     if (obj) |o| {
-        return py.PyObject_IsInstance(o, @ptrCast(@alignCast(&py.PyLong_Type))) == 1;
+        return py.PyObject_IsInstance(o, PyLong_Type_ptr) == 1;
     }
     return false;
 }
 
 inline fn isDict(obj: ?*py.PyObject) bool {
     if (obj) |o| {
-        return py.PyObject_IsInstance(o, @ptrCast(@alignCast(&py.PyDict_Type))) == 1;
+        return py.PyObject_IsInstance(o, PyDict_Type_ptr) == 1;
     }
     return false;
 }

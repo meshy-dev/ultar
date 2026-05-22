@@ -9,9 +9,83 @@ const max_exact_lua_handle = std.math.maxInt(u48);
 const can_use_lua_unsigned64 =
     (zlua.lang == .luau or zlua.lang == .lua52) and std.math.maxInt(zlua.Unsigned) >= max_exact_lua_handle;
 
+/// Lua-side runtime for ultar. Bundles the `Lua` state with the `Io` used by
+/// callbacks and the modules registered onto the state. Stable pointer:
+/// callers heap-allocate (or place at a stable address) so userdata that
+/// outlives a single call can hold `*LuaRt` directly.
+pub const LuaRt = struct {
+    lua: *Lua,
+    io: std.Io,
+
+    const rt_registry_key: [:0]const u8 = "ultar.lua_rt.rt_ptr";
+
+    /// In-place init. Stashes `self` in `lua`'s registry and registers the
+    /// `ultar.*` modules and userdata metatables. `self` must outlive `lua`.
+    pub fn init(self: *LuaRt, lua: *Lua, io: std.Io) !void {
+        self.lua = lua;
+        self.io = io;
+        lua.pushLightUserdata(@ptrCast(self)); // [+p]
+        lua.setField(zlua.registry_index, rt_registry_key); // pop 1
+        try self.registerModules();
+    }
+
+    /// Fetch the runtime previously installed on `lua`.
+    pub fn fromLua(lua: *Lua) *LuaRt {
+        _ = lua.getField(zlua.registry_index, rt_registry_key); // [+p]
+        const ptr = lua.toPointer(-1) orelse @panic("lua_rt: runtime not installed");
+        lua.pop(1); // pop 1
+        return @ptrCast(@alignCast(@constCast(ptr)));
+    }
+
+    fn registerModules(self: *LuaRt) !void {
+        const lua = self.lua;
+        try lua.newMetatable(ScanCtx.meta_table); // [+p]
+        lua.newTable(); // [+p]
+        lua.pushFunction(zlua.wrap(scanDir)); // [+p]
+        lua.setField(-2, ScanCtx.f_iter); // pop 1
+        lua.setField(-2, "__index"); // pop 1
+        if (zlua.lang != .luau) {
+            lua.pushFunction(zlua.wrap(ScanCtx.luaDetor)); // [+p]
+            lua.setField(-2, "__gc"); // pop 1
+        }
+        lua.pop(1); // pop meta_table
+
+        try lua.newMetatable(MsgpackUnpacker.meta_table); // [+p]
+        lua.newTable(); // [+p]
+        lua.pushFunction(zlua.wrap(MsgpackUnpacker.iter)); // [+p]
+        lua.setField(-2, MsgpackUnpacker.f_iter); // pop 1
+        lua.setField(-2, "__index"); // pop 1
+        if (zlua.lang != .luau) {
+            lua.pushFunction(zlua.wrap(MsgpackUnpacker.luaDetor)); // [+p]
+            lua.setField(-2, "__gc"); // pop 1
+        }
+        lua.pop(1); // pop meta_table
+
+        try registerPreload(lua, "ultar.utix", zlua.wrap(utixModuleLoader));
+        try registerPreload(lua, "ultar.scandir", zlua.wrap(scandirModuleLoader));
+        try registerPreload(lua, "ultar.debug", zlua.wrap(debugModuleLoader));
+    }
+};
+
+fn dumpStackCfn(lua: *Lua) i32 {
+    luaDumpStack(lua);
+    return 0;
+}
+
+/// Lua loader for `ultar.debug`; returns `{ dump_stack = fn() }`. Calling
+/// `dump_stack` from inside an active Lua frame yields a non-empty call-stack
+/// section (the dump runs before any error unwind).
+fn debugModuleLoader(lua: *Lua) i32 {
+    lua.createTable(0, 1); // [+p] module table
+    lua.pushFunction(zlua.wrap(dumpStackCfn)); // [+p]
+    lua.setField(-2, "dump_stack"); // pop dump_stack
+    return 1;
+}
+
 const ScanCtx = struct {
-    dir: std.fs.Dir,
-    iter: std.fs.Dir.Iterator,
+    rt: *LuaRt,
+    dir: std.Io.Dir,
+    iter: std.Io.Dir.Iterator,
 
     const g_new_ctx = "scan_dir";
     const f_iter = "iter";
@@ -19,68 +93,164 @@ const ScanCtx = struct {
 
     pub fn luauDetor(data: *anyopaque) void {
         const ctx: *ScanCtx = @ptrFromInt(@intFromPtr(data));
-        ctx.dir.close();
+        ctx.dir.close(ctx.rt.io);
     }
 
     pub fn luaDetor(lua: *Lua) !c_int {
         const ctx = try lua.toUserdata(ScanCtx, 1);
-        ctx.dir.close();
+        ctx.dir.close(ctx.rt.io);
         return 0;
     }
 };
 
+/// Logs the active call stack (frames currently executing) followed by every
+/// value slot on the data stack, with absolute and relative indices, type,
+/// and a best-effort summary. Stack-safe: any temporary pushes are popped
+/// before returning.
 pub fn luaDumpStack(lua: *Lua) void {
-    // var level: i32 = 0;
-    // while (lua.getStack(level) catch null) |debug_info| {
-    //     logger.info("[{}] file {s} line {}: {s} ", .{
-    //         -level,
-    //         debug_info.source,
-    //         debug_info.current_line orelse -1,
-    //         debug_info.name orelse "unknown",
-    //     });
-    //     level += 1;
-    // }
-
-    const top: usize = @intCast(lua.getTop());
-    var buf: [1024]u8 = undefined;
-    for (1..top + 1) |_i| {
-        const i: i32 = @intCast(_i);
-        const t = lua.typeOf(i);
-        var value: []const u8 = undefined;
-        switch (t) {
-            .nil => {
-                value = "nil";
-            },
-            .boolean => {
-                value = if (lua.toBoolean(i)) "true" else "false";
-            },
-            .number => {
-                const v = lua.toNumber(i) catch {
-                    value = "unknown number";
-                    break;
-                };
-                value = std.fmt.bufPrint(&buf, "{d}", .{v}) catch "fmt err";
-            },
-            .string => {
-                value = lua.toString(i) catch "unknown string";
-            },
-            .table => {
-                const len = lua.rawLen(i);
-                value = std.fmt.bufPrint(&buf, "table(len={d})", .{len}) catch "fmt err";
-            },
-            .function => {
-                value = "function";
-            },
-            .userdata => {
-                value = "userdata";
-            },
-            else => {
-                value = "unknown type";
-            },
-        }
-
-        logger.info("Stack[{}]: {s}", .{ i, value });
+    dumpCallStack(lua);
+    const top = lua.getTop();
+    logger.info("Lua data stack (top={d}):", .{top});
+    if (top <= 0) {
+        logger.info("  <empty>", .{});
+        return;
     }
+    var buf: [512]u8 = undefined;
+    var i: i32 = 1;
+    while (i <= top) : (i += 1) {
+        const rel = i - top - 1; // -1 = top, -2 = top-1, ...
+        const desc = describeSlot(lua, i, &buf);
+        logger.info("  [{d:>3} | {d:>3}] {s}", .{ i, rel, desc });
+    }
+}
+
+/// Walks the activation records (lowest level = innermost current call) and
+/// logs each. Distinct from the data stack: an entry here is a function
+/// *currently being called*, not a function value sitting in a slot.
+fn dumpCallStack(lua: *Lua) void {
+    logger.info("Lua call stack (innermost first):", .{});
+    var level: i32 = 0;
+    var seen: i32 = 0;
+    while (level < 64) : (level += 1) {
+        var buf: [256]u8 = undefined;
+        const line = callFrameDescribe(lua, level, &buf) orelse break;
+        logger.info("  #{d} {s}", .{ level, line });
+        seen += 1;
+    }
+    if (seen == 0) logger.info("  <no active Lua frames>", .{});
+}
+
+fn callFrameDescribe(lua: *Lua, level: i32, buf: []u8) ?[]const u8 {
+    if (zlua.lang == .luau) {
+        // Luau's getInfo takes the level directly and uses lowercase `s`.
+        var info: zlua.DebugInfo = .{};
+        lua.getInfo(level, .{ .s = true, .l = true, .n = true }, &info);
+        return formatFrame(&info, buf);
+    }
+    var info = lua.getStack(level) catch return null;
+    lua.getInfo(.{ .S = true, .l = true, .n = true }, &info);
+    return formatFrame(&info, buf);
+}
+
+fn formatFrame(info: anytype, buf: []u8) []const u8 {
+    const what_str = @tagName(info.what);
+    const name: []const u8 = if (info.name) |n| n else "?";
+    const line: i32 = info.current_line orelse -1;
+    const short_src = std.mem.sliceTo(&info.short_src, 0);
+    return std.fmt.bufPrint(buf, "{s} '{s}' at {s}:{d}", .{ what_str, name, short_src, line }) catch "<frame>";
+}
+
+fn describeSlot(lua: *Lua, idx: i32, buf: []u8) []const u8 {
+    return switch (lua.typeOf(idx)) {
+        .none => "none",
+        .nil => "nil",
+        .boolean => if (lua.toBoolean(idx)) "boolean true" else "boolean false",
+        .light_userdata => describePointer(lua, idx, "lightuserdata", buf),
+        .number => describeNumber(lua, idx, buf),
+        .string => describeString(lua, idx, buf),
+        .table => describeTable(lua, idx, buf),
+        .function => describeFunction(lua, idx, buf),
+        .userdata => describeUserdata(lua, idx, buf),
+        .thread => "thread",
+    };
+}
+
+fn describePointer(lua: *Lua, idx: i32, kind: []const u8, buf: []u8) []const u8 {
+    const ptr = lua.toPointer(idx) orelse return std.fmt.bufPrint(buf, "{s} 0x0", .{kind}) catch kind;
+    return std.fmt.bufPrint(buf, "{s} 0x{x}", .{ kind, @intFromPtr(ptr) }) catch kind;
+}
+
+fn describeNumber(lua: *Lua, idx: i32, buf: []u8) []const u8 {
+    const v = lua.toNumber(idx) catch return "number <unreadable>";
+    if (std.math.isFinite(v) and @floor(v) == v and v >= -1e15 and v <= 1e15) {
+        const iv: i64 = @intFromFloat(v);
+        return std.fmt.bufPrint(buf, "number {d}", .{iv}) catch "number";
+    }
+    return std.fmt.bufPrint(buf, "number {d}", .{v}) catch "number";
+}
+
+fn describeString(lua: *Lua, idx: i32, buf: []u8) []const u8 {
+    const s = lua.toString(idx) catch return "string <unreadable>";
+    const cap = 60;
+    if (s.len <= cap) {
+        return std.fmt.bufPrint(buf, "string({d}) \"{s}\"", .{ s.len, s }) catch "string";
+    }
+    return std.fmt.bufPrint(buf, "string({d}) \"{s}…\"", .{ s.len, s[0..cap] }) catch "string";
+}
+
+fn describeTable(lua: *Lua, idx: i32, buf: []u8) []const u8 {
+    const array_len = lua.lenRaw(idx);
+    var name_buf: [64]u8 = undefined;
+    if (metatableName(lua, idx, &name_buf)) |name| {
+        return std.fmt.bufPrint(buf, "table[len={d}] mt=<{s}>", .{ array_len, name }) catch "table";
+    }
+    return std.fmt.bufPrint(buf, "table[len={d}]", .{array_len}) catch "table";
+}
+
+fn describeFunction(lua: *Lua, idx: i32, buf: []u8) []const u8 {
+    const ptr = lua.toPointer(idx);
+    const addr = if (ptr) |p| @intFromPtr(p) else 0;
+    const kind: []const u8 = if (lua.isCFunction(idx)) "C function" else "Lua function";
+
+    // A function on the data stack is a *value* — it's not currently
+    // executing. Use getInfo's `>` mode (Lua / luajit only) to surface where
+    // it was defined so the dump distinguishes a Lua-function value
+    // (`defined script.lua:12-30`) from an in-progress call (which shows up
+    // in the call stack section above).
+    if (zlua.lang != .luau) {
+        lua.pushValue(idx); // [+p] function value; `>` consumes it.
+        var info: zlua.DebugInfo = .{};
+        lua.getInfo(.{ .@">" = true, .S = true }, &info);
+        const short_src = std.mem.sliceTo(&info.short_src, 0);
+        const first = info.first_line_defined orelse 0;
+        const last = info.last_line_defined orelse 0;
+        return std.fmt.bufPrint(buf, "value: {s} 0x{x} defined {s}:{d}-{d}", .{ kind, addr, short_src, first, last }) catch kind;
+    }
+    return std.fmt.bufPrint(buf, "value: {s} 0x{x}", .{ kind, addr }) catch kind;
+}
+
+fn describeUserdata(lua: *Lua, idx: i32, buf: []u8) []const u8 {
+    const ptr = lua.toPointer(idx);
+    const addr = if (ptr) |p| @intFromPtr(p) else 0;
+    var name_buf: [64]u8 = undefined;
+    if (metatableName(lua, idx, &name_buf)) |name| {
+        return std.fmt.bufPrint(buf, "userdata <{s}> 0x{x}", .{ name, addr }) catch "userdata";
+    }
+    return std.fmt.bufPrint(buf, "userdata 0x{x}", .{addr}) catch "userdata";
+}
+
+/// Best-effort metatable `__name` lookup. Leaves the stack unchanged; copies
+/// the name into `out` so the result is stable once the metatable is popped.
+fn metatableName(lua: *Lua, idx: i32, out: []u8) ?[]const u8 {
+    lua.getMetatable(idx) catch return null; // [+p] metatable
+    defer lua.pop(1);
+    _ = lua.getField(-1, "__name"); // [+p] name (or nil)
+    defer lua.pop(1);
+    if (!lua.isString(-1)) return null;
+    const s = lua.toString(-1) catch return null;
+    const n = @min(s.len, out.len);
+    @memcpy(out[0..n], s[0..n]);
+    return out[0..n];
 }
 
 pub fn toUnsigned(lua: *Lua, idx: i32) !u32 {
@@ -121,7 +291,7 @@ pub fn pushUnsigned64(lua: *Lua, v: u64) void {
     }
 }
 
-pub fn printLuaErr(lua: *Lua, err: zlua.Error) zlua.Error {
+pub fn printLuaErr(lua: *Lua, err: anyerror) anyerror {
     switch (err) {
         error.LuaError, error.LuaRuntime, error.LuaSyntax => {
             const err_msg = lua.toString(-1) catch "unknown error";
@@ -132,23 +302,25 @@ pub fn printLuaErr(lua: *Lua, err: zlua.Error) zlua.Error {
         },
     }
     luaDumpStack(lua);
-    std.debug.dumpCurrentStackTrace(null);
+    std.debug.dumpCurrentStackTrace(.{});
     return err;
 }
 
 fn newScanCtx(lua: *Lua) !i32 {
     const path = lua.toString(1) catch |err| return printLuaErr(lua, err);
+    const rt = LuaRt.fromLua(lua);
 
     const ctx = switch (zlua.lang) {
-        // Other runtimes use __gc metamethod to clean up userdata
+        // Non-luau runtimes attach cleanup via the __gc metamethod instead.
         .luau => lua.newUserdataDtor(ScanCtx, zlua.wrap(ScanCtx.luauDetor)),
         .lua54 => lua.newUserdata(ScanCtx, 0),
         else => lua.newUserdata(ScanCtx),
     };
 
-    ctx.dir = std.fs.cwd().openDir(path, .{ .iterate = true }) catch |err| {
+    ctx.rt = rt;
+    ctx.dir = std.Io.Dir.cwd().openDir(rt.io, path, .{ .iterate = true }) catch |err| {
         logger.warn("Failed to open directory {s}: {}", .{ path, err });
-        return zlua.Error.LuaFile;
+        return error.LuaFile;
     };
     ctx.iter = ctx.dir.iterate();
 
@@ -160,11 +332,11 @@ fn newScanCtx(lua: *Lua) !i32 {
 
 fn scanIterator(lua: *Lua) !i32 {
     const ctx = try lua.toUserdata(ScanCtx, Lua.upvalueIndex(1));
-    const next_e = try ctx.iter.next();
+    const next_e = try ctx.iter.next(ctx.rt.io);
     if (next_e) |entry| {
-        var buf: [std.fs.max_path_bytes]u8 = undefined;
-        const entry_name = try ctx.dir.realpath(entry.name, &buf);
-        _ = lua.pushString(entry_name);
+        var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const len = try ctx.dir.realPathFile(ctx.rt.io, entry.name, &buf);
+        _ = lua.pushString(buf[0..len]);
         return 1;
     } else {
         return 0;
@@ -183,9 +355,7 @@ const MsgpackUnpacker = struct {
 
     pub const UnpackerImpl = struct {
         lua: *Lua,
-        // Dynamic list of stack indices where each new table lives
         tables: std.ArrayList(i32),
-        // Parallel stack tracking the next numeric key for array inserts
         arrayIdx: std.ArrayList(i32),
 
         pub fn init(lua: *Lua) UnpackerImpl {
@@ -249,7 +419,6 @@ const MsgpackUnpacker = struct {
         }
 
         pub fn mapBegin(self: *UnpackerImpl, l: usize) !void {
-            // Preallocate the table (num_rec is a hint to VM)
             self.lua.createTable(0, @intCast(l)); // [+p]
             const top = self.lua.getTop();
             try self.tables.append(self.lua.allocator(), top);
@@ -270,7 +439,7 @@ const MsgpackUnpacker = struct {
             const top = self.lua.getTop();
             const alloc = self.lua.allocator();
             try self.tables.append(alloc, top);
-            try self.arrayIdx.append(alloc, 1); // lua array index starts at 1
+            try self.arrayIdx.append(alloc, 1); // Lua arrays are 1-indexed.
         }
 
         pub fn arrayEnd(self: *UnpackerImpl) !void {
@@ -281,22 +450,18 @@ const MsgpackUnpacker = struct {
         }
 
         fn assign(self: *UnpackerImpl) !void {
-            if (self.tables.items.len == 0) {
-                // Just a value: do nothing
-                return;
-            }
+            if (self.tables.items.len == 0) return;
             const table_idx = self.tables.items[self.tables.items.len - 1];
             const top = self.lua.getTop();
             if (top - table_idx == 2) {
-                // Table, key, value: set table[key] = value
+                // [table, key, value] -> table[key] = value
                 self.lua.setTable(table_idx); // pops 2
             } else if (top - table_idx == 1) {
-                // Table, value: set table[i] = value
+                // [table, value] -> table[i] = value
                 const idx = self.arrayIdx.getLast();
-                self.lua.rawSetIndex(table_idx, idx); // pops 1
+                self.lua.setIndexRaw(table_idx, idx); // pops 1
                 self.arrayIdx.items[self.arrayIdx.items.len - 1] = idx + 1;
             } else {
-                // Just a value: do nothing
                 std.debug.assert(top == table_idx);
             }
         }
@@ -316,10 +481,11 @@ const MsgpackUnpacker = struct {
         .arrayEnd = UnpackerImpl.arrayEnd,
     });
 
-    msgpack_file: std.fs.File,
+    rt: *LuaRt,
+    msgpack_file: std.Io.File,
     unpacker: Unpacker,
     read_buf: [65536]u8 = undefined,
-    reader: std.fs.File.Reader,
+    reader: std.Io.File.Reader,
 
     const f_iter = "iter";
     const meta_table = "MsgpackUnpackerMT";
@@ -327,32 +493,34 @@ const MsgpackUnpacker = struct {
 
     pub fn luauDetor(data: *anyopaque) void {
         const ctx: *MsgpackUnpacker = @ptrFromInt(@intFromPtr(data));
-        ctx.msgpack_file.close();
+        ctx.msgpack_file.close(ctx.rt.io);
         ctx.unpacker.ctx.deinit();
     }
 
     pub fn luaDetor(lua: *Lua) !c_int {
         const ctx = try lua.toUserdata(MsgpackUnpacker, 1);
-        ctx.msgpack_file.close();
+        ctx.msgpack_file.close(ctx.rt.io);
         ctx.unpacker.ctx.deinit();
         return 0;
     }
 
     fn newCtx(lua: *Lua) !i32 {
         const path = lua.toString(1) catch |err| return printLuaErr(lua, err);
+        const rt = LuaRt.fromLua(lua);
 
         const ctx = switch (zlua.lang) {
-            // Other runtimes use __gc metamethod to clean up userdata
+            // Non-luau runtimes attach cleanup via the __gc metamethod instead.
             .luau => lua.newUserdataDtor(MsgpackUnpacker, zlua.wrap(MsgpackUnpacker.luauDetor)),
             .lua54 => lua.newUserdata(MsgpackUnpacker, 0),
             else => lua.newUserdata(MsgpackUnpacker),
         };
 
-        ctx.msgpack_file = std.fs.cwd().openFile(path, .{ .mode = .read_only }) catch |err| {
+        ctx.rt = rt;
+        ctx.msgpack_file = std.Io.Dir.cwd().openFile(rt.io, path, .{ .mode = .read_only }) catch |err| {
             logger.warn("Failed to open file {s}: {}", .{ path, err });
-            return zlua.Error.LuaFile;
+            return error.LuaFile;
         };
-        ctx.reader = std.fs.File.readerStreaming(ctx.msgpack_file, &ctx.read_buf);
+        ctx.reader = ctx.msgpack_file.readerStreaming(rt.io, &ctx.read_buf);
         ctx.unpacker = .{ .reader = &ctx.reader.interface, .ctx = UnpackerImpl.init(lua), .alloc = lua.allocator() };
 
         _ = lua.getMetatableRegistry(MsgpackUnpacker.meta_table); // [+p]
@@ -375,64 +543,35 @@ const MsgpackUnpacker = struct {
                 return 0;
             }
 
-            std.debug.dumpCurrentStackTrace(null);
+            std.debug.dumpCurrentStackTrace(.{});
             logger.err("Msgpack unpacker failed: {}", .{err});
-            return if (err == error.OutOfMemory) zlua.Error.OutOfMemory else zlua.Error.LuaRuntime;
+            return if (err == error.OutOfMemory) error.OutOfMemory else error.LuaRuntime;
         };
         return 1;
     }
 };
 
-/// Module loader for ultar.utix - returns { open = function(path) }
+/// Lua loader for `ultar.utix`; returns `{ open = fn(path) }`.
 fn utixModuleLoader(lua: *Lua) i32 {
     lua.createTable(0, 1); // [+p] module table
     lua.pushFunction(zlua.wrap(MsgpackUnpacker.newCtx)); // [+p]
     lua.setField(-2, "open"); // pop, set module.open
-    return 1; // return module table
+    return 1;
 }
 
-/// Module loader for ultar.scandir - returns { open = function(path) }
+/// Lua loader for `ultar.scandir`; returns `{ open = fn(path) }`.
 fn scandirModuleLoader(lua: *Lua) i32 {
     lua.createTable(0, 1); // [+p] module table
     lua.pushFunction(zlua.wrap(newScanCtx)); // [+p]
     lua.setField(-2, "open"); // pop, set module.open
-    return 1; // return module table
+    return 1;
 }
 
-/// Register a module loader in package.preload[name]
+/// Install `loader_fn` at `package.preload[name]`.
 fn registerPreload(lua: *Lua, name: [:0]const u8, loader_fn: zlua.CFn) !void {
-    _ = try lua.getGlobal("package"); // [+p]
+    _ = lua.getGlobal("package"); // [+p]
     _ = lua.getField(-1, "preload"); // [+p]
     lua.pushFunction(loader_fn); // [+p]
     lua.setField(-2, name); // pop loader_fn
     lua.pop(2); // pop preload, package
-}
-
-pub fn registerRt(lua: *Lua) !void {
-    // Register metatables for userdata types
-    try lua.newMetatable(ScanCtx.meta_table); // [+p]
-    lua.newTable(); // [+p]
-    lua.pushFunction(zlua.wrap(scanDir)); // [+p]
-    lua.setField(-2, ScanCtx.f_iter); // pop 1
-    lua.setField(-2, "__index"); // pop 1
-    if (zlua.lang != .luau) {
-        lua.pushFunction(zlua.wrap(ScanCtx.luaDetor)); // [+p]
-        lua.setField(-2, "__gc"); // pop 1
-    }
-    lua.pop(1); // pop meta_table
-
-    try lua.newMetatable(MsgpackUnpacker.meta_table); // [+p]
-    lua.newTable(); // [+p]
-    lua.pushFunction(zlua.wrap(MsgpackUnpacker.iter)); // [+p]
-    lua.setField(-2, MsgpackUnpacker.f_iter); // pop 1
-    lua.setField(-2, "__index"); // pop 1
-    if (zlua.lang != .luau) {
-        lua.pushFunction(zlua.wrap(MsgpackUnpacker.luaDetor)); // [+p]
-        lua.setField(-2, "__gc"); // pop 1
-    }
-    lua.pop(1); // pop meta_table
-
-    // Register modules in package.preload
-    try registerPreload(lua, "ultar.utix", zlua.wrap(utixModuleLoader));
-    try registerPreload(lua, "ultar.scandir", zlua.wrap(scandirModuleLoader));
 }

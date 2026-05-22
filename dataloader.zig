@@ -1,5 +1,3 @@
-// dataloader.zig
-
 const std = @import("std");
 const xev = @import("xev");
 const concurrent_ring = @import("concurrent_ring.zig");
@@ -46,7 +44,7 @@ pub const LoaderError = error{
     TooManyOpenFiles,
     InvalidFileHandle,
     ReadError,
-} || std.fs.File.OpenError || std.mem.Allocator.Error;
+} || std.Io.File.OpenError || std.mem.Allocator.Error;
 
 fn path_checksum(path: []const u8) u8 {
     var checksum: u8 = 0;
@@ -65,9 +63,8 @@ const XevReq = struct {
 pub const LoaderCtx = struct {
     const Self = @This();
 
-    // The IO thread is very active, it should poll requests ASAP.
-    // But the dataloader thread might be shared with Python,
-    // thus making result ring larger helps reduce blocking.
+    // Result ring is larger than request ring: the loader thread may be shared
+    // with Python and stall on dequeue, while the IO thread polls tightly.
     const IdxedRequest = struct {
         payload: Request,
         request_id: u64,
@@ -76,11 +73,12 @@ pub const LoaderCtx = struct {
     const ResultRing = concurrent_ring.SPSCRing(63, Response);
 
     alloc: std.mem.Allocator,
+    io: std.Io = undefined,
 
     request_ring: ReqRing = ReqRing.init(),
     result_ring: ResultRing = ResultRing.init(),
 
-    file_slots: [max_file_slots]?std.fs.File = @splat(null),
+    file_slots: [max_file_slots]?std.Io.File = @splat(null),
     xfile_slots: [max_file_slots]xev.File = undefined,
     file_refcount: [max_file_slots]u32 = @splat(0),
     file_slots_generation: [max_file_slots]u32 = std.mem.zeroes([max_file_slots]u32),
@@ -102,7 +100,7 @@ pub const LoaderCtx = struct {
     req_mem_pool: std.heap.MemoryPool(XevReq),
 
     fn findFreeFileSlot(self: *Self) !FileHandle {
-        // This isn't called too often, just linear scan
+        // Linear scan: open/close is rare relative to reads.
         for (0..max_file_slots) |offset| {
             const i = (self.last_slot + offset) % max_file_slots;
             const f = self.file_slots[0..][i];
@@ -177,7 +175,6 @@ pub const LoaderCtx = struct {
     }
 
     fn fileAddRef(self: *Self, slot: usize) void {
-        // Should start on 1
         std.debug.assert(self.file_refcount[0..][slot] > 0);
         self.file_refcount[0..][slot] += 1;
     }
@@ -187,7 +184,7 @@ pub const LoaderCtx = struct {
         self.file_refcount[0..][slot] -= 1;
         if (self.file_refcount[0..][slot] == 0) {
             const f = self.file_slots[0..][slot] orelse unreachable;
-            f.close();
+            f.close(self.io);
             self.file_slots[0..][slot] = null;
         }
     }
@@ -202,14 +199,12 @@ pub const LoaderCtx = struct {
                     return;
                 };
 
-                // Open the file
-                const f = std.fs.cwd().openFile(open_req.file_path, .{ .mode = .read_only }) catch |err| {
+                const f = std.Io.Dir.cwd().openFile(self.io, open_req.file_path, .{ .mode = .read_only }) catch |err| {
                     self.sendResponseSynced(req_id, err);
                     return;
                 };
                 const xf = xev.File.init(f) catch unreachable;
 
-                // Commit state
                 const slot: usize = h.idx;
                 const checksum = path_checksum(open_req.file_path);
                 self.file_slots[slot] = f;
@@ -248,8 +243,7 @@ pub const LoaderCtx = struct {
                 const slot: usize = read_req.file.idx;
                 const xf = self.xfile_slots[slot];
 
-                // Prepare read request
-                var xreq = self.req_mem_pool.create() catch |err| {
+                var xreq = self.req_mem_pool.create(self.alloc) catch |err| {
                     self.sendResponseSynced(req_id, err);
                     return;
                 };
@@ -258,7 +252,6 @@ pub const LoaderCtx = struct {
 
                 self.fileAddRef(slot);
 
-                // Enqueue async read
                 xf.pread(
                     &self.loop,
                     &xreq.c,
@@ -273,12 +266,12 @@ pub const LoaderCtx = struct {
             .drain => {
                 self.is_draining = true;
             },
-
-            // else => @panic("Not implemented"),
         }
     }
 
-    fn run_worker(self: *Self) void {
+    /// Worker loop. Caller must keep the backing Threaded alive for the worker's lifetime.
+    fn run_worker(self: *Self, io: std.Io) void {
+        self.io = io;
         while (self.is_running) {
             self.tick += 1;
             if (self.tick > self.debug_max_tick) {
@@ -305,7 +298,6 @@ pub const LoaderCtx = struct {
         self.worker_done.store(true, .release);
     }
 
-    // Loader side functions
     fn drainResponse(self: *Self) void {
         var count: usize = 0;
         while (self.result_ring.dequeue()) |_| {
@@ -337,14 +329,12 @@ pub const LoaderCtx = struct {
         }
     }
 
-    // Try to send a request,
-    // on success: return request id (id always > 0)
-    // on failure: return null
+    /// Non-blocking enqueue. Returns request id (> 0) on success, null if the ring is full.
     pub fn trySend(self: *Self, req: Request) ?u64 {
         self.req_cnt += 1;
         const req_id = self.req_cnt;
         self.request_ring.enqueue(.{ .payload = req, .request_id = req_id }) catch {
-            self.req_cnt -= 1; // We can do this because this is SPSC
+            self.req_cnt -= 1; // Safe rollback: SPSC, only this thread writes req_cnt.
             return null;
         };
         return req_id;
@@ -357,12 +347,12 @@ pub const LoaderCtx = struct {
     pub fn join(self: *Self) void {
         const thread = self.worker_thread orelse @panic("Worker thread not started");
         logger.debug("Joining worker thread", .{});
-        // Drain response so that pending requests won't block us from sending drain
+        // Drain results while sending drain: a full result ring stalls the worker,
+        // which would otherwise leave the request ring full and block trySend.
         while (self.trySend(.{ .drain = .{} }) == null) {
             self.drainResponse();
             std.Thread.yield() catch {};
         }
-        // Now wait until the worker thread signals done
         while (!self.worker_done.load(.acquire)) {
             self.drainResponse();
             std.Thread.yield() catch {};
@@ -372,24 +362,26 @@ pub const LoaderCtx = struct {
         self.worker_thread = null;
     }
 
-    pub fn start(self: *Self) !void {
+    pub fn start(self: *Self, io: std.Io) !void {
         if (self.worker_thread) |_| {
             @panic("Worker thread already started");
         }
 
+        self.io = io;
         self.is_running = true;
         self.worker_done.store(false, .monotonic);
 
         self.worker_thread = try std.Thread.spawn(.{
             .allocator = self.alloc,
-        }, Self.run_worker, .{self});
-        self.worker_thread.?.setName("dataloader_io_worker") catch {};
+        }, Self.run_worker, .{ self, io });
+        self.worker_thread.?.setName(io, "dataloader_io_worker") catch {};
 
         logger.debug("Worker thread started", .{});
     }
 
     pub fn initInPlace(self: *Self, alloc: std.mem.Allocator) !void {
         self.alloc = alloc;
+        self.io = undefined;
         self.request_ring = ReqRing.init();
         self.result_ring = ResultRing.init();
         self.file_slots = @splat(null);
@@ -408,7 +400,7 @@ pub const LoaderCtx = struct {
         self.debug_max_req_id = std.math.maxInt(u64);
         self.tick = 0;
         self.debug_max_tick = std.math.maxInt(u64);
-        self.req_mem_pool = try std.heap.MemoryPool(XevReq).initPreheated(alloc, 16);
+        self.req_mem_pool = try std.heap.MemoryPool(XevReq).initCapacity(alloc, 16);
     }
 
     pub fn deinit(self: *Self) void {
@@ -416,7 +408,7 @@ pub const LoaderCtx = struct {
             self.join();
         }
         self.loop.deinit();
-        self.req_mem_pool.deinit();
+        self.req_mem_pool.deinit(self.alloc);
     }
 };
 
@@ -427,14 +419,14 @@ test "test dataloader" {
         return error.SkipZigTest;
     }
 
-    std.testing.log_level = .debug;
+    const io = std.testing.io;
 
-    const f = try std.fs.cwd().createFile("testfile.tar", .{});
+    const f = try std.Io.Dir.cwd().createFile(io, "testfile.tar", .{ .truncate = true });
     var rng = std.Random.DefaultPrng.init(42);
     var ref: [256]u8 = undefined;
     rng.fill(&ref);
-    try f.writeAll(&ref);
-    f.close();
+    try f.writeStreamingAll(io, &ref);
+    f.close(io);
 
     var debug_alloc = std.heap.DebugAllocator(.{}).init;
     defer _ = debug_alloc.deinit();
@@ -444,7 +436,7 @@ test "test dataloader" {
     try ctx.initInPlace(debug_alloc.allocator());
     ctx.debug_max_req_id = 5;
     ctx.debug_max_tick = 1000;
-    try ctx.start();
+    try ctx.start(io);
     defer ctx.deinit();
 
     const open_rid = ctx.sendSynced(.{ .open_file = .{ .file_path = "testfile.tar" } });
@@ -465,7 +457,7 @@ test "test dataloader" {
 }
 
 test "test dataloader blocked join" {
-    std.testing.log_level = .debug;
+    const io = std.testing.io;
 
     var debug_alloc = std.heap.DebugAllocator(.{}).init;
     defer _ = debug_alloc.deinit();
@@ -475,13 +467,13 @@ test "test dataloader blocked join" {
     try ctx.initInPlace(debug_alloc.allocator());
     ctx.debug_max_req_id = 100;
     ctx.debug_max_tick = 1000;
-    try ctx.start();
+    try ctx.start(io);
     defer ctx.deinit();
 
-    // Send until we can't send anymore (blocked on full response ring)
+    // Fill rings until trySend fails (worker stalled on full result ring).
     while (ctx.trySend(.{ .open_file = .{ .file_path = "/sys/does_not_exist" } })) |_| {}
-    std.Thread.sleep(1000);
-    // This must unblock the worker
+    std.Io.sleep(io, .fromNanoseconds(1000), .awake) catch {};
+    // join must drain results to unblock the worker.
     ctx.join();
 
     try std.testing.expect(ctx.is_running == false);

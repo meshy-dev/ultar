@@ -14,8 +14,6 @@ pub const LuaLoaderSpec = extern struct {
     rank: c_uint,
     world_size: c_uint,
     debug: bool,
-    // Key-value config passed from Python as parallel arrays
-    // All values are strings; Lua script can convert as needed
     config_keys: [*c]const [*c]const u8 = null,
     config_values: [*c]const [*c]const u8 = null,
     config_count: c_uint = 0,
@@ -95,8 +93,11 @@ pub const LuaDataLoader = struct {
     };
 
     alloc: std.mem.Allocator,
+    threaded: std.Io.Threaded = undefined,
+    io: std.Io = undefined,
     loader: LoaderCtx = undefined,
     lua: *Lua = undefined,
+    rt: lua_rt.LuaRt = undefined,
 
     u_loader_fn: UserLoaderFn = .{},
     u_ctx: i32 = 0,
@@ -110,17 +111,15 @@ pub const LuaDataLoader = struct {
     queue: std.DoublyLinkedList = .{},
     queue_len: usize = 0,
 
-    // Row buffer pool - protected by row_buf_mutex for thread safety
-    // Accessed by: internal loader thread (newInprogressRow, nextRow)
-    //              Python thread (reclaimRow via ultarReclaimRow)
-    row_buf_mutex: std.Thread.Mutex = .{},
+    // Guards free_list and num_floating_rows; reclaimRow runs on the Python thread.
+    row_buf_mutex: std.Io.Mutex = .init,
     free_list: std.DoublyLinkedList = .{},
     num_floating_rows: usize = 0,
 
     load_rid_to_row: std.AutoArrayHashMapUnmanaged(u64, *Row),
 
-    last_instant: std.time.Instant,
-    last_log_instant: std.time.Instant,
+    last_instant: std.Io.Clock.Timestamp,
+    last_log_instant: std.Io.Clock.Timestamp,
     mbps_smoothed: f64 = 0.0,
     mbps_period_max: f64 = 0.0,
     samples_count: u64 = 0,
@@ -129,7 +128,7 @@ pub const LuaDataLoader = struct {
 
     fn gOpenFile(lua: *Lua) !i32 {
         const loader = try lua.toUserdata(Self, 1);
-        // We yield after this function & the string ref should live long enough
+        // Safe to borrow: Lua yields immediately after, keeping the string pinned.
         const file_path = try lua.toString(2);
 
         loader.u_yielded_from = .{
@@ -155,7 +154,7 @@ pub const LuaDataLoader = struct {
     fn gAddEntry(lua: *Lua) !i32 {
         const loader = try lua.toUserdata(Self, 1);
         const handle: u64 = try lua_rt.toUnsigned64(lua, 2);
-        // We yield after this function & the string ref should live long enough
+        // Safe to borrow: Lua yields immediately after, keeping the string pinned.
         const key = try lua.toString(3);
         const offset: u64 = @intFromFloat(try lua.toNumber(4));
         const size: u32 = try lua_rt.toUnsigned(lua, 5);
@@ -209,9 +208,9 @@ pub const LuaDataLoader = struct {
             self.queue_len += 1;
         }
 
-        self.row_buf_mutex.lock();
+        self.row_buf_mutex.lockUncancelable(self.io);
         const free_node_opt = self.free_list.popFirst();
-        self.row_buf_mutex.unlock();
+        self.row_buf_mutex.unlock(self.io);
 
         if (free_node_opt) |free_node| {
             var row: *Row = @fieldParentPtr("node", free_node);
@@ -222,40 +221,35 @@ pub const LuaDataLoader = struct {
         }
     }
 
+    /// Pops the stack top and returns a registry reference to it.
     fn luaPopAndRef(self: *Self) !i32 {
-        // Pops the top value from the Lua stack and returns a reference to it.
-        // This is used to store the result of a Lua function call in the registry.
         if (zlua.lang == .luau) {
-            const ref = try self.lua.ref(-1);
+            const ref = self.lua.ref(-1);
             self.lua.pop(1); // pop the value
             return ref;
         } else {
-            return try self.lua.ref(zlua.registry_index);
+            return self.lua.ref(zlua.registry_index);
         }
     }
 
-    // This function retrieves a function reference from the Lua table at `table` with the name `field_name`.
-    // The function reference is stored in the registry and returned as an integer.
+    /// Returns a registry reference to `table[field_name]`, erroring if it is not a function.
     fn getFieldAsFuncRef(self: *Self, table: i32, field_name: [:0]const u8) !i32 {
         _ = self.lua.getField(table, field_name);
         if (self.lua.isFunction(-1)) {
-            return self.luaPopAndRef(); // Pop the function and return its reference
+            return self.luaPopAndRef();
         } else {
             const type_name = self.lua.typeName(self.lua.typeOf(-1));
             self.lua.pop(1);
             logger.err("Expected {s} to be a function, got {s}", .{ field_name, type_name });
-            return zlua.Error.LuaError;
+            return error.LuaError;
         }
     }
 
-    fn printLuaErr(self: *Self, err: zlua.Error) zlua.Error {
+    fn printLuaErr(self: *Self, err: anyerror) anyerror {
         return lua_rt.printLuaErr(self.lua, err);
     }
 
-    // Tries to resume the generator coroutine
-    // If the generator is completed, returns .ok
-    // If the generator has pending unresolved yield (u_yielded_from != null), returns .yield
-    // Otherwise we resume the generator and return the status
+    /// Resumes the generator coroutine, or short-circuits if it is completed or has an unresolved yield.
     fn resumeGenerator(self: *Self) !zlua.ResumeStatus {
         if (self.u_completed) {
             return .ok;
@@ -281,22 +275,17 @@ pub const LuaDataLoader = struct {
                 self.u_completed = true;
                 return .ok;
             },
-            .yield => {
-                return .yield;
-            },
+            .yield => return .yield,
         }
     }
 
     pub fn nextRow(self: *Self) !?*LoadedRow {
-        var wait_time_ns: u64 = 1_024; // Start with 1us
-        const wait_time_cap: u64 = 1 << 24; // Cap at ~16ms
+        var wait_time_ns: u64 = 1_024; // ~1us
+        const wait_time_cap: u64 = 1 << 24; // ~16ms
         while (true) {
             const n = self.queue_len;
-            // Throttle & wait for IO if we have enough in-flight rows
-            // Compute wait time heuristic
             if (n < self.queue_size_rows) {
                 if (try self.resumeGenerator() == .ok and n == 0) {
-                    // Generator completed
                     return null;
                 }
                 wait_time_ns = @max(wait_time_ns / 2, 1);
@@ -304,18 +293,15 @@ pub const LuaDataLoader = struct {
                 wait_time_ns = @min(wait_time_ns * 2, wait_time_cap);
             }
 
-            // Handle the reason we yielded
             if (self.u_yielded_from != null) {
                 switch (self.u_yielded_from.?) {
                     .open_file => |*f| {
                         if (f.sent_rid == 0) {
-                            // Haven't sent the req yet
                             if (self.loader.trySend(.{ .open_file = .{ .file_path = f.file } })) |rid| {
                                 f.sent_rid = rid;
                             }
                         }
-                        // We resume when we got the file handle back,
-                        // Don't clear u_yielded_from
+                        // Cleared in the response handler once the file handle arrives.
                     },
                     .close_file => |*f| {
                         if (self.loader.trySend(.{ .close_file = @bitCast(f.file_handle) })) |_| {
@@ -350,7 +336,6 @@ pub const LuaDataLoader = struct {
                 }
             }
 
-            // Poll the loader responses
             while (self.loader.tryRecv()) |resp| {
                 // FIXME: make some of these errors recoverable
                 const payload = try resp.payload;
@@ -381,8 +366,8 @@ pub const LuaDataLoader = struct {
                     self.queue_len -= 1;
 
                     {
-                        self.row_buf_mutex.lock();
-                        defer self.row_buf_mutex.unlock();
+                        self.row_buf_mutex.lockUncancelable(self.io);
+                        defer self.row_buf_mutex.unlock(self.io);
                         self.num_floating_rows += 1;
                         if (self.num_floating_rows > Self.max_floating_rows) {
                             std.debug.panic("Too many floating (owned by client) rows > max: {}", .{Self.max_floating_rows});
@@ -405,26 +390,23 @@ pub const LuaDataLoader = struct {
                         bytes += e.data.len;
                     }
 
-                    const now = try std.time.Instant.now();
-                    const delta = now.since(self.last_instant);
+                    const now = std.Io.Clock.Timestamp.now(self.io, .awake);
+                    const delta_ns: i96 = self.last_instant.durationTo(now).raw.nanoseconds;
                     self.last_instant = now;
-                    const mbps = @as(f64, @floatFromInt(bytes)) * 1e-6 / (@as(f64, @floatFromInt(delta)) * 1e-9);
+                    const mbps = @as(f64, @floatFromInt(bytes)) * 1e-6 / (@as(f64, @floatFromInt(delta_ns)) * 1e-9);
 
-                    // Adaptive smoothing: alpha = 1/min(samples, 100)
                     self.samples_count += 1;
                     const smoothing_samples = @min(self.samples_count, 100);
                     const alpha = 1.0 / @as(f64, @floatFromInt(smoothing_samples));
                     self.mbps_smoothed = alpha * mbps + (1.0 - alpha) * self.mbps_smoothed;
 
-                    // Track max throughput during this logging period
                     self.mbps_period_max = @max(self.mbps_period_max, mbps);
 
-                    // Log throughput every 60 seconds
-                    const since_last_log = now.since(self.last_log_instant);
-                    if (since_last_log >= 60 * std.time.ns_per_s) {
+                    const since_last_log_ns: i96 = self.last_log_instant.durationTo(now).raw.nanoseconds;
+                    if (since_last_log_ns >= 60 * std.time.ns_per_s) {
                         logger.info("{d:.1} MBytes/s (Period max: {d:.1})", .{ self.mbps_smoothed, self.mbps_period_max });
                         self.last_log_instant = now;
-                        self.mbps_period_max = 0.0; // Reset for next period
+                        self.mbps_period_max = 0.0;
                     }
 
                     logger.debug("Returning row @ {}", .{&row.ext_row});
@@ -437,33 +419,29 @@ pub const LuaDataLoader = struct {
             if (wait_time_ns < 10_000) {
                 std.atomic.spinLoopHint();
             }
-            std.Thread.sleep(wait_time_ns);
+            std.Io.sleep(self.io, .fromNanoseconds(@intCast(wait_time_ns)), .awake) catch {};
         }
     }
 
     pub fn reclaimRow(self: *Self, c_row: *LoadedRow) void {
         const row: *Row = @fieldParentPtr("ext_row", c_row);
 
-        self.row_buf_mutex.lock();
-        defer self.row_buf_mutex.unlock();
+        self.row_buf_mutex.lockUncancelable(self.io);
+        defer self.row_buf_mutex.unlock(self.io);
 
         self.free_list.append(&row.node);
         self.num_floating_rows -= 1;
     }
 
-    /// Module loader for ultar.loader - returns the loader interface table
+    /// `require("ultar.loader")` body; returns the loader interface table. `self` is the closure upvalue.
     fn loaderModuleLoader(lua: *Lua) !i32 {
-        // Get self from upvalue
         const self = try lua.toUserdata(Self, Lua.upvalueIndex(1));
 
-        // Create the module table with loader methods
         lua.createTable(0, 5); // [+p] module table
 
-        // Store c_loader reference for method calls
         lua.pushLightUserdata(self); // [+p]
         lua.setField(-2, "c_loader"); // pop
 
-        // Add methods
         try Self.wrapCoyield(lua, "loader_open_file", Self.gOpenFile); // [+p]
         lua.setField(-2, "open_file"); // pop
         try Self.wrapCoyield(lua, "loader_close_file", Self.gCloseFile); // [+p]
@@ -473,15 +451,14 @@ pub const LuaDataLoader = struct {
         try Self.wrapCoyield(lua, "loader_finish_row", Self.gFinishRow); // [+p]
         lua.setField(-2, "finish_row"); // pop
 
-        return 1; // return module table
+        return 1;
     }
 
-    /// Register the loader module in package.preload["ultar.loader"]
+    /// Installs the loader module under `package.preload["ultar.loader"]` with `self` captured as an upvalue.
     fn registerLoaderModule(self: *Self) !void {
-        _ = try self.lua.getGlobal("package"); // [+p]
+        _ = self.lua.getGlobal("package"); // [+p]
         _ = self.lua.getField(-1, "preload"); // [+p]
 
-        // Create closure with self as upvalue
         self.lua.pushLightUserdata(self); // [+p] upvalue
         self.lua.pushClosure(zlua.wrap(Self.loaderModuleLoader), 1); // pop upvalue, push closure
 
@@ -491,12 +468,12 @@ pub const LuaDataLoader = struct {
 
     fn initLua(self: *Self, spec: LuaLoaderSpec) !void {
         self.lua.openLibs();
-        lua_rt.registerRt(self.lua) catch |err| return self.printLuaErr(err);
+        // `self` is heap-allocated, so `&self.rt` is a stable pointer for the
+        // Lua state's lifetime.
+        self.rt.init(self.lua, self.io) catch |err| return self.printLuaErr(err);
 
-        // Register ultar.loader module
         self.registerLoaderModule() catch |err| return self.printLuaErr(err);
 
-        // Compile src to bytecode & load into VM
         if (zlua.lang == .luau) {
             const alloc = self.lua.allocator();
             const src: [:0]const u8 = std.mem.span(spec.src);
@@ -512,30 +489,27 @@ pub const LuaDataLoader = struct {
             self.lua.loadString(src) catch |err| return self.printLuaErr(err);
         }
 
-        // Call the bytecode that generates a context & its functions
+        // Loader script must return a table of { init_ctx, row_generator }.
         self.lua.protectedCall(.{ .results = 1 }) catch |err| return self.printLuaErr(err);
 
-        // Check the result type is what we expect
         const table = self.lua.getTop();
         if (!self.lua.isTable(table)) {
             const type_name = self.lua.typeName(self.lua.typeOf(table));
             logger.err("Expected spec result to be a table, got {s}", .{type_name});
-            return zlua.Error.LuaError;
+            return error.LuaError;
         }
 
         self.u_loader_fn.init_ctx = try self.getFieldAsFuncRef(table, "init_ctx");
         self.u_loader_fn.row_generator = try self.getFieldAsFuncRef(table, "row_generator");
 
-        self.lua.pop(1); // Get rid of the table
+        self.lua.pop(1); // drop the table
 
-        // Initialize the user provided context
-        // Call init_ctx(rank, world_size, config)
-        _ = self.lua.rawGetIndex(zlua.registry_index, self.u_loader_fn.init_ctx);
+        // init_ctx(rank, world_size, config)
+        _ = self.lua.getIndexRaw(zlua.registry_index, self.u_loader_fn.init_ctx);
         lua_rt.pushUnsigned(self.lua, @intCast(spec.rank));
         lua_rt.pushUnsigned(self.lua, @intCast(spec.world_size));
 
-        // Push config table as 3rd argument
-        self.lua.createTable(@intCast(spec.config_count), 0); // [+p]
+        self.lua.createTable(@intCast(spec.config_count), 0); // [+p] config
         if (spec.config_keys != null and spec.config_values != null) {
             for (0..spec.config_count) |i| {
                 const key: [*:0]const u8 = @ptrCast(spec.config_keys[i]);
@@ -546,19 +520,24 @@ pub const LuaDataLoader = struct {
         }
 
         self.lua.protectedCall(.{ .args = 3, .results = 1 }) catch |err| return self.printLuaErr(err);
-        self.u_ctx = self.luaPopAndRef() catch |err| return self.printLuaErr(err); // pop & store ref of ret value (user context)
+        self.u_ctx = self.luaPopAndRef() catch |err| return self.printLuaErr(err);
 
-        // Setup the generator as a coroutine
-        _ = self.lua.rawGetIndex(zlua.registry_index, self.u_loader_fn.row_generator); // [+p]
-        _ = self.lua.rawGetIndex(zlua.registry_index, self.u_ctx); // [+p]
+        // Prime the generator coroutine; first resume calls row_generator(u_ctx).
+        _ = self.lua.getIndexRaw(zlua.registry_index, self.u_loader_fn.row_generator); // [+p]
+        _ = self.lua.getIndexRaw(zlua.registry_index, self.u_ctx); // [+p]
         self.u_resume_nargs = 1;
-        // at this point `resume` can start the generator
     }
 
     pub fn init(spec: LuaLoaderSpec, alloc: std.mem.Allocator) !*Self {
         var self = try alloc.create(Self);
         errdefer alloc.destroy(self);
-        const now = try std.time.Instant.now();
+
+        // No `std.process.Init` at the Python extension entry point; own the Io ourselves.
+        self.threaded = .init(alloc, .{});
+        errdefer self.threaded.deinit();
+        self.io = self.threaded.io();
+
+        const now = std.Io.Clock.Timestamp.now(self.io, .awake);
         self.alloc = alloc;
         self.loader = undefined;
         self.lua = undefined;
@@ -572,7 +551,7 @@ pub const LuaDataLoader = struct {
         self.in_progress_row = null;
         self.queue = .{};
         self.queue_len = 0;
-        self.row_buf_mutex = .{};
+        self.row_buf_mutex = .init;
         self.free_list = .{};
         self.num_floating_rows = 0;
         self.load_rid_to_row = try std.AutoArrayHashMapUnmanaged(u64, *Row).init(alloc, &.{}, &.{});
@@ -593,10 +572,8 @@ pub const LuaDataLoader = struct {
 
         try self.loader.initInPlace(alloc);
         errdefer self.loader.deinit();
-        try self.loader.start();
+        try self.loader.start(self.io);
 
-        // This init the Lua VM,
-        // runs init_ctx, and setup generator coroutine
         self.lua = try Lua.init(alloc);
         errdefer self.lua.deinit();
         try self.initLua(spec);
@@ -624,6 +601,8 @@ pub const LuaDataLoader = struct {
             r.deinit();
             self.alloc.destroy(r);
         }
+
+        self.threaded.deinit();
     }
 };
 
@@ -659,7 +638,7 @@ fn createLuaLoader(spec: LuaLoaderSpec) !*LuaLoaderCCtx {
 
 pub export fn ultarCreateLuaLoader(spec: LuaLoaderSpec) ?*LuaLoaderCCtx {
     return createLuaLoader(spec) catch {
-        std.debug.dumpCurrentStackTrace(null);
+        std.debug.dumpCurrentStackTrace(.{});
         return @ptrFromInt(0);
     };
 }

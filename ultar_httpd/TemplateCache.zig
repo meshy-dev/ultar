@@ -4,13 +4,43 @@ const os = std.os;
 const TemplateCache = @This();
 
 alloc: std.mem.Allocator,
-mutex: std.Thread.Mutex = .{},
+threaded: std.Io.Threaded,
+io: std.Io,
+mutex: std.Io.Mutex,
 map: std.StringHashMapUnmanaged([]const u8),
-inotify_fd: std.posix.fd_t = -1,
-watch_wd: i32 = -1,
+inotify_fd: std.posix.fd_t,
+watch_wd: i32,
 
-pub fn init(allocator: std.mem.Allocator) TemplateCache {
-    return TemplateCache{ .alloc = allocator, .map = .empty };
+/// TemplateCache.init : Initializes a TemplateCache in-place.
+pub fn init(self: *TemplateCache, allocator: std.mem.Allocator) !void {
+    // Direct field assignment keeps `Threaded` at its final address so the vtable pointer captured by `.io()` stays valid.
+    self.alloc = allocator;
+    self.mutex = .init;
+    self.map = .empty;
+    self.inotify_fd = -1;
+    self.watch_wd = -1;
+    self.threaded = .init(allocator, .{});
+    errdefer self.threaded.deinit();
+    self.io = self.threaded.io();
+
+    const fd_raw = os.linux.inotify_init1(os.linux.IN.NONBLOCK);
+    if (fd_raw < 0) return;
+    self.inotify_fd = @as(std.posix.fd_t, @intCast(fd_raw));
+    errdefer {
+        _ = os.linux.close(self.inotify_fd);
+        self.inotify_fd = -1;
+    }
+
+    const path_nt = "ultar_httpd/templates\x00";
+    const wd_usize = os.linux.inotify_add_watch(
+        @as(i32, @intCast(fd_raw)),
+        path_nt,
+        os.linux.IN.MODIFY | os.linux.IN.CREATE | os.linux.IN.DELETE | os.linux.IN.MOVED_FROM | os.linux.IN.MOVED_TO,
+    );
+    self.watch_wd = @as(i32, @intCast(wd_usize));
+
+    var t = try std.Thread.spawn(.{}, TemplateCache.watchLoop, .{self});
+    try t.setName(self.io, "tmpl.watch");
 }
 
 pub fn deinit(self: *TemplateCache) void {
@@ -19,21 +49,12 @@ pub fn deinit(self: *TemplateCache) void {
     if (self.inotify_fd >= 0) {
         _ = os.linux.close(self.inotify_fd);
     }
-}
-
-pub fn setupWatcher(self: *TemplateCache) void {
-    const fd_raw = os.linux.inotify_init1(os.linux.IN.NONBLOCK);
-    if (fd_raw < 0) return;
-    self.inotify_fd = @as(std.posix.fd_t, @intCast(fd_raw));
-    const path_nt = "ultar_httpd/templates\x00";
-    const wd_usize = os.linux.inotify_add_watch(@as(i32, @intCast(fd_raw)), path_nt, os.linux.IN.MODIFY | os.linux.IN.CREATE | os.linux.IN.DELETE | os.linux.IN.MOVED_FROM | os.linux.IN.MOVED_TO);
-    self.watch_wd = @as(i32, @intCast(wd_usize));
-    _ = std.Thread.spawn(.{}, TemplateCache.watchLoop, .{self}) catch return;
+    self.threaded.deinit();
 }
 
 fn invalidateAll(self: *TemplateCache) void {
-    self.mutex.lock();
-    defer self.mutex.unlock();
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
     var it = self.map.iterator();
     while (it.next()) |kv| {
         self.alloc.free(kv.key_ptr.*);
@@ -44,15 +65,14 @@ fn invalidateAll(self: *TemplateCache) void {
 }
 
 pub fn get(self: *TemplateCache, path: []const u8) ![]const u8 {
-    // First try under lock
-    self.mutex.lock();
-    defer self.mutex.unlock();
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
     if (self.map.get(path)) |v| {
         std.debug.print("Cache hit for {s} ({} bytes)\n", .{ path, v.len });
         return v;
     }
     const max = 2 * 1024 * 1024;
-    const bytes = try std.fs.cwd().readFileAlloc(self.alloc, path, max);
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(self.io, path, self.alloc, .limited(max));
     errdefer self.alloc.free(bytes);
     const key = try self.alloc.dupe(u8, path);
     errdefer self.alloc.free(key);
@@ -61,6 +81,7 @@ pub fn get(self: *TemplateCache, path: []const u8) ![]const u8 {
     return bytes;
 }
 
+/// TemplateCache.watchLoop : Drains inotify events and invalidates the cache; runs on the dedicated `tmpl.watch` thread until `deinit` closes `inotify_fd`.
 pub fn watchLoop(self: *TemplateCache) void {
     var buf: [4096]u8 = undefined;
     while (true) {

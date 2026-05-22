@@ -4,25 +4,34 @@ const xev = @import("xev");
 const octal = @import("octal.zig");
 const tardefs = @import("tardefs.zig");
 
-// Tar file scanner
+/// Compile-time callback bundle for `TarFileScanner`; `entry_cb` is required.
+pub fn ScannerConfig(comptime State: type) type {
+    return struct {
+        entry_cb: *const fn (
+            state: *State,
+            header: ?*tardefs.TarHeader,
+            offset: usize,
+            size: usize,
+        ) bool,
+        error_cb: ?*const fn (state: *State, err: xev.ReadError!void) bool = null,
+        done_cb: ?*const fn (state: *State) void = null,
+    };
+}
 
 pub fn TarFileScanner(
     comptime State: type,
-    comptime entry_cb: *const fn (
-        state: *State,
-        header: ?*tardefs.TarHeader,
-        offset: usize,
-        size: usize,
-    ) bool,
-    comptime error_cb: ?*const fn (state: *State, err: xev.ReadError!void) bool,
+    comptime cfg: ScannerConfig(State),
 ) type {
+    const entry_cb = cfg.entry_cb;
+    const error_cb = cfg.error_cb;
+    const done_cb = cfg.done_cb;
     return struct {
         const Self = @This();
         const logger = std.log.scoped(.TarFileScanner);
 
         const blocks: usize = 64;
 
-        fs_file: ?std.fs.File,
+        fs_file: ?std.Io.File,
         f: xev.File,
         state: State,
 
@@ -30,15 +39,15 @@ pub fn TarFileScanner(
         read_buf: [Self.blocks * tardefs.block_size]u8 = undefined,
         offset: usize = 0,
 
-        pub fn initFp(state: State, fp: []const u8) !Self {
-            const fs_file = std.fs.cwd().openFile(fp, .{ .mode = .read_only }) catch |err| {
+        pub fn initFp(io: std.Io, state: State, fp: []const u8) !Self {
+            const fs_file = std.Io.Dir.cwd().openFile(io, fp, .{ .mode = .read_only }) catch |err| {
                 std.debug.print("Failed to open file {s}. Error: {}\n", .{ fp, err });
                 return err;
             };
             return try Self.init(state, fs_file);
         }
 
-        pub fn init(state: State, fs_file: std.fs.File) !Self {
+        pub fn init(state: State, fs_file: std.Io.File) !Self {
             return .{
                 .fs_file = fs_file,
                 .f = try xev.File.init(fs_file),
@@ -46,10 +55,15 @@ pub fn TarFileScanner(
             };
         }
 
-        pub fn deinit(self: *Self) void {
+        pub fn deinit(self: *Self, io: std.Io) void {
             if (self.fs_file) |f| {
-                f.close();
+                f.close(io);
             }
+        }
+
+        fn finish(self: *Self) xev.CallbackAction {
+            if (done_cb) |f| f(&self.state);
+            return .disarm;
         }
 
         pub fn readCallback(
@@ -64,9 +78,9 @@ pub fn TarFileScanner(
             const read_size = r catch |err| {
                 logger.err("Error reading from file: {}", .{err});
                 if (error_cb) |f| {
-                    return if (f(&self.state, err)) .rearm else .disarm;
+                    if (f(&self.state, err)) return .rearm;
                 }
-                return .disarm;
+                return self.finish();
             };
             _ = c;
             _ = s;
@@ -74,11 +88,11 @@ pub fn TarFileScanner(
 
             if (read_size < tardefs.block_size) {
                 logger.err("Read {} bytes, less than block size", .{read_size});
-                return .disarm;
+                return self.finish();
             }
             if (read_size % tardefs.block_size != 0) {
                 logger.err("Read {} bytes, not a multiple of block size", .{read_size});
-                return .disarm;
+                return self.finish();
             }
 
             var buf_offset: usize = 0;
@@ -92,21 +106,21 @@ pub fn TarFileScanner(
                     if (zero_block_encountered >= 2) {
                         logger.debug("TarFile terminated", .{});
                         _ = entry_cb(&self.state, null, 0, 0);
-                        return .disarm;
+                        return self.finish();
                     }
                     continue;
                 }
 
                 if (!block.magic.gnu.isValid() and !block.magic.posix.isValid()) {
                     logger.err("Invalid magic number in tar header\n", .{});
-                    return .disarm;
+                    return self.finish();
                 }
                 const u_chksum = tardefs.calcChecksum(block, u8);
                 const s_chksum = tardefs.calcChecksum(block, i8);
                 const block_chksum = octal.octalAsciiToSize(&block.chksum);
                 if (block_chksum != u_chksum and block_chksum != s_chksum) {
                     logger.err("Checksum mismatch in tar header: {} != (with u8) {} or (with i8) {}", .{ block_chksum, u_chksum, s_chksum });
-                    return .disarm;
+                    return self.finish();
                 }
 
                 const size = octal.octalAsciiToSize(&block.size);
@@ -114,7 +128,7 @@ pub fn TarFileScanner(
 
                 if (mem.indexOf(u8, &block.name, "@PaxHeader") == null) {
                     if (!entry_cb(&self.state, block, self.offset + buf_offset, size)) {
-                        return .disarm;
+                        return self.finish();
                     }
                 }
 
@@ -134,8 +148,6 @@ pub fn TarFileScanner(
     };
 }
 
-// Dir scanner
-
 fn fnameCmp(_: void, a: []const u8, b: []const u8) bool {
     return mem.lessThan(u8, a, b);
 }
@@ -152,41 +164,41 @@ const FileList = struct {
     }
 };
 
-pub fn scanDirAlloc(allocator: mem.Allocator, base_path: [:0]const u8, ext: [:0]const u8, comptime sorted: bool) !FileList {
+pub fn scanDirAlloc(allocator: mem.Allocator, io: std.Io, base_path: [:0]const u8, ext: [:0]const u8, comptime sorted: bool) !FileList {
     const logger = std.log.scoped(.scanDirAlloc);
 
     var entries = try std.ArrayList([]const u8).initCapacity(allocator, 1024);
 
-    var stack = try std.ArrayListUnmanaged(std.fs.Dir).initCapacity(allocator, 8);
+    var stack = try std.ArrayListUnmanaged(std.Io.Dir).initCapacity(allocator, 8);
     defer stack.deinit(allocator);
 
-    const real_base_path = try std.fs.realpathAlloc(allocator, base_path);
-    try stack.append(allocator, try std.fs.openDirAbsolute(real_base_path, .{ .iterate = true }));
-    allocator.free(real_base_path);
+    var rp_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const base_n = try std.Io.Dir.cwd().realPathFile(io, base_path, &rp_buf);
+    try stack.append(allocator, try std.Io.Dir.openDirAbsolute(io, rp_buf[0..base_n], .{ .iterate = true }));
 
     while (stack.items.len > 0) {
         var dir_entry = stack.pop().?;
         var iter = dir_entry.iterate();
-        while (try iter.next()) |entry| {
-            var buf: [2048]u8 = undefined;
+        while (try iter.next(io)) |entry| {
+            var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
             switch (entry.kind) {
                 .directory => {
-                    if (dir_entry.openDir(entry.name, .{ .iterate = true })) |subdir| {
+                    if (dir_entry.openDir(io, entry.name, .{ .iterate = true })) |subdir| {
                         try stack.append(allocator, subdir);
                     } else |err| {
-                        const full_path = try dir_entry.realpath(entry.name, &buf);
-                        logger.warn("Failed to open subdir at {s} ({}), skipping subtree", .{ full_path, err });
+                        const n = try dir_entry.realPathFile(io, entry.name, &buf);
+                        logger.warn("Failed to open subdir at {s} ({}), skipping subtree", .{ buf[0..n], err });
                     }
                 },
                 .file => if (mem.endsWith(u8, entry.name, ext)) {
-                    const full_path = try dir_entry.realpath(entry.name, &buf);
-                    try entries.append(try allocator.dupe(u8, full_path));
+                    const n = try dir_entry.realPathFile(io, entry.name, &buf);
+                    try entries.append(try allocator.dupe(u8, buf[0..n]));
                 },
                 .sym_link => logger.warn("Skipping symlink {s}", .{entry.name}),
                 else => {},
             }
         }
-        dir_entry.close();
+        dir_entry.close(io);
     }
 
     if (sorted) {

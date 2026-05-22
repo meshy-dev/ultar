@@ -22,10 +22,7 @@ fn packBE(comptime T: type, buf: []u8, v: T) void {
         std.debug.assert(@typeInfo(T) == .int);
     }
     const nb = @bitSizeOf(T) / 8;
-    const UType = @Type(std.builtin.Type{ .int = .{
-        .signedness = .unsigned,
-        .bits = @bitSizeOf(T),
-    } });
+    const UType = @Int(.unsigned, @bitSizeOf(T));
     const uv: UType = @bitCast(v);
     inline for (0..nb) |i| {
         const shift: comptime_int = (nb - 1 - i) * 8;
@@ -404,7 +401,7 @@ test "test map packing" {
 pub const Packer = struct {
     const Self = @This();
 
-    writer: *std.io.Writer,
+    writer: *std.Io.Writer,
 
     pub fn addNil(self: *Self) !void {
         _ = try self.writer.writeByte(m_nil);
@@ -450,7 +447,7 @@ test "test writer" {
     var buf: [1024]u8 = std.mem.zeroes([1024]u8);
 
     {
-        var writer = std.io.Writer.fixed(&buf);
+        var writer = std.Io.Writer.fixed(&buf);
 
         var pack = Packer{ .writer = &writer };
         try pack.beginMap(4);
@@ -478,7 +475,7 @@ test "test writer" {
     }
 
     {
-        var writer = std.io.Writer.fixed(&buf);
+        var writer = std.Io.Writer.fixed(&buf);
 
         var pack = Packer{ .writer = &writer };
 
@@ -516,7 +513,7 @@ pub fn MsgpackHandler(CtxT: type) type {
 const up_log = std.log.scoped(.msgpack_unpacker);
 
 fn errNoImpl() error{NotImplemented} {
-    std.debug.dumpCurrentStackTrace(null);
+    std.debug.dumpCurrentStackTrace(.{});
     up_log.err("Not implemented", .{});
     return error.NotImplemented;
 }
@@ -531,7 +528,7 @@ pub fn Unpacker(CtxT: type, comptime handler: MsgpackHandler(CtxT)) type {
         const Self = @This();
 
         ctx: CtxT,
-        reader: *std.io.Reader,
+        reader: *std.Io.Reader,
         alloc: std.mem.Allocator,
 
         fn isShortStr(header: u8) bool {
@@ -792,7 +789,7 @@ pub fn Unpacker(CtxT: type, comptime handler: MsgpackHandler(CtxT)) type {
                         var buf: [8]u8 = undefined;
                         read += try self.reader.readSliceShort(buf[0..nb]);
 
-                        const UType = @Type(std.builtin.Type{ .int = .{ .bits = nb * 8, .signedness = .unsigned } });
+                        const UType = @Int(.unsigned, nb * 8);
                         var u: UType = 0;
                         inline for (0..nb) |i| {
                             u |= (@as(UType, @intCast(buf[i])) << ((nb - 1 - i) * 8));
@@ -805,7 +802,7 @@ pub fn Unpacker(CtxT: type, comptime handler: MsgpackHandler(CtxT)) type {
                         var buf: [8]u8 = undefined;
                         read += try self.reader.readSliceShort(buf[0..nb]);
 
-                        const UType = @Type(std.builtin.Type{ .int = .{ .bits = nb * 8, .signedness = .unsigned } });
+                        const UType = @Int(.unsigned, nb * 8);
                         var u: UType = 0;
                         inline for (0..nb) |i| {
                             u |= (@as(UType, @intCast(buf[i])) << ((nb - 1 - i) * 8));
@@ -822,7 +819,7 @@ pub fn Unpacker(CtxT: type, comptime handler: MsgpackHandler(CtxT)) type {
             return read;
         }
 
-        pub fn init(reader: std.io.Reader, ctx: CtxT, alloc: std.mem.Allocator) Self {
+        pub fn init(reader: std.Io.Reader, ctx: CtxT, alloc: std.mem.Allocator) Self {
             return .{
                 .reader = reader,
                 .ctx = ctx,
@@ -834,7 +831,7 @@ pub fn Unpacker(CtxT: type, comptime handler: MsgpackHandler(CtxT)) type {
 
 test "test unpacker" {
     const ref = "\x84\xa3abc\xc2\xa3def7\xb4%%%%%%%%%%%%%%%%%%%%\xce\xba\xad\xf0\r\xb1this is an \xe5\x90\x91\xe9\x87\x8f\x93\xcb\xbf\xec\xcc\xcc\xcc\xcc\xcc\xcd\xcb?\xe0Q\xeb\x85\x1e\xb8R\xcb?\xd5UUUUUU";
-    var reader = std.io.Reader.fixed(ref);
+    var reader = std.Io.Reader.fixed(ref);
 
     var gpa = std.heap.DebugAllocator(.{}).init;
     const alloc = gpa.allocator();
@@ -842,7 +839,7 @@ test "test unpacker" {
     const FmtCtx = struct {
         const Self = @This();
 
-        writer: *std.io.Writer,
+        writer: *std.Io.Writer,
 
         pub fn f_bool(s: *Self, v: bool) !void {
             if (v) {
@@ -886,7 +883,7 @@ test "test unpacker" {
     };
 
     var out_buf: [1024]u8 = std.mem.zeroes([1024]u8);
-    var writer = std.io.Writer.fixed(&out_buf);
+    var writer = std.Io.Writer.fixed(&out_buf);
 
     var unpacker: Unpacker(
         FmtCtx,
@@ -955,7 +952,7 @@ pub const Scanner = struct {
         expect_key: bool, // only meaningful for map
     };
 
-    reader: *std.io.Reader,
+    reader: *std.Io.Reader,
     alloc: std.mem.Allocator,
 
     // Small-string scratch buffer; returned slices are valid until next call
@@ -1092,7 +1089,7 @@ pub const Scanner = struct {
         self.clearLastAlloc();
     }
 
-    pub fn init(reader: *std.io.Reader, alloc: std.mem.Allocator) Self {
+    pub fn init(reader: *std.Io.Reader, alloc: std.mem.Allocator) Self {
         return .{ .reader = reader, .alloc = alloc };
     }
 
@@ -1225,7 +1222,7 @@ pub const Scanner = struct {
                 const nb = 1 << (h - 0xd0);
                 var buf: [8]u8 = undefined;
                 _ = try self.reader.readSliceShort(buf[0..nb]);
-                const UType = @Type(std.builtin.Type{ .int = .{ .bits = nb * 8, .signedness = .unsigned } });
+                const UType = @Int(.unsigned, nb * 8);
                 var u: UType = 0;
                 inline for (0..nb) |i| u |= (@as(UType, @intCast(buf[i])) << ((nb - 1 - i) * 8));
                 self.parentNoteValueSeen();
@@ -1267,7 +1264,7 @@ pub const Scanner = struct {
 
 test "msgpack scanner - map with array" {
     const ref = "\x84\xa3abc\xc2\xa3def7\xb4%%%%%%%%%%%%%%%%%%%%\xce\xba\xad\xf0\r\xb1this is an \xe5\x90\x91\xe9\x87\x8f\x93\xcb\xbf\xec\xcc\xcc\xcc\xcc\xcc\xcd\xcb?\xe0Q\xeb\x85\x1e\xb8R\xcb?\xd5UUUUUU";
-    var reader = std.io.Reader.fixed(ref);
+    var reader = std.Io.Reader.fixed(ref);
     var gpa = std.heap.DebugAllocator(.{}).init;
     defer std.debug.assert(gpa.deinit() == .ok);
     var sc = Scanner.init(&reader, gpa.allocator());
@@ -1323,13 +1320,13 @@ test "msgpack scanner - map with array" {
 
 test "msgpack scanner - array 100" {
     var buf: [1024]u8 = undefined;
-    var writer = std.io.Writer.fixed(&buf);
+    var writer = std.Io.Writer.fixed(&buf);
     var pack = Packer{ .writer = &writer };
     try pack.beginArray(100);
     for (0..100) |i| try pack.addInt(usize, i);
     try writer.flush();
 
-    var reader = std.io.Reader.fixed(buf[0..writer.end]);
+    var reader = std.Io.Reader.fixed(buf[0..writer.end]);
     var gpa = std.heap.DebugAllocator(.{}).init;
     defer std.debug.assert(gpa.deinit() == .ok);
     var sc = Scanner.init(&reader, gpa.allocator());
@@ -1350,14 +1347,14 @@ test "msgpack scanner - array 100" {
 
 test "msgpack scanner - long string alloc" {
     var buf: [4096]u8 = undefined;
-    var writer = std.io.Writer.fixed(&buf);
+    var writer = std.Io.Writer.fixed(&buf);
     var pack = Packer{ .writer = &writer };
     var long: [300]u8 = undefined;
     @memset(&long, 'A');
     try pack.addStr(&long);
     try writer.flush();
 
-    var reader = std.io.Reader.fixed(buf[0..writer.end]);
+    var reader = std.Io.Reader.fixed(buf[0..writer.end]);
     var gpa = std.heap.DebugAllocator(.{}).init;
     defer std.debug.assert(gpa.deinit() == .ok);
     var sc = Scanner.init(&reader, gpa.allocator());

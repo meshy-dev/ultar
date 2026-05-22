@@ -1,24 +1,28 @@
 .{
     .name = .ultar,
     .version = "0.1.0",
-    .minimum_zig_version = "0.15.2",
+    .minimum_zig_version = "0.16.0",
     .fingerprint = 0x17f55a637e2667a4,
     .dependencies = .{
         .libxev = .{
-            .url = "git+https://github.com/mitchellh/libxev.git#42d4ead52667e03619dcd5b1a3ca8ef7d5dd24ed",
-            .hash = "libxev-0.0.0-86vtc0IbEwBzMSXa-ZPZ8JpcV4Mw1SrsTuvtJmFAQ7Uu",
+            .url = "git+https://github.com/mitchellh/libxev.git#9ce8e8e6ff89e583258a7f8e7adeeeaeae8611bf",
+            .hash = "libxev-0.0.0-86vtcwIRFADbH4hk-EjROXxlrKIRPQdA41XiTSytYO-F",
         },
         .clap = .{
-            .url = "https://github.com/Hejsil/zig-clap/archive/refs/tags/0.11.0.tar.gz",
-            .hash = "clap-0.11.0-oBajB-HnAQDPCKYzwF7rO3qDFwRcD39Q0DALlTSz5H7e",
+            .url = "git+https://github.com/Hejsil/zig-clap?ref=0.12.0#8d97efa1ee1e575443c7888d5c38e1c3fc145cf5",
+            .hash = "clap-0.12.0-oBajB7foAQDqlSwaSG5g0yq7xGbQARUsBk5T64gAOqP5",
         },
         .zlua = .{
-            .url = "git+https://github.com/natecraddock/ziglua.git#315b7f25efd29d9e2143d6c0ab685bb7f640450f",
-            .hash = "zlua-0.1.0-hGRpCww-BQCx3cX6zbKWfTgOx6B7Peo4P17RK2hm7-xV",
+            .url = "git+https://github.com/natecraddock/ziglua#8f271c82baa5fc43aa02a72f6da020c2025d9436",
+            .hash = "zlua-0.1.0-hGRpC2aABQD4D9PBVH3wAW8k32-I4969MRQ0CpOwoley",
         },
-        .zap = .{
-            .url = "git+https://github.com/zigzap/zap#76679f308c702cd8880201e6e93914e1d836a54b",
-            .hash = "zap-0.10.6-GoeB8w-EJABTkxyoGH_Z8oMBYMxTBvn7YWk-DrJOHuDO",
+        .httpz = .{
+            .url = "git+https://github.com/karlseguin/http.zig#03658c279937066201aba8c0a8f1936d821d0709",
+            .hash = "httpz-0.0.0-PNVzrLjJCAD37S0CcrXpsjSqr86hVjK0rsALTDJ98AAJ",
+        },
+        .mustach = .{
+            .url = "git+https://gitlab.com/jobol/mustach.git?ref=1.2.10#6bbfd33244ad08cd5debec8af1786d9e8e29dd2e",
+            .hash = "N-V-__8AAK_9AgD53waZ9zLnY0lRqKtlidqWv6H91hQ83Yne",
         },
     },
     .paths = .{
@@ -34,5 +38,6 @@
         "scanners.zig",
         "tardefs.zig",
         "tests.zig",
+        "ultar_httpd",
     },
 }

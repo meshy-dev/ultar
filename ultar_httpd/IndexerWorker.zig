@@ -1,9 +1,3 @@
-// IndexerWorker: in-process indexer that runs in a dedicated thread.
-//
-// HTTP handlers enqueue jobs via a mutex-protected queue; the worker thread
-// picks them up, creates an xev loop, and runs the TarFileScanner +
-// WdsIndexingState logic from indexer.zig in-process.
-
 const std = @import("std");
 const xev = @import("xev");
 const indexer_mod = @import("indexer");
@@ -12,25 +6,24 @@ const WdsIndexingState = indexer_mod.WdsIndexingState;
 const Indexer = indexer_mod.Indexer;
 
 const Self = @This();
-
 const logger = std.log.scoped(.IndexerWorker);
 
-pub const JobStatus = enum {
-    queued,
-    running,
-    done,
-    @"error",
-};
+pub const JobStatus = enum { queued, running, done, @"error" };
 
+/// Heap-owned per-tar record. Lives in `jobs` from submission until the next
+/// `getStatus` purge after completion.
 pub const Job = struct {
-    abs_path: []const u8, // absolute path to tar file (owned)
-    rel_path: []const u8, // relative path for display (owned)
+    abs_path: []const u8,
+    rel_path: []const u8,
     status: JobStatus,
-    error_msg: ?[]const u8 = null, // owned, if present
-    bytes_total: u64 = 0, // total tar file size in bytes (set when transitioning to running)
+    error_msg: ?[]const u8 = null,
+    bytes_total: u64 = 0,
+    bytes_scanned: usize = 0,
+    done_event: std.Io.Event = .unset,
+    scanner: ?*Indexer = null,
+    worker: *Self,
 };
 
-/// Snapshot of a job returned to HTTP handlers (allocated on caller's arena).
 pub const JobSnapshot = struct {
     rel_path: []const u8,
     status: JobStatus,
@@ -40,105 +33,102 @@ pub const JobSnapshot = struct {
 };
 
 allocator: std.mem.Allocator,
-mutex: std.Thread.Mutex = .{},
-cond: std.Thread.Condition = .{},
-thread: ?std.Thread = null,
-running: bool = false,
+threaded: std.Io.Threaded,
+io: std.Io,
+mutex: std.Io.Mutex,
+group: std.Io.Group,
 
-// All jobs (history + active). Protected by mutex.
-jobs: std.ArrayListUnmanaged(Job) = .{},
-// Indices into `jobs` that are still queued. Protected by mutex.
-queue: std.ArrayListUnmanaged(usize) = .{},
+xev_thread: std.Thread,
+loop: xev.Loop,
+notify_async: xev.Async,
+notify_completion: xev.Completion,
 
-/// Byte offset into the tar file currently being scanned.
-/// Written atomically (.monotonic) by xev read callbacks on the worker
-/// thread (via `WdsIndexingState.progress_ptr`); read atomically
-/// (.monotonic) by HTTP handler threads in `getStatus()`.
-///
-/// Lifetime: this field lives on the module-level `indexer_worker` global
-/// in main.zig, which is never freed while any indexing or HTTP handling
-/// is in progress. `WdsIndexingState.progress_ptr` points here only for
-/// the duration of a single `processJob` call and is stack-local to the
-/// worker thread, so the pointee always outlives the pointer holder.
-current_scanned: usize = 0,
+/// All submitted jobs. Protected by `mutex`.
+jobs: std.ArrayListUnmanaged(*Job),
+/// Jobs awaiting `startJob` on the xev thread. Protected by `mutex`.
+pending: std.ArrayListUnmanaged(*Job),
+/// Completed jobs whose scanner must be freed on the xev thread. Protected by `mutex`.
+to_cleanup: std.ArrayListUnmanaged(*Job),
+active: usize,
+shutdown: bool,
 
-pub fn init(allocator: std.mem.Allocator) Self {
-    return .{ .allocator = allocator };
+/// Initialize in place. Spawns the xev thread; caller must pair with `deinit`.
+pub fn init(self: *Self, allocator: std.mem.Allocator) !void {
+    self.allocator = allocator;
+    self.mutex = .init;
+    self.group = .init;
+    self.jobs = .empty;
+    self.pending = .empty;
+    self.to_cleanup = .empty;
+    self.active = 0;
+    self.shutdown = false;
+
+    self.threaded = .init(allocator, .{});
+    errdefer self.threaded.deinit();
+    self.io = self.threaded.io();
+
+    self.loop = try xev.Loop.init(.{});
+    errdefer self.loop.deinit();
+
+    self.notify_async = try xev.Async.init();
+    errdefer self.notify_async.deinit();
+    self.notify_async.wait(&self.loop, &self.notify_completion, Self, self, onNotify);
+
+    self.xev_thread = try std.Thread.spawn(.{}, xevLoop, .{self});
 }
 
+/// Awaits in-flight submitters, joins the xev thread, frees all registered jobs.
 pub fn deinit(self: *Self) void {
-    // Signal the thread to stop
+    self.group.await(self.io) catch {};
+
     {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        self.running = false;
-        self.cond.signal();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        self.shutdown = true;
     }
+    self.notify_async.notify() catch {};
+    self.xev_thread.join();
 
-    // Join the thread
-    if (self.thread) |t| {
-        t.join();
-        self.thread = null;
-    }
+    self.notify_async.deinit();
+    self.loop.deinit();
 
-    // Free owned strings
-    for (self.jobs.items) |*job| {
+    for (self.jobs.items) |job| {
         self.allocator.free(job.abs_path);
         self.allocator.free(job.rel_path);
         if (job.error_msg) |msg| self.allocator.free(msg);
+        self.allocator.destroy(job);
     }
     self.jobs.deinit(self.allocator);
-    self.queue.deinit(self.allocator);
+    self.pending.deinit(self.allocator);
+    self.to_cleanup.deinit(self.allocator);
+
+    self.threaded.deinit();
 }
 
-pub fn start(self: *Self) !void {
-    self.running = true;
-    self.thread = try std.Thread.spawn(.{}, workerLoop, .{self});
-}
-
-/// Enqueue a tar file for indexing. Strings are duped and owned by the worker.
+/// Schedule a tar file for indexing. Path slices are copied; caller retains its own.
 pub fn enqueue(self: *Self, abs_path: []const u8, rel_path: []const u8) !void {
-    self.mutex.lock();
-    defer self.mutex.unlock();
-
-    // Check for duplicate (same abs_path not yet done/errored)
-    for (self.jobs.items) |*job| {
-        if (std.mem.eql(u8, job.abs_path, abs_path)) {
-            if (job.status == .queued or job.status == .running) {
-                return; // already queued or running
-            }
-        }
+    {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (self.shutdown) return error.Shutdown;
     }
 
     const owned_abs = try self.allocator.dupe(u8, abs_path);
+    errdefer self.allocator.free(owned_abs);
     const owned_rel = try self.allocator.dupe(u8, rel_path);
+    errdefer self.allocator.free(owned_rel);
 
-    const job_idx = self.jobs.items.len;
-    try self.jobs.append(self.allocator, .{
-        .abs_path = owned_abs,
-        .rel_path = owned_rel,
-        .status = .queued,
-    });
-    try self.queue.append(self.allocator, job_idx);
-    self.cond.signal();
+    try self.group.concurrent(self.io, runJob, .{ self, owned_abs, owned_rel });
 }
 
-/// Return a snapshot of all jobs, then purge completed ones from the list.
-/// The snapshot includes each done/error job exactly once (at its final state);
-/// the server deletes the job immediately after, handing lifecycle to the client.
+/// Snapshot all jobs into `arena`, then purge completed entries from `jobs`.
 pub fn getStatus(self: *Self, arena: std.mem.Allocator) ![]JobSnapshot {
-    self.mutex.lock();
-    defer self.mutex.unlock();
-
-    const scanned_now = @atomicLoad(usize, &self.current_scanned, .monotonic);
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
 
     var snapshots = try std.ArrayListUnmanaged(JobSnapshot).initCapacity(arena, self.jobs.items.len);
-    for (self.jobs.items) |*job| {
-        const bs: u64 = switch (job.status) {
-            .running => scanned_now,
-            .done => job.bytes_total,
-            else => 0,
-        };
+    for (self.jobs.items) |job| {
+        const bs = @atomicLoad(usize, &job.bytes_scanned, .monotonic);
         try snapshots.append(arena, .{
             .rel_path = try arena.dupe(u8, job.rel_path),
             .status = job.status,
@@ -148,160 +138,224 @@ pub fn getStatus(self: *Self, arena: std.mem.Allocator) ![]JobSnapshot {
         });
     }
 
-    // Purge completed jobs after including them in the snapshot.
-    // Reverse iteration keeps earlier indices stable during removal.
     var i: usize = self.jobs.items.len;
     while (i > 0) {
         i -= 1;
-        const job = &self.jobs.items[i];
-        if (job.status == .done or job.status == .@"error") {
-            self.allocator.free(job.abs_path);
-            self.allocator.free(job.rel_path);
-            if (job.error_msg) |msg| self.allocator.free(msg);
-            _ = self.jobs.orderedRemove(i);
-            // Fix up queue indices that pointed past the removed slot
-            for (self.queue.items) |*qi| {
-                if (qi.* > i) qi.* -= 1;
-            }
-        }
+        const job = self.jobs.items[i];
+        if (job.status != .done and job.status != .@"error") continue;
+        // Scanner is already freed on the xev thread before status transitions to .done;
+        // .@"error" paths never leave a live scanner attached.
+        self.allocator.free(job.abs_path);
+        self.allocator.free(job.rel_path);
+        if (job.error_msg) |msg| self.allocator.free(msg);
+        self.allocator.destroy(job);
+        _ = self.jobs.orderedRemove(i);
     }
 
     return snapshots.items;
 }
 
-fn workerLoop(self: *Self) void {
-    logger.info("IndexerWorker thread started", .{});
-
-    while (true) {
-        // Wait for work
-        var batch: []usize = &.{};
-        {
-            self.mutex.lock();
-            defer self.mutex.unlock();
-
-            while (self.running and self.queue.items.len == 0) {
-                self.cond.wait(&self.mutex);
-            }
-
-            if (!self.running) {
-                logger.info("IndexerWorker thread stopping", .{});
-                return;
-            }
-
-            // Drain the queue into a local batch
-            batch = self.queue.toOwnedSlice(self.allocator) catch {
-                logger.err("Failed to drain queue", .{});
-                continue;
-            };
-        }
-        defer self.allocator.free(batch);
-
-        // Process each job
-        for (batch) |job_idx| {
-            self.processJob(job_idx);
-        }
-    }
-}
-
-fn processJob(self: *Self, job_idx: usize) void {
-    // Mark as running and stat the file for total size
-    const abs_path: []const u8 = blk: {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        self.jobs.items[job_idx].status = .running;
-        break :blk self.jobs.items[job_idx].abs_path;
+/// Submitter task body. Takes ownership of `owned_abs`/`owned_rel`; blocks
+/// the submitter until the scanner signals `done_event`.
+fn runJob(self: *Self, owned_abs: []const u8, owned_rel: []const u8) void {
+    // Job is heap-allocated so `&bytes_scanned` and `&done_event` stay stable
+    // for the scanner across `jobs` ArrayList growth.
+    const job = self.allocator.create(Job) catch {
+        self.allocator.free(owned_abs);
+        self.allocator.free(owned_rel);
+        return;
+    };
+    job.* = .{
+        .abs_path = owned_abs,
+        .rel_path = owned_rel,
+        .status = .queued,
+        .worker = self,
     };
 
-    logger.info("Indexing: {s}", .{abs_path});
+    const registered = register: {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
 
-    // Stat file for total size
-    const file_size: u64 = if (std.fs.openFileAbsolute(abs_path, .{})) |f| blk: {
-        defer f.close();
-        break :blk f.getEndPos() catch 0;
+        // Dedup against any still-active job for the same path.
+        for (self.jobs.items) |existing| {
+            if (std.mem.eql(u8, existing.abs_path, owned_abs) and
+                (existing.status == .queued or existing.status == .running))
+            {
+                break :register false;
+            }
+        }
+
+        self.jobs.append(self.allocator, job) catch break :register false;
+        self.pending.append(self.allocator, job) catch {
+            _ = self.jobs.pop();
+            break :register false;
+        };
+        break :register true;
+    };
+
+    if (!registered) {
+        self.allocator.free(owned_abs);
+        self.allocator.free(owned_rel);
+        self.allocator.destroy(job);
+        return;
+    }
+
+    self.notify_async.notify() catch {};
+    job.done_event.waitUncancelable(self.io);
+}
+
+fn xevLoop(self: *Self) void {
+    self.loop.run(.until_done) catch |err| {
+        logger.err("xev loop error: {}", .{err});
+    };
+}
+
+fn onNotify(self_opt: ?*Self, l: *xev.Loop, c: *xev.Completion, r: xev.Async.WaitError!void) xev.CallbackAction {
+    _ = c;
+    _ = r catch {};
+    const self = self_opt.?;
+
+    var pending_drain: []*Job = &.{};
+    var cleanup_drain: []*Job = &.{};
+    {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (self.pending.items.len > 0) {
+            pending_drain = self.pending.toOwnedSlice(self.allocator) catch &.{};
+        }
+        if (self.to_cleanup.items.len > 0) {
+            cleanup_drain = self.to_cleanup.toOwnedSlice(self.allocator) catch &.{};
+        }
+    }
+
+    for (cleanup_drain) |job| {
+        if (job.scanner) |sc| {
+            sc.state.deinit();
+            sc.deinit(self.io);
+            self.allocator.destroy(sc);
+            job.scanner = null;
+        }
+        self.mutex.lockUncancelable(self.io);
+        if (job.status == .running) job.status = .done;
+        self.active -= 1;
+        self.mutex.unlock(self.io);
+        job.done_event.set(self.io);
+    }
+    if (cleanup_drain.len > 0) self.allocator.free(cleanup_drain);
+
+    for (pending_drain) |job| {
+        self.startJob(l, job) catch |err| self.markError(job, err);
+    }
+    if (pending_drain.len > 0) self.allocator.free(pending_drain);
+
+    var stop_loop = false;
+    {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (self.shutdown and self.active == 0 and
+            self.pending.items.len == 0 and self.to_cleanup.items.len == 0)
+        {
+            stop_loop = true;
+        }
+    }
+    if (stop_loop) {
+        l.stop();
+        return .disarm;
+    }
+    return .rearm;
+}
+
+/// Build a `WdsIndexingState` writing to `<abs_path>.utix`. On success the
+/// output file is owned by the returned state.
+fn createIndexingState(self: *Self, l: *xev.Loop, abs_path: []const u8) !WdsIndexingState {
+    const out_path_abs = try std.mem.concat(self.allocator, u8, &[_][]const u8{ abs_path, ".utix" });
+    defer self.allocator.free(out_path_abs);
+
+    const out_file = try std.Io.Dir.createFileAbsolute(self.io, out_path_abs, .{ .truncate = true });
+    errdefer out_file.close(self.io);
+
+    return try WdsIndexingState.init(self.allocator, self.io, l, out_file, .msgpack);
+}
+
+fn startJob(self: *Self, l: *xev.Loop, job: *Job) !void {
+    const abs_path = job.abs_path;
+
+    const file_size: u64 = if (std.Io.Dir.openFileAbsolute(self.io, abs_path, .{ .mode = .read_only })) |f| sz: {
+        defer f.close(self.io);
+        const st = f.stat(self.io) catch break :sz 0;
+        break :sz st.size;
     } else |_| 0;
 
     {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        self.jobs.items[job_idx].bytes_total = file_size;
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        job.bytes_total = file_size;
+        job.status = .running;
+        self.active += 1;
+    }
+    errdefer {
+        self.mutex.lockUncancelable(self.io);
+        self.active -= 1;
+        self.mutex.unlock(self.io);
     }
 
-    // Reset progress counter before scanning begins
-    @atomicStore(usize, &self.current_scanned, @as(usize, 0), .monotonic);
+    var state = try self.createIndexingState(l, abs_path);
+    var state_owned_by_scanner = false;
+    errdefer if (!state_owned_by_scanner) state.deinit();
 
-    // Build output path: abs_path ++ ".utix"
-    const out_path = std.mem.concat(self.allocator, u8, &[_][]const u8{ abs_path, ".utix" }) catch {
-        self.setJobError(job_idx, "out of memory");
-        return;
-    };
-    defer self.allocator.free(out_path);
+    const scanner = try self.allocator.create(Indexer);
+    errdefer self.allocator.destroy(scanner);
 
-    // Create output file
-    const out_file = std.fs.createFileAbsolute(out_path, .{ .truncate = true }) catch |err| {
-        const msg = std.fmt.allocPrint(self.allocator, "failed to create output: {}", .{err}) catch "create error";
-        self.setJobError(job_idx, msg);
-        return;
-    };
-    // out_file is closed by WdsIndexingState.deinit -> OStream.deinit
-
-    // Create xev loop for this job
-    var loop = xev.Loop.init(.{}) catch |err| {
-        const msg = std.fmt.allocPrint(self.allocator, "loop init failed: {}", .{err}) catch "loop error";
-        self.setJobError(job_idx, msg);
-        out_file.close();
-        return;
-    };
-    defer loop.deinit();
-
-    // Init indexing state
-    var state = WdsIndexingState.init(self.allocator, &loop, out_file, .msgpack) catch |err| {
-        const msg = std.fmt.allocPrint(self.allocator, "state init failed: {}", .{err}) catch "init error";
-        self.setJobError(job_idx, msg);
-        return;
-    };
-
-    // Point WdsIndexingState's progress_ptr at our atomic counter.
-    // Safe: current_scanned lives on the global IndexerWorker, which outlives
-    // this stack-local state. The pointer is only dereferenced inside
-    // scannedEntryCb, which runs synchronously within loop.run() below.
-    state.progress_ptr = &self.current_scanned;
-
-    // Init scanner
-    var scanner = Indexer.initFp(state, abs_path) catch |err| {
-        const msg = std.fmt.allocPrint(self.allocator, "scanner init failed: {}", .{err}) catch "scanner error";
-        self.setJobError(job_idx, msg);
-        state.deinit();
-        return;
-    };
-    scanner.enqueueRead(&loop);
-
-    // Run the event loop
-    loop.run(.until_done) catch |err| {
-        const msg = std.fmt.allocPrint(self.allocator, "loop run failed: {}", .{err}) catch "run error";
-        self.setJobError(job_idx, msg);
+    scanner.* = try Indexer.initFp(self.io, state, abs_path);
+    state_owned_by_scanner = true;
+    errdefer {
         scanner.state.deinit();
-        scanner.deinit();
-        return;
-    };
-
-    // Clean up scanner resources
-    scanner.state.deinit();
-    scanner.deinit();
-
-    // Mark as done
-    {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        self.jobs.items[job_idx].status = .done;
+        scanner.deinit(self.io);
     }
 
-    logger.info("Indexing complete: {s}", .{abs_path});
+    scanner.state.progress_ptr = &job.bytes_scanned;
+    scanner.state.done_event_ptr = &job.done_event;
+    scanner.state.done_notify_cb = onJobDone;
+    scanner.state.done_notify_ctx = job;
+
+    job.scanner = scanner;
+    scanner.enqueueRead(l);
 }
 
-fn setJobError(self: *Self, job_idx: usize, msg: []const u8) void {
-    self.mutex.lock();
-    defer self.mutex.unlock();
-    self.jobs.items[job_idx].status = .@"error";
-    // If the message was allocated by us (not a static string), store it; otherwise dupe it.
-    self.jobs.items[job_idx].error_msg = self.allocator.dupe(u8, msg) catch null;
+/// Scanner terminal callback. The scanner's read completion and any in-flight
+/// ostream chunk writes are still owned by io_uring at this point. Arm the
+/// ostream's drain hook; cleanup is deferred until every chunk write has
+/// completed (`onOstreamDrained`).
+fn onJobDone(ctx: *anyopaque) void {
+    const job: *Job = @ptrCast(@alignCast(ctx));
+    const sc = job.scanner orelse {
+        onOstreamDrained(ctx);
+        return;
+    };
+    sc.state.ostream.drain_done_cb = onOstreamDrained;
+    sc.state.ostream.drain_done_ctx = ctx;
+    if (sc.state.ostream.pending_writes == 0) onOstreamDrained(ctx);
+}
+
+/// Fired once the ostream's `pending_writes` reaches zero. Still runs inside
+/// a callback (writeCb or onJobDone), so we only enqueue the job for the
+/// xev thread to free on a later tick.
+fn onOstreamDrained(ctx: *anyopaque) void {
+    const job: *Job = @ptrCast(@alignCast(ctx));
+    const self = job.worker;
+    {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        self.to_cleanup.append(self.allocator, job) catch {};
+    }
+    self.notify_async.notify() catch {};
+}
+
+fn markError(self: *Self, job: *Job, err: anyerror) void {
+    const msg = std.fmt.allocPrint(self.allocator, "indexing failed: {}", .{err}) catch null;
+    self.mutex.lockUncancelable(self.io);
+    job.status = .@"error";
+    job.error_msg = msg;
+    self.mutex.unlock(self.io);
+    job.done_event.set(self.io);
 }

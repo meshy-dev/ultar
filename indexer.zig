@@ -11,13 +11,12 @@ const index_ext = "utix";
 
 const logger = std.log.scoped(.indexer);
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    const io = init.io;
 
     var stderr_buffer: [1024]u8 = undefined;
-    var stderr_writer = std.fs.File.stderr().writer(&stderr_buffer);
+    var stderr_writer = std.Io.File.stderr().writer(io, &stderr_buffer);
     const stderr = &stderr_writer.interface;
     defer stderr.flush() catch @panic("Error flushing stderr");
 
@@ -34,11 +33,10 @@ pub fn main() !void {
     };
 
     var diag = clap.Diagnostic{};
-    var res = clap.parse(clap.Help, &params, parsers, .{
+    var res = clap.parse(clap.Help, &params, parsers, init.minimal.args, .{
         .diagnostic = &diag,
         .allocator = allocator,
     }) catch |err| {
-        // Report useful error and exit.
         diag.report(stderr, err) catch {};
         return err;
     };
@@ -53,7 +51,7 @@ pub fn main() !void {
         for (indexers) |*t| {
             if (t.fs_file != null) {
                 t.state.deinit();
-                t.deinit();
+                t.deinit(io);
             }
         }
         allocator.free(indexers);
@@ -71,12 +69,12 @@ pub fn main() !void {
         const indexer = &indexers[i];
         const out_fp = try std.mem.join(allocator, ".", &[_][]const u8{ fp, index_ext });
         defer allocator.free(out_fp);
-        const out_file = std.fs.cwd().createFile(out_fp, .{ .truncate = true }) catch |err| {
+        const out_file = std.Io.Dir.cwd().createFile(io, out_fp, .{ .truncate = true }) catch |err| {
             logger.err("Error opening output file {s}: {}", .{ out_fp, err });
             return err;
         };
-        const state = try WdsIndexingState.init(allocator, &loop, out_file, fmt);
-        indexer.* = try Indexer.initFp(state, fp);
+        const state = try WdsIndexingState.init(allocator, io, &loop, out_file, fmt);
+        indexer.* = try Indexer.initFp(io, state, fp);
         indexer.enqueueRead(&loop);
     }
 
@@ -90,7 +88,11 @@ pub const IndexMetadataError = error{
     TooManyColumns,
 };
 
-pub const Indexer = scanners.TarFileScanner(WdsIndexingState, WdsIndexingState.scannedEntryCb, WdsIndexingState.errorCb);
+pub const Indexer = scanners.TarFileScanner(WdsIndexingState, .{
+    .entry_cb = WdsIndexingState.scannedEntryCb,
+    .error_cb = WdsIndexingState.errorCb,
+    .done_cb = WdsIndexingState.doneCb,
+});
 
 pub const WdsIndexingState = struct {
     const Self = @This();
@@ -120,6 +122,7 @@ pub const WdsIndexingState = struct {
     };
 
     gpa: std.mem.Allocator,
+    io: std.Io,
     rows: usize = 0,
 
     ostream: OStream,
@@ -130,35 +133,35 @@ pub const WdsIndexingState = struct {
 
     fmt: SerializationFormat,
 
-    /// Optional pointer to a `usize` that receives the current byte offset
-    /// into the tar file as scanning progresses. Written with `@atomicStore`
-    /// (.monotonic) from the xev callback on the worker thread; read with
-    /// `@atomicLoad` (.monotonic) from HTTP threads (via `IndexerWorker.getStatus`).
-    ///
-    /// Lifetime: the pointee (`IndexerWorker.current_scanned`) is a field on
-    /// the long-lived global `IndexerWorker` and therefore outlives every
-    /// `WdsIndexingState` instance, which is stack-local to `processJob`.
-    /// The pointer is only dereferenced inside `scannedEntryCb`, which runs
-    /// synchronously within `loop.run()` on the worker thread -- never after
-    /// the `WdsIndexingState` is deinited. Safe to leave `null` (standalone
-    /// indexer binary) -- the store is simply skipped.
+    /// Atomic monotonic tar-input byte offset; null disables reporting.
     progress_ptr: ?*usize = null,
+
+    /// Set once by `doneCb`; null disables completion signaling.
+    done_event_ptr: ?*std.Io.Event = null,
+
+    /// Fired by `doneCb` before `done_event_ptr` is set.
+    done_notify_cb: ?*const fn (ctx: *anyopaque) void = null,
+    done_notify_ctx: ?*anyopaque = null,
+
+    /// Guards `finalize` against re-entry.
+    finalized: bool = false,
 
     row_buf: std.ArrayListUnmanaged(Entry),
     row_arena: std.heap.ArenaAllocator,
 
-    pub fn init(alloc: std.mem.Allocator, loop: *xev.Loop, output_file: std.fs.File, fmt: SerializationFormat) !Self {
+    pub fn init(alloc: std.mem.Allocator, io: std.Io, loop: *xev.Loop, output_file: std.Io.File, fmt: SerializationFormat) !Self {
         return .{
             .gpa = alloc,
+            .io = io,
             .ostream = try OStream.init(loop, output_file),
             .row_buf = try std.ArrayListUnmanaged(Entry).initCapacity(alloc, 256),
             .row_arena = std.heap.ArenaAllocator.init(alloc),
-            .fmt = fmt, // Don't init the serializer (they need &ostream)
+            .fmt = fmt, // Serializer constructed per-write; it borrows &ostream.
         };
     }
 
     pub fn deinit(self: *Self) void {
-        self.ostream.deinit();
+        self.ostream.deinit(self.io);
         self.row_buf.deinit(self.gpa);
         self.row_arena.deinit();
     }
@@ -224,7 +227,6 @@ pub const WdsIndexingState = struct {
             return IndexMetadataError.TooManyRows;
         }
 
-        // Write the previous row
         switch (self.fmt) {
             .msgpack => try self.writeRowMsgPack(),
             .jsonl => try self.writeRowJsonl(),
@@ -247,7 +249,6 @@ pub const WdsIndexingState = struct {
         if (self.current_row_str_idx == null or !std.mem.eql(u8, row_str_idx, self.current_row_str_idx.?)) {
             try self.writeRow();
 
-            // Record new row key & start the row
             std.mem.copyForwards(u8, &self.current_row_str_idx_buf, row_str_idx);
             self.current_row_str_idx = self.current_row_str_idx_buf[0..row_str_idx.len];
             self.row_buf.clearRetainingCapacity();
@@ -255,7 +256,6 @@ pub const WdsIndexingState = struct {
             self.current_row_base = offset;
         }
 
-        // Add entry to row_buf
         const offset_from_base = offset - self.current_row_base;
         if (offset_from_base > std.math.maxInt(std.meta.fieldInfo(Entry, .offset_from_base).type)) {
             return IndexMetadataError.RowTooLarge;
@@ -271,12 +271,21 @@ pub const WdsIndexingState = struct {
     }
 
     pub fn finalize(self: *Self) void {
+        if (self.finalized) return;
+        self.finalized = true;
         self.writeRow() catch |err| {
             logger.err("Error writing final row: {}", .{err});
         };
         self.ostream.interface.flush() catch |err| {
             logger.err("Error while flushing output file: {}", .{err});
         };
+    }
+
+    /// Scanner terminal hook; idempotent.
+    pub fn doneCb(state: *Self) void {
+        state.finalize();
+        if (state.done_notify_cb) |cb| if (state.done_notify_ctx) |ctx| cb(ctx);
+        if (state.done_event_ptr) |ev| ev.set(state.io);
     }
 
     pub fn scannedEntryCb(
@@ -292,7 +301,7 @@ pub const WdsIndexingState = struct {
             if (prefix_len > 0) {
                 std.mem.copyForwards(u8, &buf, h.prefix[0..prefix_len]);
                 buf[prefix_len] = std.fs.path.sep;
-                prefix_len += 1; // Add a separator
+                prefix_len += 1;
             }
             const header_name_len = std.mem.indexOfScalar(u8, &h.name, 0) orelse h.name.len;
             if (header_name_len > 0)

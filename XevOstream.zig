@@ -23,11 +23,19 @@ free_chunks: List = .{},
 
 arena: std.heap.ArenaAllocator,
 loop: *xev.Loop,
-file: std.fs.File,
+file: std.Io.File,
 xfile: xev.File,
 interface: std.Io.Writer,
 
-pub fn init(loop: *xev.Loop, output_file: std.fs.File) !Self {
+/// Count of submitted chunk writes that haven't yet hit `writeCb`. Reading is
+/// only safe from the owning xev thread.
+pending_writes: usize = 0,
+/// Fired by `writeCb` the moment `pending_writes` reaches zero. Set by the
+/// owner once they need to be told all outstanding writes have drained.
+drain_done_cb: ?*const fn (ctx: *anyopaque) void = null,
+drain_done_ctx: ?*anyopaque = null,
+
+pub fn init(loop: *xev.Loop, output_file: std.Io.File) !Self {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     const first_chunk = try arena.allocator().create(Chunk);
     return .{
@@ -43,11 +51,11 @@ pub fn init(loop: *xev.Loop, output_file: std.fs.File) !Self {
     };
 }
 
-pub fn deinit(self: *Self) void {
+pub fn deinit(self: *Self, io: std.Io) void {
     self.curr_chunk = null;
     self.free_chunks = .{};
     self.arena.deinit();
-    self.file.close();
+    self.file.close(io);
 }
 
 pub fn getOrAllocChunk(self: *Self) !*Chunk {
@@ -69,12 +77,15 @@ fn writeCb(
 ) xev.CallbackAction {
     const self = ud orelse unreachable;
 
-    // The completion is a member of Chunk
     const chunk: *Chunk = @fieldParentPtr("c", c);
 
     logger.debug("writeCb: {} bytes written from {}", .{ r catch 0, &b.slice[0] });
 
     self.free_chunks.prepend(&chunk.node);
+    self.pending_writes -= 1;
+    if (self.pending_writes == 0) {
+        if (self.drain_done_cb) |cb| if (self.drain_done_ctx) |ctx| cb(ctx);
+    }
 
     return .disarm;
 }
@@ -100,7 +111,7 @@ fn writeCb(
 //     }
 // }
 
-fn drain(io_w: *std.Io.Writer, data: []const []const u8, splat: usize) std.io.Writer.Error!usize {
+fn drain(io_w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
     _ = splat;
     _ = data;
     var self: *Self = @fieldParentPtr("interface", io_w);
@@ -117,6 +128,7 @@ fn drain(io_w: *std.Io.Writer, data: []const []const u8, splat: usize) std.io.Wr
 pub fn flush(self: *Self) !void {
     if (self.curr_chunk) |chunk| {
         const slice = chunk.buf[0..self.interface.end];
+        self.pending_writes += 1;
         self.xfile.write(self.loop, &chunk.c, .{ .slice = slice }, Self, self, writeCb);
 
         self.curr_chunk = try self.getOrAllocChunk();

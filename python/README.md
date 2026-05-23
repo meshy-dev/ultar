@@ -12,7 +12,7 @@ pip install ultar-dataloader
 
 ### Building from source
 
-Requires Zig 0.15+.
+Requires Zig 0.16+.
 
 ```bash
 # Build native extension
@@ -44,7 +44,7 @@ return {
             max_rows = tonumber(config.max_rows) or -1,
         }
     end,
-    
+
     row_generator = function(ctx)
         local tar = loader:open_file(ctx.tar_path)
         local idx = utix.open(ctx.idx_path)

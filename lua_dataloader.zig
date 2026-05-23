@@ -7,6 +7,38 @@ const LoaderCtx = dataloader.LoaderCtx;
 
 const logger = std.log.scoped(.lua_dataloader);
 
+const LuaAllocDiag = struct {
+    var inner: std.mem.Allocator = undefined;
+    var count: u32 = 0;
+    const vtable: std.mem.Allocator.VTable = .{
+        .alloc = allocFn,
+        .resize = resizeFn,
+        .remap = remapFn,
+        .free = freeFn,
+    };
+    fn allocFn(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        _ = ctx;
+        const p = inner.rawAlloc(len, alignment, ret_addr);
+        if (count < 8) {
+            logger.info("lua alloc len={d} -> 0x{x}", .{ len, if (p) |q| @intFromPtr(q) else 0 });
+            count += 1;
+        }
+        return p;
+    }
+    fn resizeFn(ctx: *anyopaque, buf: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        _ = ctx;
+        return inner.rawResize(buf, alignment, new_len, ret_addr);
+    }
+    fn remapFn(ctx: *anyopaque, buf: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        _ = ctx;
+        return inner.rawRemap(buf, alignment, new_len, ret_addr);
+    }
+    fn freeFn(ctx: *anyopaque, buf: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        _ = ctx;
+        inner.rawFree(buf, alignment, ret_addr);
+    }
+};
+
 pub const LuaLoaderSpec = extern struct {
     src: [*c]const u8,
     shard_list: [*c]const [*c]const u8,
@@ -529,11 +561,7 @@ pub const LuaDataLoader = struct {
     }
 
     pub fn init(spec: LuaLoaderSpec, alloc: std.mem.Allocator) !*Self {
-        logger.info("LuaDataLoader.init: allocating Self ({d} bytes)", .{@sizeOf(Self)});
-        var self = alloc.create(Self) catch |err| {
-            logger.err("alloc.create(Self) failed: {}", .{err});
-            return err;
-        };
+        var self = try alloc.create(Self);
         errdefer alloc.destroy(self);
 
         // No `std.process.Init` at the Python extension entry point; own the Io ourselves.
@@ -574,25 +602,22 @@ pub const LuaDataLoader = struct {
             self.in_progress_row = null;
         }
 
-        logger.info("LuaDataLoader.init: initializing loader (LoaderCtx in place)", .{});
-        self.loader.initInPlace(alloc) catch |err| {
-            logger.err("loader.initInPlace failed: {}", .{err});
-            return err;
-        };
+        try self.loader.initInPlace(alloc);
         errdefer self.loader.deinit();
-        logger.info("LuaDataLoader.init: starting loader", .{});
-        self.loader.start(self.io) catch |err| {
-            logger.err("loader.start failed: {}", .{err});
-            return err;
-        };
+        try self.loader.start(self.io);
 
-        logger.info("LuaDataLoader.init: creating Lua state", .{});
-        self.lua = Lua.init(alloc) catch |err| {
-            logger.err("Lua.init failed: {}", .{err});
-            return err;
+        // Diagnostic wrapper: log the first few Lua allocation addresses so
+        // we can see if they fit LuaJIT-GC64's 47-bit pointer requirement.
+        // The inner allocator is captured by-value into a process-global so
+        // the vtable function pointers stay valid for the lifetime of the
+        // Lua state.
+        LuaAllocDiag.inner = alloc;
+        const diag_alloc: std.mem.Allocator = .{
+            .ptr = &LuaAllocDiag.inner,
+            .vtable = &LuaAllocDiag.vtable,
         };
+        self.lua = try Lua.init(diag_alloc);
         errdefer self.lua.deinit();
-        logger.info("LuaDataLoader.init: running user spec", .{});
         try self.initLua(spec);
 
         return self;
@@ -634,10 +659,6 @@ pub const LuaLoaderCCtx = struct {
 
 fn createLuaLoader(spec: LuaLoaderSpec) !*LuaLoaderCCtx {
     logger.info("Creating lua loader with spec: {}", .{spec});
-    logger.info("sizeof(LuaDataLoader)={d} sizeof(LuaLoaderCCtx)={d}", .{
-        @sizeOf(LuaDataLoader),
-        @sizeOf(LuaLoaderCCtx),
-    });
     const c = try std.heap.c_allocator.create(LuaLoaderCCtx);
     errdefer std.heap.c_allocator.destroy(c);
 

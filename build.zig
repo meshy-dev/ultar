@@ -1,12 +1,15 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const httpd_build = @import("ultar_httpd/build.zig");
 
 pub fn build(b: *std.Build) void {
-    // Pin glibc to 2.39 to force Zig's bundled crt; host crt1.o on glibc >=2.40
-    // emits `.sframe` with R_X86_64_PC64 relocs that Zig 0.16's lld rejects.
-    const target = b.standardTargetOptions(.{
-        .default_target = .{ .abi = .gnu, .os_tag = .linux, .glibc_version = .{ .major = 2, .minor = 39, .patch = 0 } },
-    });
+    // On glibc-based Linux hosts, pin glibc to 2.34 to force Zig's bundled crt.
+    // macOS and non-glibc Linux (musl, etc.) use the host's native defaults.
+    const default_target: std.Target.Query = if (builtin.os.tag == .linux and builtin.abi.isGnu())
+        .{ .abi = .gnu, .os_tag = .linux, .glibc_version = .{ .major = 2, .minor = 34, .patch = 0 } }
+    else
+        .{};
+    const target = b.standardTargetOptions(.{ .default_target = default_target });
     const optimize = b.standardOptimizeOption(.{});
 
     const engine = b.option([]const u8, "lua", "Use specified lua engine (default to luajit). Available: luajit, luau, lua54") orelse "luajit";
@@ -95,12 +98,13 @@ pub fn build(b: *std.Build) void {
     const python_step = b.step("python-bindings", "Build Python ABI3 extension module");
     const python_lib = buildPythonBindingsStep(b, target, optimize, lua_dataloader_mod, python_exe);
 
-    // Stage the built artifact into the Python source tree under its
-    // platform-specific extension (.so / .dylib / .pyd).
+    // Stage the built artifact into the Python source tree. Python's import
+    // system on macOS recognizes .so (not .dylib), so rewrite .dylib to .so.
     const copy_native = b.addSystemCommand(&.{
         "sh", "-c",
         \\for f in zig-out/lib/*_native.abi3.*; do
         \\  ext="${f##*.}"
+        \\  case "$ext" in dylib) ext=so ;; esac
         \\  cp -f "$f" "python/src/ultar_dataloader/_native.abi3.$ext"
         \\done
         ,

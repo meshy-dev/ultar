@@ -61,18 +61,20 @@ pub const lj_low_page_allocator: std.mem.Allocator = .{
 
 fn ljLowAlloc(_: *anyopaque, n: usize, alignment: std.mem.Alignment, _: usize) ?[*]u8 {
     const page_size = std.heap.pageSize();
-    const len = std.mem.alignForward(usize, @max(n, page_size), page_size);
-    // Page-aligned mmap satisfies any reasonable alignment LuaJIT will ask for.
-    if (alignment.toByteUnits() > page_size) return null;
+    // DebugAllocator asks for page_size (≥128 KB) alignment for its slab
+    // pages, so honor whatever the caller wants — and round len up to the
+    // same boundary so mmap returns a chunk we can hand back as a slot.
+    const align_bytes = @max(alignment.toByteUnits(), page_size);
+    const align_mask = ~(align_bytes - 1);
+    const len = std.mem.alignForward(usize, @max(n, page_size), align_bytes);
 
     // Strategy mirrors lj_alloc.c's mmap_probe: pick a hint inside the low
     // 47-bit window, MAP_FIXED_NOREPLACE so the kernel either honors the hint
     // exactly or fails (vs plain mmap which silently relocates to wherever).
     // Seed with last successful tail so contiguous allocations cluster.
-    var hint = lj_hint_addr.load(.monotonic);
+    var hint = lj_hint_addr.load(.monotonic) & align_mask;
     if (hint == 0 or !ljFits47(hint, len)) {
-        hint = ljNextRandom() & ((@as(usize, 1) << lj_mbits) - page_size);
-        if (hint < lj_probe_lower) hint = lj_probe_lower;
+        hint = pickRandomHint(align_mask, len);
     }
 
     var retry: u32 = 0;
@@ -100,25 +102,31 @@ fn ljLowAlloc(_: *anyopaque, n: usize, alignment: std.mem.Alignment, _: usize) ?
             else => return null,
         }
 
-        // Pick the next hint. Linear probe at 16 MB stride for a few rounds
-        // (cheap if the window has free space nearby), then random anywhere
-        // in the low 47-bit space.
+        // Pick the next hint. Linear probe forward in `len`-sized strides for
+        // a few rounds (cheap if the window has free space nearby), then
+        // random anywhere in the low 47-bit space.
         if (retry < lj_probe_linear) {
-            hint +%= 0x1000000;
-            if (!ljFits47(hint, len)) hint = lj_probe_lower;
+            hint +%= @max(len, 0x1000000);
+            hint &= align_mask;
+            if (!ljFits47(hint, len)) hint = pickRandomHint(align_mask, len);
         } else {
-            while (true) {
-                hint = ljNextRandom() & ((@as(usize, 1) << lj_mbits) - page_size);
-                if (hint >= lj_probe_lower and ljFits47(hint, len)) break;
-            }
+            hint = pickRandomHint(align_mask, len);
         }
     }
     return null;
 }
 
-fn ljLowFree(_: *anyopaque, memory: []u8, _: std.mem.Alignment, _: usize) void {
+fn pickRandomHint(align_mask: usize, len: usize) usize {
+    while (true) {
+        const candidate = ljNextRandom() & ((@as(usize, 1) << lj_mbits) - 1) & align_mask;
+        if (candidate >= lj_probe_lower and ljFits47(candidate, len)) return candidate;
+    }
+}
+
+fn ljLowFree(_: *anyopaque, memory: []u8, alignment: std.mem.Alignment, _: usize) void {
     const page_size = std.heap.pageSize();
-    const len = std.mem.alignForward(usize, memory.len, page_size);
+    const align_bytes = @max(alignment.toByteUnits(), page_size);
+    const len = std.mem.alignForward(usize, @max(memory.len, page_size), align_bytes);
     std.posix.munmap(@alignCast(memory.ptr[0..len]));
 }
 

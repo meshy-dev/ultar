@@ -529,7 +529,11 @@ pub const LuaDataLoader = struct {
     }
 
     pub fn init(spec: LuaLoaderSpec, alloc: std.mem.Allocator) !*Self {
-        var self = try alloc.create(Self);
+        logger.info("LuaDataLoader.init: allocating Self ({d} bytes)", .{@sizeOf(Self)});
+        var self = alloc.create(Self) catch |err| {
+            logger.err("alloc.create(Self) failed: {}", .{err});
+            return err;
+        };
         errdefer alloc.destroy(self);
 
         // No `std.process.Init` at the Python extension entry point; own the Io ourselves.
@@ -570,12 +574,25 @@ pub const LuaDataLoader = struct {
             self.in_progress_row = null;
         }
 
-        try self.loader.initInPlace(alloc);
+        logger.info("LuaDataLoader.init: initializing loader (LoaderCtx in place)", .{});
+        self.loader.initInPlace(alloc) catch |err| {
+            logger.err("loader.initInPlace failed: {}", .{err});
+            return err;
+        };
         errdefer self.loader.deinit();
-        try self.loader.start(self.io);
+        logger.info("LuaDataLoader.init: starting loader", .{});
+        self.loader.start(self.io) catch |err| {
+            logger.err("loader.start failed: {}", .{err});
+            return err;
+        };
 
-        self.lua = try Lua.init(alloc);
+        logger.info("LuaDataLoader.init: creating Lua state", .{});
+        self.lua = Lua.init(alloc) catch |err| {
+            logger.err("Lua.init failed: {}", .{err});
+            return err;
+        };
         errdefer self.lua.deinit();
+        logger.info("LuaDataLoader.init: running user spec", .{});
         try self.initLua(spec);
 
         return self;
@@ -617,6 +634,10 @@ pub const LuaLoaderCCtx = struct {
 
 fn createLuaLoader(spec: LuaLoaderSpec) !*LuaLoaderCCtx {
     logger.info("Creating lua loader with spec: {}", .{spec});
+    logger.info("sizeof(LuaDataLoader)={d} sizeof(LuaLoaderCCtx)={d}", .{
+        @sizeOf(LuaDataLoader),
+        @sizeOf(LuaLoaderCCtx),
+    });
     const c = try std.heap.c_allocator.create(LuaLoaderCCtx);
     errdefer std.heap.c_allocator.destroy(c);
 

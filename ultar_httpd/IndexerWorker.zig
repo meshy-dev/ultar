@@ -8,6 +8,11 @@ const Indexer = indexer_mod.Indexer;
 const Self = @This();
 const logger = std.log.scoped(.IndexerWorker);
 
+// kqueue (macOS) dispatches regular-file I/O to a thread pool; without one
+// every read returns EPERM. io_uring (Linux) handles file I/O in-kernel.
+const needs_thread_pool = @import("builtin").os.tag != .linux;
+const ThreadPoolStorage = if (needs_thread_pool) xev.ThreadPool else void;
+
 pub const JobStatus = enum { queued, running, done, @"error" };
 
 /// Heap-owned per-tar record. Lives in `jobs` from submission until the next
@@ -39,6 +44,7 @@ mutex: std.Io.Mutex,
 group: std.Io.Group,
 
 xev_thread: std.Thread,
+thread_pool: ThreadPoolStorage,
 loop: xev.Loop,
 notify_async: xev.Async,
 notify_completion: xev.Completion,
@@ -67,7 +73,19 @@ pub fn init(self: *Self, allocator: std.mem.Allocator) !void {
     errdefer self.threaded.deinit();
     self.io = self.threaded.io();
 
-    self.loop = try xev.Loop.init(.{});
+    if (needs_thread_pool) {
+        self.thread_pool = .init(.{});
+    } else {
+        self.thread_pool = {};
+    }
+    errdefer if (needs_thread_pool) {
+        self.thread_pool.shutdown();
+        self.thread_pool.deinit();
+    };
+
+    self.loop = try xev.Loop.init(.{
+        .thread_pool = if (needs_thread_pool) &self.thread_pool else null,
+    });
     errdefer self.loop.deinit();
 
     self.notify_async = try xev.Async.init();
@@ -91,6 +109,10 @@ pub fn deinit(self: *Self) void {
 
     self.notify_async.deinit();
     self.loop.deinit();
+    if (needs_thread_pool) {
+        self.thread_pool.shutdown();
+        self.thread_pool.deinit();
+    }
 
     for (self.jobs.items) |job| {
         self.allocator.free(job.abs_path);

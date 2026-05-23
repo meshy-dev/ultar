@@ -29,7 +29,8 @@ pub fn init(self: *TemplateCache, allocator: std.mem.Allocator) !void {
     self.watcher.start(templates_path) catch return;
 
     var t = try std.Thread.spawn(.{}, TemplateCache.watchLoop, .{self});
-    try t.setName(self.io, "tmpl.watch");
+    // macOS only lets a thread rename itself; tolerate the failure.
+    t.setName(self.io, "tmpl.watch") catch {};
 }
 
 pub fn deinit(self: *TemplateCache) void {

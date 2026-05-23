@@ -62,7 +62,20 @@ pub fn main(init: std.process.Init) !void {
         return clap.help(stderr, clap.Help, &params, .{});
     }) else .msgpack;
 
-    var loop = try xev.Loop.init(.{});
+    // kqueue (macOS) needs a thread pool to service regular-file I/O,
+    // otherwise every read returns EPERM. io_uring on Linux handles file
+    // I/O in-kernel, so skip the pool there to avoid idle worker threads.
+    const needs_thread_pool = @import("builtin").os.tag != .linux;
+    var thread_pool: if (needs_thread_pool) xev.ThreadPool else void =
+        if (needs_thread_pool) .init(.{}) else {};
+    defer if (needs_thread_pool) {
+        thread_pool.shutdown();
+        thread_pool.deinit();
+    };
+
+    var loop = try xev.Loop.init(.{
+        .thread_pool = if (needs_thread_pool) &thread_pool else null,
+    });
     defer loop.deinit();
 
     for (res.args.file, 0..) |fp, i| {

@@ -5,6 +5,12 @@ const concurrent_ring = @import("concurrent_ring.zig");
 const logger = std.log.scoped(.dataloader);
 const wlog = std.log.scoped(.dataloader_io_thread);
 
+// kqueue (macOS) dispatches regular-file I/O to a thread pool; without one
+// every read returns EPERM. io_uring (Linux) handles file I/O in-kernel,
+// so we skip the pool there to avoid idle worker threads.
+const needs_thread_pool = @import("builtin").os.tag != .linux;
+const ThreadPoolStorage = if (needs_thread_pool) xev.ThreadPool else void;
+
 pub const FileHandle = packed struct {
     idx: u20,
     generation: u20,
@@ -84,6 +90,10 @@ pub const LoaderCtx = struct {
     file_slots_generation: [max_file_slots]u32 = std.mem.zeroes([max_file_slots]u32),
     file_slots_checksum: [max_file_slots]u8 = undefined,
 
+    // Owned thread pool for libxev's kqueue backend (macOS): regular-file
+    // I/O is dispatched here, otherwise reads fail EPERM. io_uring (Linux)
+    // does file I/O in-kernel and doesn't need it, so this is `void` there.
+    thread_pool: ThreadPoolStorage = if (needs_thread_pool) undefined else {},
     loop: xev.Loop,
     worker_thread: ?std.Thread = null,
     worker_done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -384,12 +394,25 @@ pub const LoaderCtx = struct {
         self.io = undefined;
         self.request_ring = ReqRing.init();
         self.result_ring = ResultRing.init();
-        self.file_slots = @splat(null);
+        // These arrays are several MB each; assigning a literal RHS (e.g.
+        // `@splat(0)` / `std.mem.zeroes(...)`) materializes the value on the
+        // stack first, which blows the 8 MB stack on macOS at Python call
+        // depth. Zero / set in place instead.
+        @memset(&self.file_slots, null);
         self.xfile_slots = undefined;
-        self.file_refcount = @splat(0);
-        self.file_slots_generation = std.mem.zeroes([max_file_slots]u32);
+        @memset(&self.file_refcount, 0);
+        @memset(&self.file_slots_generation, 0);
         self.file_slots_checksum = undefined;
-        self.loop = try xev.Loop.init(.{});
+        if (needs_thread_pool) {
+            self.thread_pool = .init(.{});
+        }
+        errdefer if (needs_thread_pool) {
+            self.thread_pool.shutdown();
+            self.thread_pool.deinit();
+        };
+        self.loop = try xev.Loop.init(.{
+            .thread_pool = if (needs_thread_pool) &self.thread_pool else null,
+        });
         errdefer self.loop.deinit();
         self.worker_thread = null;
         self.worker_done = std.atomic.Value(bool).init(false);
@@ -408,6 +431,10 @@ pub const LoaderCtx = struct {
             self.join();
         }
         self.loop.deinit();
+        if (needs_thread_pool) {
+            self.thread_pool.shutdown();
+            self.thread_pool.deinit();
+        }
         self.req_mem_pool.deinit(self.alloc);
     }
 };

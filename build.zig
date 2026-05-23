@@ -3,8 +3,15 @@ const builtin = @import("builtin");
 const httpd_build = @import("ultar_httpd/build.zig");
 
 pub fn build(b: *std.Build) void {
-    // On glibc-based Linux hosts, pin glibc to 2.34 to force Zig's bundled crt.
-    // macOS and non-glibc Linux (musl, etc.) use the host's native defaults.
+    // Default for local builds on glibc Linux: pin glibc 2.34 to force Zig's
+    // bundled crt (host crt1.o on glibc >=2.40 emits .sframe sections with
+    // R_X86_64_PC64 relocs that Zig 0.16's lld rejects). macOS and musl Linux
+    // use native defaults.
+    //
+    // Honors `-Dtarget=...` from CI/users — when an override is provided, the
+    // default below is discarded entirely (see std.Build.standardTargetOptions),
+    // so callers like the manylinux wheel job that need a specific glibc ABI
+    // must pass `-Dtarget=<arch>-linux-gnu.<minor>` explicitly.
     const default_target: std.Target.Query = if (builtin.os.tag == .linux and builtin.abi.isGnu())
         .{ .abi = .gnu, .os_tag = .linux, .glibc_version = .{ .major = 2, .minor = 34, .patch = 0 } }
     else

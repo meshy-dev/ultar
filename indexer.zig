@@ -47,6 +47,13 @@ pub fn main(init: std.process.Init) !void {
 
     const num_tarfiles = res.args.file.len;
     var indexers = try allocator.alloc(Indexer, num_tarfiles);
+    // `allocator.alloc` returns uninitialized memory (0xaa poison under the
+    // debug allocator on Linux, whatever c_allocator hands back elsewhere).
+    // Zero the slice up front so the cleanup defer below can treat
+    // `fs_file == null` as the real init flag: a zero-init Indexer has a null
+    // optional file and empty arena lists, both of which the partial-cleanup
+    // path handles correctly without touching uninitialized fields.
+    @memset(std.mem.sliceAsBytes(indexers), 0);
     defer {
         for (indexers) |*t| {
             if (t.fs_file != null) {

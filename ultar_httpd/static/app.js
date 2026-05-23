@@ -21,7 +21,7 @@ setInterval(function() {
 }, 4000);
 
 /* ── Content type detection ─────────────────────────────────── */
-var _imgExts = {jpg:1,jpeg:1,png:1,gif:1,webp:1,bmp:1,svg:1};
+var _imgExts = {jpg:1,jpeg:1,png:1,gif:1,webp:1,bmp:1,svg:1,jxl:1};
 var _vidExts = {mp4:1,webm:1,mov:1,avi:1};
 var _audExts = {mp3:1,wav:1,ogg:1,flac:1};
 var _txtExts = {txt:1,csv:1,log:1,xml:1,yaml:1,yml:1,md:1};

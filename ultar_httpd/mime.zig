@@ -23,6 +23,7 @@ pub fn forFileExt(ext: []const u8) []const u8 {
     if (std.ascii.eqlIgnoreCase(e, "png")) return "image/png";
     if (std.ascii.eqlIgnoreCase(e, "gif")) return "image/gif";
     if (std.ascii.eqlIgnoreCase(e, "webp")) return "image/webp";
+    if (std.ascii.eqlIgnoreCase(e, "jxl")) return "image/jxl";
     if (std.ascii.eqlIgnoreCase(e, "bmp")) return "image/bmp";
     if (std.ascii.eqlIgnoreCase(e, "svg")) return "image/svg+xml";
 

@@ -7,37 +7,114 @@ const LoaderCtx = dataloader.LoaderCtx;
 
 const logger = std.log.scoped(.lua_dataloader);
 
-const LuaAllocDiag = struct {
-    var inner: std.mem.Allocator = undefined;
-    var count: u32 = 0;
-    const vtable: std.mem.Allocator.VTable = .{
-        .alloc = allocFn,
-        .resize = resizeFn,
-        .remap = remapFn,
-        .free = freeFn,
-    };
-    fn allocFn(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
-        _ = ctx;
-        const p = inner.rawAlloc(len, alignment, ret_addr);
-        if (count < 8) {
-            logger.info("lua alloc len={d} -> 0x{x}", .{ len, if (p) |q| @intFromPtr(q) else 0 });
-            count += 1;
-        }
-        return p;
-    }
-    fn resizeFn(ctx: *anyopaque, buf: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
-        _ = ctx;
-        return inner.rawResize(buf, alignment, new_len, ret_addr);
-    }
-    fn remapFn(ctx: *anyopaque, buf: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
-        _ = ctx;
-        return inner.rawRemap(buf, alignment, new_len, ret_addr);
-    }
-    fn freeFn(ctx: *anyopaque, buf: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
-        _ = ctx;
-        inner.rawFree(buf, alignment, ret_addr);
-    }
+// ---------------------------------------------------------------------------
+// LuaJIT-GC64 47-bit pointer constraint
+//
+// LuaJIT in GC64 mode packs GC pointers into 47-bit fields and rejects any
+// allocation whose address has bit 47 (or higher) set — `lua_newstate` frees
+// the GG_State and returns NULL, which surfaces as `error.OutOfMemory`. On
+// Linux/aarch64 with 48-bit virtual addressing, the kernel routinely hands
+// userspace mappings above 0x0000_8000_0000_0000, so `smp_allocator` triggers
+// this rejection. LuaJIT works around it in `lj_alloc.c` by probing mmap
+// with hint addresses; we reproduce that probing as a Zig page-level
+// allocator and compose a `DebugAllocator` on top of it for the per-state
+// general-purpose layer.
+// ---------------------------------------------------------------------------
+
+const lj_mbits: u6 = 47; // GC64 packs pointers into 47 bits.
+const lj_probe_max: u32 = 30;
+const lj_probe_linear: u32 = 5;
+const lj_probe_lower: usize = 0x4000;
+
+var lj_hint_addr: std.atomic.Value(usize) = .init(0);
+var lj_prng_state: std.atomic.Value(u64) = .init(0x9E3779B97F4A7C15);
+
+fn ljNextRandom() u64 {
+    // SplitMix64; doesn't need to be high-quality, just spread enough across
+    // the low 47 bits to escape unmappable regions after linear probing fails.
+    var x = lj_prng_state.fetchAdd(0x9E3779B97F4A7C15, .monotonic);
+    x = (x ^ (x >> 30)) *% 0xBF58476D1CE4E5B9;
+    x = (x ^ (x >> 27)) *% 0x94D049BB133111EB;
+    return x ^ (x >> 31);
+}
+
+fn ljFits47(addr: usize, size: usize) bool {
+    return (addr >> lj_mbits) == 0 and ((addr + size) >> lj_mbits) == 0;
+}
+
+const lj_low_page_vtable: std.mem.Allocator.VTable = .{
+    .alloc = ljLowAlloc,
+    .resize = std.mem.Allocator.noResize,
+    .remap = std.mem.Allocator.noRemap,
+    .free = ljLowFree,
 };
+
+/// Page-level allocator that mmaps memory guaranteed to fit in 47 bits.
+/// Backs the per-state `DebugAllocator` we hand to LuaJIT.
+pub const lj_low_page_allocator: std.mem.Allocator = .{
+    .ptr = undefined,
+    .vtable = &lj_low_page_vtable,
+};
+
+fn ljLowAlloc(_: *anyopaque, n: usize, alignment: std.mem.Alignment, _: usize) ?[*]u8 {
+    const page_size = std.heap.pageSize();
+    const len = std.mem.alignForward(usize, @max(n, page_size), page_size);
+    // Page-aligned mmap satisfies any reasonable alignment LuaJIT will ask for.
+    if (alignment.toByteUnits() > page_size) return null;
+
+    var hint = lj_hint_addr.load(.monotonic);
+    var retry: u32 = 0;
+    while (retry < lj_probe_max) : (retry += 1) {
+        const hint_ptr: ?[*]align(std.heap.page_size_min) u8 =
+            if (hint != 0) @ptrFromInt(hint) else null;
+        if (std.posix.mmap(
+            hint_ptr,
+            len,
+            .{ .READ = true, .WRITE = true },
+            .{ .TYPE = .PRIVATE, .ANONYMOUS = true },
+            -1,
+            0,
+        )) |slice| {
+            const addr = @intFromPtr(slice.ptr);
+            if (addr >= lj_probe_lower and ljFits47(addr, len)) {
+                lj_hint_addr.store(addr + len, .monotonic);
+                return slice.ptr;
+            }
+            std.posix.munmap(slice);
+        } else |err| switch (err) {
+            error.OutOfMemory => return null,
+            else => {},
+        }
+
+        if (hint != 0 and retry < lj_probe_linear) {
+            // Linear probe forward at 16 MB stride, like lj_alloc.
+            hint +%= 0x1000000;
+            if (!ljFits47(hint, len)) hint = 0;
+        } else if (hint != 0 and retry == lj_probe_linear) {
+            hint = 0; // Give the kernel free choice once.
+        } else {
+            // Random hint within the low 47-bit window.
+            while (true) {
+                hint = ljNextRandom() & ((@as(usize, 1) << lj_mbits) - page_size);
+                if (hint >= lj_probe_lower) break;
+            }
+        }
+    }
+    return null;
+}
+
+fn ljLowFree(_: *anyopaque, memory: []u8, _: std.mem.Alignment, _: usize) void {
+    const page_size = std.heap.pageSize();
+    const len = std.mem.alignForward(usize, memory.len, page_size);
+    std.posix.munmap(@alignCast(memory.ptr[0..len]));
+}
+
+// Per-Lua-state GPA backed by `lj_low_page_allocator`. `void` for non-LuaJIT
+// builds so the field disappears entirely.
+const LuaGpa = if (zlua.lang == .luajit)
+    std.heap.DebugAllocator(.{ .thread_safe = false })
+else
+    void;
 
 pub const LuaLoaderSpec = extern struct {
     src: [*c]const u8,
@@ -128,6 +205,9 @@ pub const LuaDataLoader = struct {
     threaded: std.Io.Threaded = undefined,
     io: std.Io = undefined,
     loader: LoaderCtx = undefined,
+    // LuaJIT-only: per-state GPA over `lj_low_page_allocator` to keep every
+    // GC pointer within 47 bits. For other engines this stays unused.
+    lua_gpa: LuaGpa = if (zlua.lang == .luajit) .init else {},
     lua: *Lua = undefined,
     rt: lua_rt.LuaRt = undefined,
 
@@ -606,17 +686,12 @@ pub const LuaDataLoader = struct {
         errdefer self.loader.deinit();
         try self.loader.start(self.io);
 
-        // Diagnostic wrapper: log the first few Lua allocation addresses so
-        // we can see if they fit LuaJIT-GC64's 47-bit pointer requirement.
-        // The inner allocator is captured by-value into a process-global so
-        // the vtable function pointers stay valid for the lifetime of the
-        // Lua state.
-        LuaAllocDiag.inner = alloc;
-        const diag_alloc: std.mem.Allocator = .{
-            .ptr = &LuaAllocDiag.inner,
-            .vtable = &LuaAllocDiag.vtable,
-        };
-        self.lua = try Lua.init(diag_alloc);
+        const lua_alloc = if (zlua.lang == .luajit) blk: {
+            self.lua_gpa = .init;
+            self.lua_gpa.backing_allocator = lj_low_page_allocator;
+            break :blk self.lua_gpa.allocator();
+        } else alloc;
+        self.lua = try Lua.init(lua_alloc);
         errdefer self.lua.deinit();
         try self.initLua(spec);
 
@@ -627,6 +702,9 @@ pub const LuaDataLoader = struct {
         self.load_rid_to_row.deinit(self.alloc);
         self.loader.deinit();
         self.lua.deinit();
+        // Tear down the low-mmap GPA *after* lua.deinit has freed all
+        // remaining GC objects back through it.
+        if (zlua.lang == .luajit) _ = self.lua_gpa.deinit();
 
         while (self.queue.popFirst()) |r_node| {
             var r: *Row = @fieldParentPtr("node", r_node);

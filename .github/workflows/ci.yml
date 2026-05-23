@@ -62,7 +62,13 @@ jobs:
   python-wheels:
     name: Python wheel ${{ matrix.target.platform }}
     runs-on: ${{ matrix.target.runner }}
-    container: ${{ matrix.target.container }}
+    container:
+      image: ${{ matrix.target.container }}
+      # Docker's default seccomp profile blocks io_uring_* syscalls (CVE-2022
+      # hardening); libxev's Linux backend is io_uring-only, so the indexer
+      # exits with PermissionDenied during pytest unless we drop the profile.
+      # Empty for macOS (no container at all there).
+      options: ${{ matrix.target.container_options }}
     strategy:
       matrix:
         target:
@@ -73,14 +79,17 @@ jobs:
           - platform: manylinux_2_28_x86_64
             runner: ubuntu-22.04
             container: quay.io/pypa/manylinux_2_28_x86_64
+            container_options: --security-opt seccomp=unconfined
             zig_args: -Dtarget=x86_64-linux-gnu.2.28 -Dcpu=x86_64_v3
           - platform: manylinux_2_34_aarch64
             runner: ubuntu-24.04-arm
             container: quay.io/pypa/manylinux_2_34_aarch64
+            container_options: --security-opt seccomp=unconfined
             zig_args: -Dtarget=aarch64-linux-gnu.2.34 -Dcpu=neoverse_v2
           - platform: macosx_11_0_arm64
             runner: macos-latest
             container: ""
+            container_options: ""
             zig_args: -Dcpu=apple_m1 -Dlua=lua54
 
     steps:

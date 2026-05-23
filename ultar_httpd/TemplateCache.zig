@@ -1,15 +1,16 @@
 const std = @import("std");
-const os = std.os;
+const builtin = @import("builtin");
 
 const TemplateCache = @This();
+
+const templates_path = "ultar_httpd/templates";
 
 alloc: std.mem.Allocator,
 threaded: std.Io.Threaded,
 io: std.Io,
 mutex: std.Io.Mutex,
 map: std.StringHashMapUnmanaged([]const u8),
-inotify_fd: std.posix.fd_t,
-watch_wd: i32,
+watcher: Watcher,
 
 /// TemplateCache.init : Initializes a TemplateCache in-place.
 pub fn init(self: *TemplateCache, allocator: std.mem.Allocator) !void {
@@ -17,27 +18,15 @@ pub fn init(self: *TemplateCache, allocator: std.mem.Allocator) !void {
     self.alloc = allocator;
     self.mutex = .init;
     self.map = .empty;
-    self.inotify_fd = -1;
-    self.watch_wd = -1;
+    self.watcher = .{};
     self.threaded = .init(allocator, .{});
     errdefer self.threaded.deinit();
     self.io = self.threaded.io();
 
-    const fd_raw = os.linux.inotify_init1(os.linux.IN.NONBLOCK);
-    if (fd_raw < 0) return;
-    self.inotify_fd = @as(std.posix.fd_t, @intCast(fd_raw));
-    errdefer {
-        _ = os.linux.close(self.inotify_fd);
-        self.inotify_fd = -1;
-    }
-
-    const path_nt = "ultar_httpd/templates\x00";
-    const wd_usize = os.linux.inotify_add_watch(
-        @as(i32, @intCast(fd_raw)),
-        path_nt,
-        os.linux.IN.MODIFY | os.linux.IN.CREATE | os.linux.IN.DELETE | os.linux.IN.MOVED_FROM | os.linux.IN.MOVED_TO,
-    );
-    self.watch_wd = @as(i32, @intCast(wd_usize));
+    // Best-effort: cache still works without live invalidation if the
+    // platform-specific watcher fails to attach (e.g. directory missing,
+    // unsupported OS).
+    self.watcher.start(templates_path) catch return;
 
     var t = try std.Thread.spawn(.{}, TemplateCache.watchLoop, .{self});
     try t.setName(self.io, "tmpl.watch");
@@ -46,9 +35,7 @@ pub fn init(self: *TemplateCache, allocator: std.mem.Allocator) !void {
 pub fn deinit(self: *TemplateCache) void {
     self.invalidateAll();
     self.map.clearAndFree(self.alloc);
-    if (self.inotify_fd >= 0) {
-        _ = os.linux.close(self.inotify_fd);
-    }
+    self.watcher.stop();
     self.threaded.deinit();
 }
 
@@ -81,22 +68,132 @@ pub fn get(self: *TemplateCache, path: []const u8) ![]const u8 {
     return bytes;
 }
 
-/// TemplateCache.watchLoop : Drains inotify events and invalidates the cache; runs on the dedicated `tmpl.watch` thread until `deinit` closes `inotify_fd`.
-pub fn watchLoop(self: *TemplateCache) void {
-    var buf: [4096]u8 = undefined;
-    while (true) {
-        if (self.inotify_fd < 0) return;
-        const n = std.posix.read(self.inotify_fd, buf[0..]) catch |e| {
-            if (e == error.WouldBlock) continue;
-            return;
-        };
-        if (n == 0) continue;
-        var off: usize = 0;
-        while (off + @sizeOf(os.linux.inotify_event) <= @as(usize, n)) {
-            const ev_slice = buf[off .. off + @sizeOf(os.linux.inotify_event)];
-            const ev_ptr = std.mem.bytesAsValue(os.linux.inotify_event, ev_slice);
-            off += @sizeOf(os.linux.inotify_event) + @as(usize, @intCast(ev_ptr.len));
-            self.invalidateAll();
-        }
+/// Blocks on the OS-specific event source and invalidates the cache on each
+/// event; exits when `deinit` closes the watcher fds.
+fn watchLoop(self: *TemplateCache) void {
+    while (self.watcher.waitForEvent()) {
+        self.invalidateAll();
     }
 }
+
+/// Cross-platform directory-change watcher. `start` attaches to a path,
+/// `stop` releases all OS resources, and `waitForEvent` blocks until either
+/// an event is available (return `true`) or the watcher is stopped (`false`).
+const Watcher = switch (builtin.os.tag) {
+    .linux => LinuxWatcher,
+    .macos, .ios, .tvos, .watchos, .visionos => DarwinWatcher,
+    else => NullWatcher,
+};
+
+const NullWatcher = struct {
+    pub fn start(_: *@This(), _: []const u8) !void {
+        return error.Unsupported;
+    }
+    pub fn stop(_: *@This()) void {}
+    pub fn waitForEvent(_: *@This()) bool {
+        return false;
+    }
+};
+
+const LinuxWatcher = struct {
+    fd: std.posix.fd_t = -1,
+
+    pub fn start(self: *@This(), path: []const u8) !void {
+        // Blocking inotify so `waitForEvent` parks the watch thread instead
+        // of busy-looping on `error.WouldBlock`.
+        const fd_raw = std.os.linux.inotify_init1(0);
+        if (@as(isize, @bitCast(fd_raw)) < 0) return error.InotifyInitFailed;
+        const fd: std.posix.fd_t = @intCast(fd_raw);
+        errdefer _ = std.os.linux.close(fd);
+
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const path_z = try std.fmt.bufPrintZ(&path_buf, "{s}", .{path});
+
+        const mask = std.os.linux.IN.MODIFY |
+            std.os.linux.IN.CREATE |
+            std.os.linux.IN.DELETE |
+            std.os.linux.IN.MOVED_FROM |
+            std.os.linux.IN.MOVED_TO;
+        const wd = std.os.linux.inotify_add_watch(fd, path_z.ptr, mask);
+        if (@as(isize, @bitCast(wd)) < 0) return error.InotifyAddWatchFailed;
+
+        self.fd = fd;
+    }
+
+    pub fn stop(self: *@This()) void {
+        if (self.fd >= 0) {
+            _ = std.os.linux.close(self.fd);
+            self.fd = -1;
+        }
+    }
+
+    pub fn waitForEvent(self: *@This()) bool {
+        if (self.fd < 0) return false;
+        var buf: [4096]u8 = undefined;
+        const n = std.posix.read(self.fd, &buf) catch return false;
+        return n > 0;
+    }
+};
+
+const DarwinWatcher = struct {
+    kq: std.posix.fd_t = -1,
+    dir_fd: std.posix.fd_t = -1,
+
+    // EVFILT_VNODE on macOS is constant -4; codified inline because
+    // std doesn't expose the kqueue filter numbers as named values.
+    const EVFILT_VNODE: i16 = -4;
+    const EV_ADD: u16 = 0x0001;
+    const EV_CLEAR: u16 = 0x0020;
+    const NOTE_DELETE: u32 = 0x00000001;
+    const NOTE_WRITE: u32 = 0x00000002;
+    const NOTE_EXTEND: u32 = 0x00000004;
+    const NOTE_RENAME: u32 = 0x00000020;
+
+    pub fn start(self: *@This(), path: []const u8) !void {
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const path_z = try std.fmt.bufPrintZ(&path_buf, "{s}", .{path});
+
+        // `O_EVTONLY` opens the dir solely for change notifications; it
+        // doesn't count against the kernel's unmount-busy semantics.
+        const dir_fd_c = std.c.open(path_z.ptr, .{ .EVTONLY = true, .DIRECTORY = true });
+        if (dir_fd_c < 0) return error.OpenFailed;
+        errdefer _ = std.c.close(dir_fd_c);
+
+        const kq_c = std.c.kqueue();
+        if (kq_c < 0) return error.KqueueFailed;
+        errdefer _ = std.c.close(kq_c);
+
+        var change: std.c.Kevent = .{
+            .ident = @intCast(dir_fd_c),
+            .filter = EVFILT_VNODE,
+            .flags = EV_ADD | EV_CLEAR,
+            .fflags = NOTE_DELETE | NOTE_WRITE | NOTE_EXTEND | NOTE_RENAME,
+            .data = 0,
+            .udata = 0,
+        };
+        const r = std.c.kevent(kq_c, @ptrCast(&change), 1, undefined, 0, null);
+        if (r < 0) return error.KeventRegisterFailed;
+
+        self.dir_fd = dir_fd_c;
+        self.kq = kq_c;
+    }
+
+    pub fn stop(self: *@This()) void {
+        // Close kq first so any blocking `kevent` call returns immediately.
+        if (self.kq >= 0) {
+            _ = std.c.close(self.kq);
+            self.kq = -1;
+        }
+        if (self.dir_fd >= 0) {
+            _ = std.c.close(self.dir_fd);
+            self.dir_fd = -1;
+        }
+    }
+
+    pub fn waitForEvent(self: *@This()) bool {
+        if (self.kq < 0) return false;
+        var ev: std.c.Kevent = undefined;
+        const r = std.c.kevent(self.kq, undefined, 0, @ptrCast(&ev), 1, null);
+        return r > 0;
+    }
+};

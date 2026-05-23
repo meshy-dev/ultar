@@ -637,7 +637,8 @@ fn createLuaLoader(spec: LuaLoaderSpec) !*LuaLoaderCCtx {
 }
 
 pub export fn ultarCreateLuaLoader(spec: LuaLoaderSpec) ?*LuaLoaderCCtx {
-    return createLuaLoader(spec) catch {
+    return createLuaLoader(spec) catch |err| {
+        logger.err("createLuaLoader failed: {}", .{err});
         std.debug.dumpCurrentStackTrace(.{});
         return @ptrFromInt(0);
     };

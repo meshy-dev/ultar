@@ -8,18 +8,21 @@ const LoaderCtx = dataloader.LoaderCtx;
 const logger = std.log.scoped(.lua_dataloader);
 
 // ---------------------------------------------------------------------------
-// LuaJIT-GC64 47-bit pointer constraint
+// LuaJIT-GC64 47-bit pointer constraint (Linux only)
 //
 // LuaJIT in GC64 mode packs GC pointers into 47-bit fields and rejects any
 // allocation whose address has bit 47 (or higher) set — `lua_newstate` frees
 // the GG_State and returns NULL, which surfaces as `error.OutOfMemory`. On
 // Linux/aarch64 with 48-bit virtual addressing, the kernel routinely hands
 // userspace mappings above 0x0000_8000_0000_0000, so `smp_allocator` triggers
-// this rejection. LuaJIT works around it in `lj_alloc.c` by probing mmap
-// with hint addresses; we reproduce that probing as a Zig page-level
-// allocator and compose a `DebugAllocator` on top of it for the per-state
-// general-purpose layer.
+// this rejection. (macOS keeps user VA ≤ 47 bits on both x86_64 and arm64,
+// and we don't ship LuaJIT there anyway.) LuaJIT works around it in
+// `lj_alloc.c` by probing mmap with hint addresses; we reproduce that
+// probing as a Zig page-level allocator and compose a `DebugAllocator` on
+// top of it for the per-state general-purpose layer.
 // ---------------------------------------------------------------------------
+
+const needs_lua_low_mmap = zlua.lang == .luajit and @import("builtin").os.tag == .linux;
 
 const lj_mbits: u6 = 47; // GC64 packs pointers into 47 bits.
 const lj_probe_max: u32 = 30;
@@ -62,41 +65,51 @@ fn ljLowAlloc(_: *anyopaque, n: usize, alignment: std.mem.Alignment, _: usize) ?
     // Page-aligned mmap satisfies any reasonable alignment LuaJIT will ask for.
     if (alignment.toByteUnits() > page_size) return null;
 
+    // Strategy mirrors lj_alloc.c's mmap_probe: pick a hint inside the low
+    // 47-bit window, MAP_FIXED_NOREPLACE so the kernel either honors the hint
+    // exactly or fails (vs plain mmap which silently relocates to wherever).
+    // Seed with last successful tail so contiguous allocations cluster.
     var hint = lj_hint_addr.load(.monotonic);
+    if (hint == 0 or !ljFits47(hint, len)) {
+        hint = ljNextRandom() & ((@as(usize, 1) << lj_mbits) - page_size);
+        if (hint < lj_probe_lower) hint = lj_probe_lower;
+    }
+
     var retry: u32 = 0;
     while (retry < lj_probe_max) : (retry += 1) {
-        const hint_ptr: ?[*]align(std.heap.page_size_min) u8 =
-            if (hint != 0) @ptrFromInt(hint) else null;
+        const hint_ptr: [*]align(std.heap.page_size_min) u8 = @ptrFromInt(hint);
         if (std.posix.mmap(
             hint_ptr,
             len,
             .{ .READ = true, .WRITE = true },
-            .{ .TYPE = .PRIVATE, .ANONYMOUS = true },
+            .{ .TYPE = .PRIVATE, .ANONYMOUS = true, .FIXED_NOREPLACE = true },
             -1,
             0,
         )) |slice| {
             const addr = @intFromPtr(slice.ptr);
-            if (addr >= lj_probe_lower and ljFits47(addr, len)) {
+            // FIXED_NOREPLACE guarantees `addr == hint` on success.
+            std.debug.assert(addr == hint);
+            if (ljFits47(addr, len)) {
                 lj_hint_addr.store(addr + len, .monotonic);
                 return slice.ptr;
             }
-            std.posix.munmap(slice);
+            std.posix.munmap(slice); // Shouldn't happen, but be defensive.
         } else |err| switch (err) {
             error.OutOfMemory => return null,
-            else => {},
+            error.MappingAlreadyExists => {}, // try a new hint
+            else => return null,
         }
 
-        if (hint != 0 and retry < lj_probe_linear) {
-            // Linear probe forward at 16 MB stride, like lj_alloc.
+        // Pick the next hint. Linear probe at 16 MB stride for a few rounds
+        // (cheap if the window has free space nearby), then random anywhere
+        // in the low 47-bit space.
+        if (retry < lj_probe_linear) {
             hint +%= 0x1000000;
-            if (!ljFits47(hint, len)) hint = 0;
-        } else if (hint != 0 and retry == lj_probe_linear) {
-            hint = 0; // Give the kernel free choice once.
+            if (!ljFits47(hint, len)) hint = lj_probe_lower;
         } else {
-            // Random hint within the low 47-bit window.
             while (true) {
                 hint = ljNextRandom() & ((@as(usize, 1) << lj_mbits) - page_size);
-                if (hint >= lj_probe_lower) break;
+                if (hint >= lj_probe_lower and ljFits47(hint, len)) break;
             }
         }
     }
@@ -109,9 +122,9 @@ fn ljLowFree(_: *anyopaque, memory: []u8, _: std.mem.Alignment, _: usize) void {
     std.posix.munmap(@alignCast(memory.ptr[0..len]));
 }
 
-// Per-Lua-state GPA backed by `lj_low_page_allocator`. `void` for non-LuaJIT
-// builds so the field disappears entirely.
-const LuaGpa = if (zlua.lang == .luajit)
+// Per-Lua-state GPA backed by `lj_low_page_allocator`. `void` on platforms
+// where the low-mmap dance isn't needed so the field disappears entirely.
+const LuaGpa = if (needs_lua_low_mmap)
     std.heap.DebugAllocator(.{ .thread_safe = false })
 else
     void;
@@ -205,9 +218,9 @@ pub const LuaDataLoader = struct {
     threaded: std.Io.Threaded = undefined,
     io: std.Io = undefined,
     loader: LoaderCtx = undefined,
-    // LuaJIT-only: per-state GPA over `lj_low_page_allocator` to keep every
-    // GC pointer within 47 bits. For other engines this stays unused.
-    lua_gpa: LuaGpa = if (zlua.lang == .luajit) .init else {},
+    // Linux+LuaJIT only: per-state GPA over `lj_low_page_allocator` to keep
+    // every GC pointer within 47 bits. Compiles out elsewhere.
+    lua_gpa: LuaGpa = if (needs_lua_low_mmap) .init else {},
     lua: *Lua = undefined,
     rt: lua_rt.LuaRt = undefined,
 
@@ -686,7 +699,7 @@ pub const LuaDataLoader = struct {
         errdefer self.loader.deinit();
         try self.loader.start(self.io);
 
-        const lua_alloc = if (zlua.lang == .luajit) blk: {
+        const lua_alloc = if (needs_lua_low_mmap) blk: {
             self.lua_gpa = .init;
             self.lua_gpa.backing_allocator = lj_low_page_allocator;
             break :blk self.lua_gpa.allocator();
@@ -704,7 +717,7 @@ pub const LuaDataLoader = struct {
         self.lua.deinit();
         // Tear down the low-mmap GPA *after* lua.deinit has freed all
         // remaining GC objects back through it.
-        if (zlua.lang == .luajit) _ = self.lua_gpa.deinit();
+        if (needs_lua_low_mmap) _ = self.lua_gpa.deinit();
 
         while (self.queue.popFirst()) |r_node| {
             var r: *Row = @fieldParentPtr("node", r_node);

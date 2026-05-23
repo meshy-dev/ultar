@@ -66,9 +66,22 @@ jobs:
     strategy:
       matrix:
         target:
-          - { platform: manylinux_2_28_x86_64, runner: ubuntu-22.04, container: "quay.io/pypa/manylinux_2_28_x86_64", cpu: x86_64_v3 }
-          - { platform: manylinux_2_34_aarch64, runner: ubuntu-24.04-arm, container: "quay.io/pypa/manylinux_2_34_aarch64", cpu: neoverse_v2 }
-          - { platform: macosx_11_0_arm64, runner: macos-latest, container: "", cpu: apple_m1 }
+          # `zig_args` carries all the per-platform `zig build` flags. For the
+          # manylinux wheels we pin glibc explicitly via -Dtarget so the
+          # produced binary's ABI is independent of the runner's host glibc;
+          # macOS uses native + lua54 (LuaJIT does not build on aarch64-macos).
+          - platform: manylinux_2_28_x86_64
+            runner: ubuntu-22.04
+            container: quay.io/pypa/manylinux_2_28_x86_64
+            zig_args: -Dtarget=x86_64-linux-gnu.2.28 -Dcpu=x86_64_v3
+          - platform: manylinux_2_34_aarch64
+            runner: ubuntu-24.04-arm
+            container: quay.io/pypa/manylinux_2_34_aarch64
+            zig_args: -Dtarget=aarch64-linux-gnu.2.34 -Dcpu=neoverse_v2
+          - platform: macosx_11_0_arm64
+            runner: macos-latest
+            container: ""
+            zig_args: -Dcpu=apple_m1 -Dlua=lua54
 
     steps:
       - name: Checkout code
@@ -95,61 +108,43 @@ jobs:
         with:
           version: 0.16.0
 
+      # The two host setups land Python 3.11 on PATH so every later step can
+      # just say `python` without caring whether it's the manylinux container
+      # interpreter or the runner-provided one.
+      - name: Setup Python (manylinux)
+        if: matrix.target.container != ''
+        run: echo "/opt/python/cp311-cp311/bin" >> $GITHUB_PATH
+
       - name: Setup Python (macOS)
         if: matrix.target.container == ''
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: Install Python build dependencies (manylinux)
-        if: matrix.target.container != ''
-        run: |
-          # Use Python 3.11 from manylinux's /opt/python
-          export PATH="/opt/python/cp311-cp311/bin:$PATH"
-          python3 -m pip install --upgrade pip
-          python3 -m pip install build wheel setuptools
-          # Verify Python is working
-          python3 --version
-          which python3
-
-      - name: Install Python build dependencies (macOS)
-        if: matrix.target.container == ''
+      - name: Install Python build dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install build wheel setuptools
+          python -m pip install build wheel setuptools pytest
 
-      - name: Build native extension (manylinux)
-        if: matrix.target.container != ''
+      - name: Build native extension + CLI
+        # `cli` produces the indexer that test_limited_abi.py shells out to.
         run: |
-          export PATH="/opt/python/cp311-cp311/bin:$PATH"
-          zig build python-bindings \
+          zig build python-bindings cli \
             -Doptimize=ReleaseSafe \
-            -Dcpu=${{ matrix.target.cpu }} \
-            --summary all
-        env:
-          PYTHON: /opt/python/cp311-cp311/bin/python3
-
-      - name: Build native extension (macOS)
-        if: matrix.target.container == ''
-        run: |
-          zig build python-bindings \
-            -Doptimize=ReleaseSafe \
-            -Dcpu=${{ matrix.target.cpu }} \
-            -Dlua=lua54 \
+            ${{ matrix.target.zig_args }} \
             --summary all
         env:
           PYTHON: python
 
-      - name: Build wheel (manylinux)
-        if: matrix.target.container != ''
-        run: |
-          export PATH="/opt/python/cp311-cp311/bin:$PATH"
-          python3 -m build --wheel --no-isolation python/
+      - name: Build wheel
+        run: python -m build --wheel --no-isolation python/
 
-      - name: Build wheel (macOS)
-        if: matrix.target.container == ''
-        run: |
-          python -m build --wheel --no-isolation python/
+      - name: Install built wheel
+        # Install before pytest so tests import the same package users get.
+        run: python -m pip install python/dist/*.whl
+
+      - name: Run pytest
+        run: cd python && python -m pytest -v tests/
 
       - name: Rename wheel to target platform
         run: |

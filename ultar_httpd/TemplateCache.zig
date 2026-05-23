@@ -135,12 +135,19 @@ const LinuxWatcher = struct {
     }
 };
 
+// EVFILT_VNODE on a directory fd fires for entry-level changes (create,
+// remove, rename, extend) but NOT when an existing file's contents are
+// edited in-place. In practice modern editors (vim, zed, VS Code, helix)
+// save via write-tmp-then-rename, which surfaces as NOTE_RENAME/NOTE_WRITE
+// on the directory and is caught. Editors that overwrite in place would
+// miss; if that case ever matters, switch to FSEvents (CoreServices) which
+// reports per-file modifications via FSEventStreamCreate + dispatch queue.
 const DarwinWatcher = struct {
     kq: std.posix.fd_t = -1,
     dir_fd: std.posix.fd_t = -1,
 
-    // EVFILT_VNODE on macOS is constant -4; codified inline because
-    // std doesn't expose the kqueue filter numbers as named values.
+    // std doesn't expose the kqueue filter numbers as named values, so the
+    // values from <sys/event.h> are codified inline here.
     const EVFILT_VNODE: i16 = -4;
     const EV_ADD: u16 = 0x0001;
     const EV_CLEAR: u16 = 0x0020;

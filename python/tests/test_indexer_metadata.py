@@ -109,9 +109,9 @@ return {
     for row in idx:iter() do
       local meta = row.metadata or {}
       local payload = table.concat({
-        tostring(meta[".label"]),
-        tostring(meta[".width"]),
-        tostring(meta[".height"]),
+        string.format("%.0f", meta[".label"]),
+        string.format("%.0f", meta[".width"]),
+        string.format("%.0f", meta[".height"]),
         tostring(meta[".filename"]),
       }, "|") .. string.char(0) .. "tail"
       loader:add_entry_bytes(".metadata.txt", payload)

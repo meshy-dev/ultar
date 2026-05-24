@@ -138,9 +138,10 @@ const UtixEntry = struct {
     keys: [][]const u8,
     offsets: []u64,
     sizes: []u64,
+    metadata: ?[]const u8 = null,
 };
 
-const UtixField = enum { none, str_idx, iidx, offset, keys, offsets, sizes, unknown };
+const UtixField = enum { none, str_idx, iidx, offset, keys, offsets, sizes, metadata, unknown };
 
 fn utixFieldFromKey(key: []const u8) UtixField {
     if (std.mem.eql(u8, key, "str_idx")) return .str_idx;
@@ -149,7 +150,69 @@ fn utixFieldFromKey(key: []const u8) UtixField {
     if (std.mem.eql(u8, key, "keys")) return .keys;
     if (std.mem.eql(u8, key, "offsets")) return .offsets;
     if (std.mem.eql(u8, key, "sizes")) return .sizes;
+    if (std.mem.eql(u8, key, "metadata")) return .metadata;
     return .unknown;
+}
+
+fn writeJsonString(w: *std.Io.Writer, s: []const u8) !void {
+    try w.writeByte('"');
+    for (s) |c| switch (c) {
+        '"' => try w.writeAll("\\\""),
+        '\\' => try w.writeAll("\\\\"),
+        '\n' => try w.writeAll("\\n"),
+        '\r' => try w.writeAll("\\r"),
+        '\t' => try w.writeAll("\\t"),
+        else => if (c < 0x20) {
+            try w.print("\\u{X:0>4}", .{c});
+        } else {
+            try w.writeByte(c);
+        },
+    };
+    try w.writeByte('"');
+}
+
+fn writeJsonFromToken(scanner: *msgpack.Scanner, w: *std.Io.Writer, tok: msgpack.Scanner.Token) !void {
+    switch (tok) {
+        .nil => try w.writeAll("null"),
+        .boolean => |b| try w.writeAll(if (b) "true" else "false"),
+        .uint => |u| try w.print("{d}", .{u}),
+        .int => |i| try w.print("{d}", .{i}),
+        .float => |f| try w.print("{d}", .{f}),
+        .string => |s| try writeJsonString(w, s),
+        .array_begin => |len| {
+            try w.writeByte('[');
+            for (0..len) |i| {
+                if (i != 0) try w.writeByte(',');
+                try writeJsonFromToken(scanner, w, try scanner.next());
+            }
+            const end = try scanner.next();
+            if (end != .array_end) return error.InvalidFormat;
+            try w.writeByte(']');
+        },
+        .map_begin => |len| {
+            try w.writeByte('{');
+            for (0..len) |i| {
+                if (i != 0) try w.writeByte(',');
+                const key_tok = try scanner.next();
+                switch (key_tok) {
+                    .map_key => |key| try writeJsonString(w, key),
+                    else => return error.InvalidFormat,
+                }
+                try w.writeByte(':');
+                try writeJsonFromToken(scanner, w, try scanner.next());
+            }
+            const end = try scanner.next();
+            if (end != .map_end) return error.InvalidFormat;
+            try w.writeByte('}');
+        },
+        else => return error.InvalidFormat,
+    }
+}
+
+fn jsonFromMsgpackValue(arena: std.mem.Allocator, scanner: *msgpack.Scanner, tok: msgpack.Scanner.Token) ![]const u8 {
+    var w: std.Io.Writer.Allocating = .init(arena);
+    try writeJsonFromToken(scanner, &w.writer, tok);
+    return w.written();
 }
 
 fn parseUtixFile(arena: std.mem.Allocator, io: std.Io, file_path: []const u8) ![]UtixEntry {
@@ -164,12 +227,33 @@ fn parseUtixFile(arena: std.mem.Allocator, io: std.Io, file_path: []const u8) ![
     var entries = try std.ArrayList(UtixEntry).initCapacity(arena, 0);
     var current: ?UtixEntry = null;
     var current_field: UtixField = .none;
+    var skip_depth: usize = 0;
 
     while (true) {
         const tok = try scanner.next();
+        if (skip_depth > 0) {
+            switch (tok) {
+                .map_begin, .array_begin => skip_depth += 1,
+                .map_end, .array_end => skip_depth -= 1,
+                else => {},
+            }
+            continue;
+        }
         switch (tok) {
             .end => break,
             .map_begin => {
+                if (current_field == .metadata) {
+                    if (current) |*e| {
+                        e.metadata = try jsonFromMsgpackValue(arena, &scanner, tok);
+                    }
+                    current_field = .none;
+                    continue;
+                }
+                if (current_field == .unknown or current_field == .metadata) {
+                    skip_depth = 1;
+                    current_field = .none;
+                    continue;
+                }
                 current = UtixEntry{
                     .str_idx = "",
                     .iidx = 0,
@@ -177,6 +261,7 @@ fn parseUtixFile(arena: std.mem.Allocator, io: std.Io, file_path: []const u8) ![
                     .keys = &[_][]const u8{},
                     .offsets = &[_]u64{},
                     .sizes = &[_]u64{},
+                    .metadata = null,
                 };
             },
             .map_key => |key| {
@@ -189,6 +274,11 @@ fn parseUtixFile(arena: std.mem.Allocator, io: std.Io, file_path: []const u8) ![
                 }
             },
             .array_begin => |len| {
+                if (current_field == .unknown) {
+                    skip_depth = 1;
+                    current_field = .none;
+                    continue;
+                }
                 if (current == null) continue;
                 if (current_field == .keys) {
                     var tmp = try std.ArrayList([]const u8).initCapacity(arena, len);
@@ -377,7 +467,13 @@ fn renderLoadHtml(
         }
 
         const id_value = if (entry.str_idx.len > 0) entry.str_idx else try std.fmt.allocPrint(arena, "{X}", .{entry.iidx});
-        try rows.append(arena, .{ .cells = cells.items, .id_value = id_value, .row_idx = @intCast(entry.iidx) });
+        try rows.append(arena, .{
+            .cells = cells.items,
+            .id_value = id_value,
+            .row_idx = @intCast(entry.iidx),
+            .has_metadata = entry.metadata != null,
+            .metadata_json = entry.metadata,
+        });
     }
 
     var page_links = try std.ArrayList(mustach_render.LoadTablePageLink).initCapacity(arena, total_pages);

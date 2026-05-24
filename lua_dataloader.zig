@@ -311,6 +311,23 @@ pub const LuaDataLoader = struct {
         return 0;
     }
 
+    fn gAddEntryBytes(lua: *Lua) !i32 {
+        const loader = try lua.toUserdata(Self, 1);
+        const key = try lua.toString(2);
+        const bytes = try lua.toString(3);
+
+        const row = loader.in_progress_row orelse @panic("No in-progress row while trying to .add_entry_bytes");
+        const row_alloc = row.arena.allocator();
+        const key_z = try row_alloc.dupeZ(u8, key);
+        const data = try row_alloc.dupe(u8, bytes);
+        try row.entries.append(row_alloc, .{
+            .key = key_z,
+            .data = data,
+        });
+        row.num_fullfilled += 1;
+        return 0;
+    }
+
     inline fn wrapCoyield(lua: *Lua, global_name: [:0]const u8, comptime cfn: fn (lua: *Lua) anyerror!i32) !void {
         var buf: [1024]u8 = undefined;
 
@@ -325,6 +342,29 @@ pub const LuaDataLoader = struct {
             \\    );
             \\    {s}(self.c_loader, ...)
             \\    return coroutine.yield()
+            \\end
+        ;
+
+        const wrapped = try std.fmt.bufPrintZ(&buf, fmt, .{global_name});
+
+        lua.loadString(wrapped) catch |err| return lua_rt.printLuaErr(lua, err);
+        errdefer lua.pop(1); // pop the function
+        lua.protectedCall(.{ .results = 1 }) catch |err| return lua_rt.printLuaErr(lua, err);
+    }
+
+    inline fn wrapDirect(lua: *Lua, global_name: [:0]const u8, comptime cfn: fn (lua: *Lua) anyerror!i32) !void {
+        var buf: [1024]u8 = undefined;
+
+        lua.pushFunction(zlua.wrap(cfn)); // [+p]
+        lua.setGlobal(global_name); // pop fn
+
+        const fmt =
+            \\return function(self, ...)
+            \\    assert(
+            \\        type(self) == "table" and type(self.c_loader) == "userdata",
+            \\        "Invalid self, use `loader:method()` not `loader.method()`"
+            \\    );
+            \\    return {s}(self.c_loader, ...)
             \\end
         ;
 
@@ -581,6 +621,8 @@ pub const LuaDataLoader = struct {
         lua.setField(-2, "close_file"); // pop
         try Self.wrapCoyield(lua, "loader_add_entry", Self.gAddEntry); // [+p]
         lua.setField(-2, "add_entry"); // pop
+        try Self.wrapDirect(lua, "loader_add_entry_bytes", Self.gAddEntryBytes); // [+p]
+        lua.setField(-2, "add_entry_bytes"); // pop
         try Self.wrapCoyield(lua, "loader_finish_row", Self.gFinishRow); // [+p]
         lua.setField(-2, "finish_row"); // pop
 

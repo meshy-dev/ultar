@@ -296,7 +296,7 @@ fn createIndexingState(self: *Self, l: *xev.Loop, abs_path: []const u8) !WdsInde
     const out_file = try std.Io.Dir.createFileAbsolute(self.io, out_path_abs, .{ .truncate = true });
     errdefer out_file.close(self.io);
 
-    return try WdsIndexingState.init(self.allocator, self.io, l, out_file, .msgpack);
+    return try WdsIndexingState.init(self.allocator, self.io, l, out_file, .msgpack, &.{}, abs_path);
 }
 
 fn startJob(self: *Self, l: *xev.Loop, job: *Job) !void {

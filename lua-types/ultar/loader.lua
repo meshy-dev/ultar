@@ -6,7 +6,7 @@ local FileHandle = {}
 
 ---@class ultar.loader
 ---The loader interface for async data loading.
----All methods that perform I/O are coroutine-based and will yield.
+---Methods that perform I/O yield; data emission (add_entry_bytes) is synchronous.
 ---Use colon syntax for method calls: `loader:open_file(path)`
 local loader = {}
 
@@ -30,10 +30,15 @@ function loader:close_file(handle) end
 ---@return nil
 function loader:add_entry(handle, key, offset, size) end
 
+---Add in-memory bytes entry (synchronous, no yield/IO). Mix with add_entry before finish_row. Binary-safe.
+---@param key string Entry key name (e.g., ".synthetic")
+---@param data string Raw bytes content (binary safe, may contain \0)
+---@return nil
+function loader:add_entry_bytes(key, data) end
+
 ---Finish the current row and make it available to Python.
 ---After calling this, start building a new row with add_entry() calls.
 ---@return nil
 function loader:finish_row() end
 
 return loader
-

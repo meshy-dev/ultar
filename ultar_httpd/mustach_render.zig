@@ -37,6 +37,8 @@ pub const LoadTableRow = struct {
     cells: []const LoadTableCell,
     id_value: []const u8,
     row_idx: i64,
+    has_metadata: bool = false,
+    metadata_json: ?[]const u8 = null,
 };
 
 pub const LoadTablePageLink = struct {
@@ -232,6 +234,7 @@ fn enterImpl(ctx: *MustachContext, key: []const u8) c_int {
                 if (data_frame.idx >= lt.rows.len) return 0;
                 const row = lt.rows[data_frame.idx];
                 if (std.mem.eql(u8, key, "cells")) return pushArrayFrame(ctx, .load_table_cell, row.cells.len);
+                if (std.mem.eql(u8, key, "has_metadata")) return pushBoolFrame(ctx, row.has_metadata);
                 return 0;
             },
             .load_table_cell => {
@@ -336,6 +339,7 @@ fn resolveScalar(ctx: *MustachContext, key: []const u8) ?[]const u8 {
                     const r = lt.rows[data_frame.idx];
                     if (std.mem.eql(u8, key, "id_value")) return r.id_value;
                     if (std.mem.eql(u8, key, "row_idx")) return fmtI64(r.row_idx);
+                    if (std.mem.eql(u8, key, "metadata_json")) return r.metadata_json orelse "";
                     return null;
                 },
                 .load_table_cell => {

@@ -64,7 +64,26 @@ function openFloat(tplId, url, title) {
 }
 
 /* ── Cell click handler ────────────────────────────────────── */
-document.body.addEventListener('click', function(e) {
+document.addEventListener('click', function(e) {
+  /* Row metadata icon -> open floating JSON window */
+  var meta = e.target.closest('.metadata-preview');
+  if (meta && meta.closest('table.table')) {
+    e.preventDefault();
+    var trm = meta.closest('tr');
+    var idm = trm ? trm.dataset.id : 'row';
+    var fm = openFloat('tpl-float-json', '#', idm + ' · metadata');
+    var dl = fm.win.querySelector('.float-dl');
+    if (dl) dl.remove();
+    var raw = meta.dataset.metadata || '{}';
+    var code = fm.win.querySelector('.json-code');
+    try { raw = JSON.stringify(JSON.parse(raw), null, 2); } catch (err) {}
+    code.textContent = raw;
+    positionWindow(fm.win);
+    document.getElementById('windows').appendChild(fm.clone);
+    if (window.scanRoot) window.scanRoot(fm.win);
+    return;
+  }
+
   /* Image thumbnail -> open floating window */
   var thumb = e.target.closest('.image-preview');
   if (thumb && thumb.closest('table.table')) {

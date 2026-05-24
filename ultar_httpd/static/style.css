@@ -105,6 +105,8 @@ a:hover { color: var(--ctp-sky); text-decoration: underline; }
 .sticky-left { position: sticky; left: 0; z-index: 3; min-width: var(--left-col-width); max-width: var(--left-col-width); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; border-right: 1px solid var(--border); }
 thead th.sticky-left { background: rgba(49, 50, 68, 0.95); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); z-index: 11; }
 tbody td.sticky-left { background: var(--panel); }
+.metadata-preview { display: inline-block; width: 1.2em; text-align: center; color: var(--ctp-mauve); cursor: pointer; }
+.metadata-preview:hover { color: var(--ctp-pink); text-decoration: none; }
 
 /* Image preview (inline thumbnail) */
 .image-preview { display: inline-block; width: 100%; background: #000; border: 1px solid var(--border); border-radius: 4px; overflow: hidden; cursor: pointer; transition: border-color 0.15s ease, box-shadow 0.15s ease; min-height: 3rem; }

@@ -22,7 +22,7 @@
       <tbody>
         {{#rows}}
         <tr data-id="{{id_value}}">
-          <td class="sticky-left mono">{{row_idx}}:{{id_value}}</td>
+          <td class="sticky-left mono">{{#has_metadata}}<a href="#" class="metadata-preview" data-metadata="{{metadata_json}}" title="metadata">Ⓜ</a> {{/has_metadata}}{{row_idx}}:{{id_value}}</td>
           {{#cells}}
           <td>
             {{#has}}
@@ -36,5 +36,3 @@
     </table>
   </div>
 </div>
-
-

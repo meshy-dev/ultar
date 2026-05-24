@@ -13,6 +13,8 @@ zig-cache/
 
 # pixi environments
 .pixi
+.venv
+__pycache__/
 *.egg-info
 
 *.tar

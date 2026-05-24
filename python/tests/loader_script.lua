@@ -58,7 +58,6 @@ return {
 			end
 
 			if entries_added > 0 then
-				loader:add_entry_bytes(".synthetic", "hello\x00bytes")
 				loader:finish_row()
 				row_count = row_count + 1
 			end

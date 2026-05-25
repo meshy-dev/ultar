@@ -156,6 +156,15 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(webapp);
 
+    const copy_python_scripts = b.addSystemCommand(&.{
+        "sh",
+        "-c",
+        "mkdir -p python/scripts && cp -f zig-out/bin/indexer python/scripts/indexer && cp -f zig-out/bin/ultar_httpd python/scripts/ultar_httpd && chmod 755 python/scripts/indexer python/scripts/ultar_httpd",
+    });
+    copy_python_scripts.step.dependOn(&b.addInstallArtifact(indexer, .{}).step);
+    copy_python_scripts.step.dependOn(&b.addInstallArtifact(webapp, .{}).step);
+    python_step.dependOn(&copy_python_scripts.step);
+
     const cli_step = b.step("cli", "Build CLI tools (indexer, ultar_httpd)");
     cli_step.dependOn(&b.addInstallArtifact(indexer, .{}).step);
     cli_step.dependOn(&b.addInstallArtifact(webapp, .{}).step);

@@ -152,6 +152,15 @@ jobs:
         # Install before pytest so tests import the same package users get.
         run: python -m pip install python/dist/*.whl
 
+      - name: Verify installed CLIs
+        run: |
+          command -v indexer
+          command -v ultar_httpd
+          command -v ultar-dataloader
+          indexer --help
+          ultar_httpd --help
+          ultar-dataloader types-path
+
       - name: Run pytest
         run: cd python && python -m pytest -v tests/
 

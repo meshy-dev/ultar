@@ -29,7 +29,7 @@ class CopyPrebuiltExtension(build_ext):
 
         # Source: pre-built library in src/ultar_dataloader/
         src_dir = Path(__file__).parent / "src" / "ultar_dataloader"
-        
+
         # Find .so or .dylib
         for pattern in ["_native.abi3.so", "_native.abi3.dylib"]:
             src = src_dir / pattern
@@ -54,6 +54,7 @@ _native = Extension(
 setup(
     ext_modules=[_native],
     cmdclass={"build_ext": CopyPrebuiltExtension},
+    data_files=[("bin", ["scripts/indexer", "scripts/ultar_httpd"])],
     options={
         "bdist_wheel": {
             "py_limited_api": "cp311",

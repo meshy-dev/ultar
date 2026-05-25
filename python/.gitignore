@@ -9,6 +9,7 @@ dist/
 # Generated during build
 src/ultar_dataloader/_version.py
 src/ultar_dataloader/lua-types/
+scripts/
 
 # Python bytecode
 __pycache__/
@@ -30,4 +31,3 @@ htmlcov/
 *.swp
 *.swo
 *~
-
